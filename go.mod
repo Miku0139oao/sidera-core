@@ -1,4 +1,4 @@
-module github.com/sagernet/sing-box
+module github.com/Miku0139oao/sidera-core
 
 go 1.24.7
 

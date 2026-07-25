@@ -3,8 +3,8 @@ package rule
 import (
 	"strings"
 
-	"github.com/sagernet/sing-box/adapter"
-	"github.com/sagernet/sing-box/option"
+	"github.com/Miku0139oao/sidera-core/adapter"
+	"github.com/Miku0139oao/sidera-core/option"
 	"github.com/sagernet/sing/common"
 )
 

@@ -6,7 +6,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/sagernet/sing-box/adapter"
+	"github.com/Miku0139oao/sidera-core/adapter"
 	E "github.com/sagernet/sing/common/exceptions"
 )
 

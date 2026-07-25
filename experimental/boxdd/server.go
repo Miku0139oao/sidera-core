@@ -9,12 +9,12 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/sagernet/sing-box/adapter"
-	"github.com/sagernet/sing-box/daemon"
-	"github.com/sagernet/sing-box/experimental/libbox"
-	"github.com/sagernet/sing-box/include"
-	"github.com/sagernet/sing-box/log"
-	"github.com/sagernet/sing-box/service/oomkiller"
+	"github.com/Miku0139oao/sidera-core/adapter"
+	"github.com/Miku0139oao/sidera-core/daemon"
+	"github.com/Miku0139oao/sidera-core/experimental/libbox"
+	"github.com/Miku0139oao/sidera-core/include"
+	"github.com/Miku0139oao/sidera-core/log"
+	"github.com/Miku0139oao/sidera-core/service/oomkiller"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/service"
 

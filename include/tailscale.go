@@ -3,12 +3,12 @@
 package include
 
 import (
-	"github.com/sagernet/sing-box/adapter/certificate"
-	"github.com/sagernet/sing-box/adapter/endpoint"
-	"github.com/sagernet/sing-box/adapter/service"
-	"github.com/sagernet/sing-box/dns"
-	"github.com/sagernet/sing-box/protocol/tailscale"
-	"github.com/sagernet/sing-box/service/derp"
+	"github.com/Miku0139oao/sidera-core/adapter/certificate"
+	"github.com/Miku0139oao/sidera-core/adapter/endpoint"
+	"github.com/Miku0139oao/sidera-core/adapter/service"
+	"github.com/Miku0139oao/sidera-core/dns"
+	"github.com/Miku0139oao/sidera-core/protocol/tailscale"
+	"github.com/Miku0139oao/sidera-core/service/derp"
 )
 
 func registerTailscaleEndpoint(registry *endpoint.Registry) {

@@ -5,7 +5,7 @@ import (
 	"context"
 	"reflect"
 
-	"github.com/sagernet/sing-box/schema"
+	"github.com/Miku0139oao/sidera-core/schema"
 	E "github.com/sagernet/sing/common/exceptions"
 	F "github.com/sagernet/sing/common/format"
 	"github.com/sagernet/sing/common/json"

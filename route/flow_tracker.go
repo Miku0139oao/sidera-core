@@ -5,8 +5,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/sagernet/sing-box/adapter"
-	"github.com/sagernet/sing-box/log"
+	"github.com/Miku0139oao/sidera-core/adapter"
+	"github.com/Miku0139oao/sidera-core/log"
 	"github.com/sagernet/sing-tun"
 	"github.com/sagernet/sing/common/byteformats"
 	N "github.com/sagernet/sing/common/network"

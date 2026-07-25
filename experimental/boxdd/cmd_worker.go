@@ -7,9 +7,9 @@ import (
 	"io"
 	"os"
 
-	"github.com/sagernet/sing-box/daemon"
-	"github.com/sagernet/sing-box/include"
-	"github.com/sagernet/sing-box/log"
+	"github.com/Miku0139oao/sidera-core/daemon"
+	"github.com/Miku0139oao/sidera-core/include"
+	"github.com/Miku0139oao/sidera-core/log"
 	E "github.com/sagernet/sing/common/exceptions"
 
 	"github.com/spf13/cobra"

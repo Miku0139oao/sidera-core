@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/sagernet/sing-box/experimental/locale"
+	"github.com/Miku0139oao/sidera-core/experimental/locale"
 	E "github.com/sagernet/sing/common/exceptions"
 )
 

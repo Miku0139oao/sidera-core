@@ -5,8 +5,8 @@ import (
 	"slices"
 	"strings"
 
-	C "github.com/sagernet/sing-box/constant"
-	"github.com/sagernet/sing-box/schema"
+	C "github.com/Miku0139oao/sidera-core/constant"
+	"github.com/Miku0139oao/sidera-core/schema"
 	E "github.com/sagernet/sing/common/exceptions"
 	F "github.com/sagernet/sing/common/format"
 	"github.com/sagernet/sing/common/json"

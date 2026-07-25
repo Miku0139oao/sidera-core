@@ -4,7 +4,7 @@ import (
 	"net"
 	"net/netip"
 
-	"github.com/sagernet/sing-box/option"
+	"github.com/Miku0139oao/sidera-core/option"
 	tun "github.com/sagernet/sing-tun"
 	"github.com/sagernet/sing/common"
 )

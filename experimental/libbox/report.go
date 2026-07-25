@@ -11,7 +11,7 @@ import (
 	"strconv"
 	"time"
 
-	C "github.com/sagernet/sing-box/constant"
+	C "github.com/Miku0139oao/sidera-core/constant"
 	E "github.com/sagernet/sing/common/exceptions"
 )
 

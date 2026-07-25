@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	C "github.com/sagernet/sing-box/constant"
-	"github.com/sagernet/sing-box/option"
+	C "github.com/Miku0139oao/sidera-core/constant"
+	"github.com/Miku0139oao/sidera-core/option"
 	"github.com/sagernet/sing/common"
 	F "github.com/sagernet/sing/common/format"
 	"github.com/sagernet/sing/common/json/badoption"

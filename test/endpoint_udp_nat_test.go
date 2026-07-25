@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	openconnecttransport "github.com/sagernet/sing-box/transport/openconnect"
-	openvpntransport "github.com/sagernet/sing-box/transport/openvpn"
+	openconnecttransport "github.com/Miku0139oao/sidera-core/transport/openconnect"
+	openvpntransport "github.com/Miku0139oao/sidera-core/transport/openvpn"
 	"github.com/sagernet/sing-tun"
 	"github.com/sagernet/sing-tun/gtcpip/header"
 	"github.com/sagernet/sing/common/buf"

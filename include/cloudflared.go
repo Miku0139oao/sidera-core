@@ -3,8 +3,8 @@
 package include
 
 import (
-	"github.com/sagernet/sing-box/adapter/inbound"
-	"github.com/sagernet/sing-box/protocol/cloudflare"
+	"github.com/Miku0139oao/sidera-core/adapter/inbound"
+	"github.com/Miku0139oao/sidera-core/protocol/cloudflare"
 )
 
 func registerCloudflaredInbound(registry *inbound.Registry) {

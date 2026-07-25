@@ -3,7 +3,7 @@ package main
 import (
 	context "context"
 
-	daemon "github.com/sagernet/sing-box/daemon"
+	daemon "github.com/Miku0139oao/sidera-core/daemon"
 	grpc "google.golang.org/grpc"
 	codes "google.golang.org/grpc/codes"
 	status "google.golang.org/grpc/status"

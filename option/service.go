@@ -3,7 +3,7 @@ package option
 import (
 	"context"
 
-	"github.com/sagernet/sing-box/schema"
+	"github.com/Miku0139oao/sidera-core/schema"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/json"
 	"github.com/sagernet/sing/common/json/badjson"

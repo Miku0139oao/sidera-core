@@ -4,8 +4,8 @@ import (
 	"context"
 	"net/http"
 
-	"github.com/sagernet/sing-box/adapter"
-	C "github.com/sagernet/sing-box/constant"
+	"github.com/Miku0139oao/sidera-core/adapter"
+	C "github.com/Miku0139oao/sidera-core/constant"
 	"github.com/sagernet/sing/common"
 
 	"github.com/go-chi/chi/v5"

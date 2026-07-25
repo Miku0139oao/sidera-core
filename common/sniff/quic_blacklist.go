@@ -3,7 +3,7 @@ package sniff
 import (
 	"slices"
 
-	"github.com/sagernet/sing-box/common/ja3"
+	"github.com/Miku0139oao/sidera-core/common/ja3"
 )
 
 const (

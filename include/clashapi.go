@@ -2,4 +2,4 @@
 
 package include
 
-import _ "github.com/sagernet/sing-box/experimental/clashapi"
+import _ "github.com/Miku0139oao/sidera-core/experimental/clashapi"

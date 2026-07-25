@@ -1,8 +1,8 @@
 package main
 
 import (
-	"github.com/sagernet/sing-box/adapter"
-	"github.com/sagernet/sing-box/daemon"
+	"github.com/Miku0139oao/sidera-core/adapter"
+	"github.com/Miku0139oao/sidera-core/daemon"
 )
 
 type daemonPlatform interface {

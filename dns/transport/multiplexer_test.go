@@ -9,10 +9,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/sagernet/sing-box/common/dialer"
-	C "github.com/sagernet/sing-box/constant"
-	boxDNS "github.com/sagernet/sing-box/dns"
-	"github.com/sagernet/sing-box/option"
+	"github.com/Miku0139oao/sidera-core/common/dialer"
+	C "github.com/Miku0139oao/sidera-core/constant"
+	boxDNS "github.com/Miku0139oao/sidera-core/dns"
+	"github.com/Miku0139oao/sidera-core/option"
 	M "github.com/sagernet/sing/common/metadata"
 
 	mDNS "github.com/miekg/dns"

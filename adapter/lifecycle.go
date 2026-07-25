@@ -5,7 +5,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/sagernet/sing-box/log"
+	"github.com/Miku0139oao/sidera-core/log"
 	E "github.com/sagernet/sing/common/exceptions"
 	F "github.com/sagernet/sing/common/format"
 )

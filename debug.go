@@ -3,7 +3,7 @@ package box
 import (
 	"runtime/debug"
 
-	"github.com/sagernet/sing-box/option"
+	"github.com/Miku0139oao/sidera-core/option"
 	E "github.com/sagernet/sing/common/exceptions"
 )
 

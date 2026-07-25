@@ -3,7 +3,7 @@ package openvpn
 import (
 	"slices"
 
-	"github.com/sagernet/sing-box/adapter"
+	"github.com/Miku0139oao/sidera-core/adapter"
 	ovpn "github.com/sagernet/sing-openvpn"
 )
 

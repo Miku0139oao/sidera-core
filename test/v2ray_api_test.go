@@ -6,9 +6,9 @@ import (
 	"net/netip"
 	"testing"
 
-	C "github.com/sagernet/sing-box/constant"
-	"github.com/sagernet/sing-box/experimental/v2rayapi"
-	"github.com/sagernet/sing-box/option"
+	C "github.com/Miku0139oao/sidera-core/constant"
+	"github.com/Miku0139oao/sidera-core/experimental/v2rayapi"
+	"github.com/Miku0139oao/sidera-core/option"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/json/badoption"
 

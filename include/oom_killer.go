@@ -1,8 +1,8 @@
 package include
 
 import (
-	"github.com/sagernet/sing-box/adapter/service"
-	"github.com/sagernet/sing-box/service/oomkiller"
+	"github.com/Miku0139oao/sidera-core/adapter/service"
+	"github.com/Miku0139oao/sidera-core/service/oomkiller"
 )
 
 func registerOOMKillerService(registry *service.Registry) {

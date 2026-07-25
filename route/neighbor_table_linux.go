@@ -7,7 +7,7 @@ import (
 	"net/netip"
 	"slices"
 
-	"github.com/sagernet/sing-box/adapter"
+	"github.com/Miku0139oao/sidera-core/adapter"
 	E "github.com/sagernet/sing/common/exceptions"
 
 	"github.com/jsimonetti/rtnetlink"

@@ -4,9 +4,9 @@ import (
 	"context"
 	"net"
 
-	"github.com/sagernet/sing-box/adapter"
-	C "github.com/sagernet/sing-box/constant"
-	"github.com/sagernet/sing-box/option"
+	"github.com/Miku0139oao/sidera-core/adapter"
+	C "github.com/Miku0139oao/sidera-core/constant"
+	"github.com/Miku0139oao/sidera-core/option"
 	"github.com/sagernet/sing-mux"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"

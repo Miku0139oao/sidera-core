@@ -1,7 +1,7 @@
 package libbox
 
 import (
-	"github.com/sagernet/sing-box/daemon"
+	"github.com/Miku0139oao/sidera-core/daemon"
 	"github.com/sagernet/sing/common"
 )
 

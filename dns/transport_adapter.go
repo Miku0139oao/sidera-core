@@ -1,7 +1,7 @@
 package dns
 
 import (
-	"github.com/sagernet/sing-box/option"
+	"github.com/Miku0139oao/sidera-core/option"
 )
 
 type TransportAdapter struct {

@@ -5,12 +5,12 @@ package usbip
 import (
 	"context"
 
-	"github.com/sagernet/sing-box/adapter"
-	boxService "github.com/sagernet/sing-box/adapter/service"
-	"github.com/sagernet/sing-box/common/dialer"
-	C "github.com/sagernet/sing-box/constant"
-	"github.com/sagernet/sing-box/log"
-	"github.com/sagernet/sing-box/option"
+	"github.com/Miku0139oao/sidera-core/adapter"
+	boxService "github.com/Miku0139oao/sidera-core/adapter/service"
+	"github.com/Miku0139oao/sidera-core/common/dialer"
+	C "github.com/Miku0139oao/sidera-core/constant"
+	"github.com/Miku0139oao/sidera-core/log"
+	"github.com/Miku0139oao/sidera-core/option"
 	"github.com/sagernet/sing-usbip"
 	E "github.com/sagernet/sing/common/exceptions"
 )

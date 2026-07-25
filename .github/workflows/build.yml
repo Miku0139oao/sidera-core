@@ -241,8 +241,8 @@ jobs:
           set -xeuo pipefail
           mkdir -p dist
           go build -v -trimpath -o dist/sing-box -tags "${BUILD_TAGS}" \
-          -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${{ needs.calculate_version.outputs.version }}' ${LDFLAGS_SHARED} -s -w -buildid=" \
-          ./cmd/sing-box
+          -ldflags "-X 'github.com/Miku0139oao/sidera-core/constant.Version=${{ needs.calculate_version.outputs.version }}' ${LDFLAGS_SHARED} -s -w -buildid=" \
+          ./cmd/sidera
         env:
           CGO_ENABLED: "0"
           GOOS: ${{ matrix.os }}
@@ -264,8 +264,8 @@ jobs:
           set -xeuo pipefail
           mkdir -p dist
           go build -v -trimpath -o dist/sing-box -tags "${BUILD_TAGS}" \
-          -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${{ needs.calculate_version.outputs.version }}' ${LDFLAGS_SHARED} -s -w -buildid=" \
-          ./cmd/sing-box
+          -ldflags "-X 'github.com/Miku0139oao/sidera-core/constant.Version=${{ needs.calculate_version.outputs.version }}' ${LDFLAGS_SHARED} -s -w -buildid=" \
+          ./cmd/sidera
         env:
           CGO_ENABLED: "1"
           GOOS: linux
@@ -281,8 +281,8 @@ jobs:
           set -xeuo pipefail
           mkdir -p dist
           go build -v -trimpath -o dist/sing-box -tags "${BUILD_TAGS}" \
-          -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${{ needs.calculate_version.outputs.version }}' ${LDFLAGS_SHARED} -s -w -buildid=" \
-          ./cmd/sing-box
+          -ldflags "-X 'github.com/Miku0139oao/sidera-core/constant.Version=${{ needs.calculate_version.outputs.version }}' ${LDFLAGS_SHARED} -s -w -buildid=" \
+          ./cmd/sidera
         env:
           CGO_ENABLED: "1"
           GOOS: linux
@@ -298,8 +298,8 @@ jobs:
           set -xeuo pipefail
           mkdir -p dist
           go build -v -trimpath -o dist/sing-box -tags "${BUILD_TAGS}" \
-          -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${{ needs.calculate_version.outputs.version }}' ${LDFLAGS_SHARED} -s -w -buildid=" \
-          ./cmd/sing-box
+          -ldflags "-X 'github.com/Miku0139oao/sidera-core/constant.Version=${{ needs.calculate_version.outputs.version }}' ${LDFLAGS_SHARED} -s -w -buildid=" \
+          ./cmd/sidera
         env:
           CGO_ENABLED: "0"
           GOOS: ${{ matrix.os }}
@@ -318,8 +318,8 @@ jobs:
           export CXX="${CC}++"
           mkdir -p dist
           GOOS=$BUILD_GOOS GOARCH=$BUILD_GOARCH build go build -v -trimpath -o dist/sing-box -tags "${BUILD_TAGS}" \
-          -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${{ needs.calculate_version.outputs.version }}' ${LDFLAGS_SHARED} -s -w -buildid=" \
-          ./cmd/sing-box
+          -ldflags "-X 'github.com/Miku0139oao/sidera-core/constant.Version=${{ needs.calculate_version.outputs.version }}' ${LDFLAGS_SHARED} -s -w -buildid=" \
+          ./cmd/sidera
         env:
           CGO_ENABLED: "1"
           BUILD_GOOS: ${{ matrix.os }}
@@ -528,8 +528,8 @@ jobs:
           set -xeuo pipefail
           mkdir -p dist
           go build -v -trimpath -o dist/sing-box -tags "${BUILD_TAGS}" \
-          -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${{ needs.calculate_version.outputs.version }}' ${LDFLAGS_SHARED} -s -w -buildid=" \
-          ./cmd/sing-box
+          -ldflags "-X 'github.com/Miku0139oao/sidera-core/constant.Version=${{ needs.calculate_version.outputs.version }}' ${LDFLAGS_SHARED} -s -w -buildid=" \
+          ./cmd/sidera
         env:
           CGO_ENABLED: "1"
           GOOS: darwin
@@ -598,8 +598,8 @@ jobs:
           $LDFLAGS_SHARED = Get-Content release/LDFLAGS
           mkdir -p dist
           go build -v -trimpath -o dist/sing-box.exe -tags "$TAGS" `
-          -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${{ needs.calculate_version.outputs.version }}' $LDFLAGS_SHARED -s -w -buildid=" `
-          ./cmd/sing-box
+          -ldflags "-X 'github.com/Miku0139oao/sidera-core/constant.Version=${{ needs.calculate_version.outputs.version }}' $LDFLAGS_SHARED -s -w -buildid=" `
+          ./cmd/sidera
         env:
           CGO_ENABLED: "0"
           GOOS: windows
@@ -612,8 +612,8 @@ jobs:
           $LDFLAGS_SHARED = Get-Content release/LDFLAGS
           mkdir -p dist
           go build -v -trimpath -o dist/sing-box.exe -tags "$TAGS" `
-          -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${{ needs.calculate_version.outputs.version }}' $LDFLAGS_SHARED -s -w -buildid=" `
-          ./cmd/sing-box
+          -ldflags "-X 'github.com/Miku0139oao/sidera-core/constant.Version=${{ needs.calculate_version.outputs.version }}' $LDFLAGS_SHARED -s -w -buildid=" `
+          ./cmd/sidera
         env:
           CGO_ENABLED: "0"
           GOOS: windows

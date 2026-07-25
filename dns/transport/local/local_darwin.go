@@ -12,8 +12,8 @@ import (
 	"os"
 	"sync"
 
-	"github.com/sagernet/sing-box/dns"
-	dnsTransport "github.com/sagernet/sing-box/dns/transport"
+	"github.com/Miku0139oao/sidera-core/dns"
+	dnsTransport "github.com/Miku0139oao/sidera-core/dns/transport"
 	E "github.com/sagernet/sing/common/exceptions"
 
 	mDNS "github.com/miekg/dns"

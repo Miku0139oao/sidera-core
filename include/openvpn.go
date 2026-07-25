@@ -3,9 +3,9 @@
 package include
 
 import (
-	"github.com/sagernet/sing-box/adapter/endpoint"
-	"github.com/sagernet/sing-box/dns"
-	"github.com/sagernet/sing-box/protocol/openvpn"
+	"github.com/Miku0139oao/sidera-core/adapter/endpoint"
+	"github.com/Miku0139oao/sidera-core/dns"
+	"github.com/Miku0139oao/sidera-core/protocol/openvpn"
 )
 
 func registerOpenVPNEndpoints(registry *endpoint.Registry) {

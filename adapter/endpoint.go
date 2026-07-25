@@ -3,8 +3,8 @@ package adapter
 import (
 	"context"
 
-	"github.com/sagernet/sing-box/log"
-	"github.com/sagernet/sing-box/option"
+	"github.com/Miku0139oao/sidera-core/log"
+	"github.com/Miku0139oao/sidera-core/option"
 )
 
 type Endpoint interface {

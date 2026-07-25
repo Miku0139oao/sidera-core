@@ -40,7 +40,7 @@ TAGS="tag_a tag_b" make
 or
 
 ```bash
-go build -tags "tag_a tag_b" ./cmd/sing-box
+go build -tags "tag_a tag_b" ./cmd/sidera
 ```
 
 ## :material-folder-settings: Build Tags

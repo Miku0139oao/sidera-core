@@ -17,9 +17,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/sagernet/sing-box/common/schannel"
-	C "github.com/sagernet/sing-box/constant"
-	"github.com/sagernet/sing-box/option"
+	"github.com/Miku0139oao/sidera-core/common/schannel"
+	C "github.com/Miku0139oao/sidera-core/constant"
+	"github.com/Miku0139oao/sidera-core/option"
 	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/bufio"
 	"github.com/sagernet/sing/common/json/badoption"

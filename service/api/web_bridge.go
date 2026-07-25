@@ -9,8 +9,8 @@ import (
 	"strings"
 
 	"github.com/sagernet/cors"
-	"github.com/sagernet/sing-box/log"
-	"github.com/sagernet/sing-box/option"
+	"github.com/Miku0139oao/sidera-core/log"
+	"github.com/Miku0139oao/sidera-core/option"
 
 	"golang.org/x/net/http2"
 	"google.golang.org/grpc"

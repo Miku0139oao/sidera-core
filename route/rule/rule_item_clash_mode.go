@@ -4,7 +4,7 @@ import (
 	"context"
 	"strings"
 
-	"github.com/sagernet/sing-box/adapter"
+	"github.com/Miku0139oao/sidera-core/adapter"
 	"github.com/sagernet/sing/service"
 )
 

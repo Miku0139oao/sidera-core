@@ -118,8 +118,8 @@ jobs:
         run: |
           set -xeuo pipefail
           go build -v -trimpath -o sing-box -tags "${BUILD_TAGS}" \
-          -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${VERSION}' ${LDFLAGS_SHARED} -s -w -buildid=" \
-          ./cmd/sing-box
+          -ldflags "-X 'github.com/Miku0139oao/sidera-core/constant.Version=${VERSION}' ${LDFLAGS_SHARED} -s -w -buildid=" \
+          ./cmd/sidera
         env:
           CGO_ENABLED: "1"
           GOOS: linux
@@ -131,8 +131,8 @@ jobs:
         run: |
           set -xeuo pipefail
           go build -v -trimpath -o sing-box -tags "${BUILD_TAGS}" \
-          -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${VERSION}' ${LDFLAGS_SHARED} -s -w -buildid=" \
-          ./cmd/sing-box
+          -ldflags "-X 'github.com/Miku0139oao/sidera-core/constant.Version=${VERSION}' ${LDFLAGS_SHARED} -s -w -buildid=" \
+          ./cmd/sidera
         env:
           CGO_ENABLED: "0"
           GOOS: linux

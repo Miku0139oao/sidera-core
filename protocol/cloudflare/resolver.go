@@ -9,7 +9,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/sagernet/sing-box/adapter"
+	"github.com/Miku0139oao/sidera-core/adapter"
 
 	mDNS "github.com/miekg/dns"
 )

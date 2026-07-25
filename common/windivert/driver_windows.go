@@ -7,7 +7,7 @@ import (
 	"runtime"
 	"time"
 
-	"github.com/sagernet/sing-box/internal/winmutex"
+	"github.com/Miku0139oao/sidera-core/internal/winmutex"
 	E "github.com/sagernet/sing/common/exceptions"
 
 	"golang.org/x/sys/windows"

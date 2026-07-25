@@ -8,8 +8,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/sagernet/sing-box/cmd/internal/build_shared"
-	"github.com/sagernet/sing-box/log"
+	"github.com/Miku0139oao/sidera-core/cmd/internal/build_shared"
+	"github.com/Miku0139oao/sidera-core/log"
 	"github.com/sagernet/sing/common"
 )
 

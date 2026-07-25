@@ -4,15 +4,16 @@ import (
 	"bytes"
 	"context"
 
-	"github.com/sagernet/sing-box"
-	"github.com/sagernet/sing-box/adapter"
-	"github.com/sagernet/sing-box/common/trafficcontrol"
-	"github.com/sagernet/sing-box/common/urltest"
-	C "github.com/sagernet/sing-box/constant"
-	"github.com/sagernet/sing-box/experimental/deprecated"
-	"github.com/sagernet/sing-box/experimental/locale"
-	"github.com/sagernet/sing-box/log"
-	"github.com/sagernet/sing-box/option"
+	"github.com/Miku0139oao/sidera-core"
+	"github.com/Miku0139oao/sidera-core/adapter"
+	"github.com/Miku0139oao/sidera-core/common/trafficcontrol"
+	"github.com/Miku0139oao/sidera-core/common/urltest"
+	"github.com/Miku0139oao/sidera-core/config"
+	C "github.com/Miku0139oao/sidera-core/constant"
+	"github.com/Miku0139oao/sidera-core/experimental/deprecated"
+	"github.com/Miku0139oao/sidera-core/experimental/locale"
+	"github.com/Miku0139oao/sidera-core/log"
+	"github.com/Miku0139oao/sidera-core/option"
 	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/json"
@@ -57,9 +58,12 @@ func (s *StartedService) CheckConfig(ctx context.Context, configContent string) 
 func (s *StartedService) FormatConfig(ctx context.Context, configContent string) (string, error) {
 	selectedLocale := locale.FromContext(ctx)
 	ctx, _ = locale.ContextWithLocale(s.ctx, selectedLocale.Locale)
-	options, err := parseConfig(ctx, configContent)
+	options, dialect, err := config.Decode(ctx, []byte(configContent))
 	if err != nil {
 		return "", err
+	}
+	if dialect == config.DialectXray {
+		return "", E.New("formatting Xray configuration files is not implemented")
 	}
 	var buffer bytes.Buffer
 	encoder := json.NewEncoder(&buffer)
@@ -179,7 +183,7 @@ func (i *Instance) TrafficManager() *trafficcontrol.Manager {
 }
 
 func parseConfig(ctx context.Context, configContent string) (option.Options, error) {
-	options, err := json.UnmarshalExtendedContext[option.Options](ctx, []byte(configContent))
+	options, _, err := config.Decode(ctx, []byte(configContent))
 	if err != nil {
 		return option.Options{}, E.Cause(err, "decode config")
 	}

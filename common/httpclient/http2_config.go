@@ -5,7 +5,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/sagernet/sing-box/option"
+	"github.com/Miku0139oao/sidera-core/option"
 	E "github.com/sagernet/sing/common/exceptions"
 
 	"golang.org/x/net/http2"

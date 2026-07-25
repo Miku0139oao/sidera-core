@@ -50,6 +50,7 @@ formatters:
     gci:
       sections:
         - standard
+        - prefix(github.com/Miku0139oao/sidera-core)
         - prefix(github.com/sagernet/)
         - default
       custom-order: true

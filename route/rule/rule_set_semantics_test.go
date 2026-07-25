@@ -7,9 +7,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/sagernet/sing-box/adapter"
-	"github.com/sagernet/sing-box/common/convertor/adguard"
-	C "github.com/sagernet/sing-box/constant"
+	"github.com/Miku0139oao/sidera-core/adapter"
+	"github.com/Miku0139oao/sidera-core/common/convertor/adguard"
+	C "github.com/Miku0139oao/sidera-core/constant"
 	slogger "github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"

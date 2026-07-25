@@ -5,7 +5,7 @@ import (
 	sync "sync"
 	unsafe "unsafe"
 
-	daemon "github.com/sagernet/sing-box/daemon"
+	daemon "github.com/Miku0139oao/sidera-core/daemon"
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 	emptypb "google.golang.org/protobuf/types/known/emptypb"
@@ -1751,7 +1751,7 @@ const file_experimental_boxdd_desktop_service_proto_rawDesc = "" +
 	"\rDecodeProfile\x12\x14.desktop.ProfileData\x1a\x17.desktop.ProfileContent\"\x00\x12H\n" +
 	"\rArchiveReport\x12\x1d.desktop.ArchiveReportRequest\x1a\x16.google.protobuf.Empty\"\x00\x12y\n" +
 	"!StartStandaloneNetworkQualityTest\x12,.desktop.StandaloneNetworkQualityTestRequest\x1a\".daemon.NetworkQualityTestProgress\"\x000\x01\x12[\n" +
-	"\x17StartStandaloneSTUNTest\x12\".desktop.StandaloneSTUNTestRequest\x1a\x18.daemon.STUNTestProgress\"\x000\x01B6Z4github.com/sagernet/sing-box/experimental/boxdd;mainb\x06proto3"
+	"\x17StartStandaloneSTUNTest\x12\".desktop.StandaloneSTUNTestRequest\x1a\x18.daemon.STUNTestProgress\"\x000\x01B<Z:github.com/Miku0139oao/sidera-core/experimental/boxdd;mainb\x06proto3"
 
 var (
 	file_experimental_boxdd_desktop_service_proto_rawDescOnce sync.Once

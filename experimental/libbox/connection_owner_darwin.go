@@ -5,7 +5,7 @@ import (
 	"os/user"
 	"syscall"
 
-	"github.com/sagernet/sing-box/common/process"
+	"github.com/Miku0139oao/sidera-core/common/process"
 	E "github.com/sagernet/sing/common/exceptions"
 	F "github.com/sagernet/sing/common/format"
 )

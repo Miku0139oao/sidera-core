@@ -5,7 +5,7 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/sagernet/sing-box/service/oomkiller"
+	"github.com/Miku0139oao/sidera-core/service/oomkiller"
 	"github.com/sagernet/sing/common/memory"
 
 	"google.golang.org/grpc/codes"

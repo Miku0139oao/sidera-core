@@ -10,10 +10,10 @@ import (
 	"io"
 	"os"
 
-	"github.com/sagernet/sing-box/adapter"
-	"github.com/sagernet/sing-box/common/ja3"
-	"github.com/sagernet/sing-box/common/sniff/internal/qtls"
-	C "github.com/sagernet/sing-box/constant"
+	"github.com/Miku0139oao/sidera-core/adapter"
+	"github.com/Miku0139oao/sidera-core/common/ja3"
+	"github.com/Miku0139oao/sidera-core/common/sniff/internal/qtls"
+	C "github.com/Miku0139oao/sidera-core/constant"
 	"github.com/sagernet/sing/common/buf"
 	E "github.com/sagernet/sing/common/exceptions"
 

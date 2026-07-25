@@ -9,8 +9,8 @@ import (
 	"strings"
 
 	_ "github.com/sagernet/gomobile"
-	"github.com/sagernet/sing-box/cmd/internal/build_shared"
-	"github.com/sagernet/sing-box/log"
+	"github.com/Miku0139oao/sidera-core/cmd/internal/build_shared"
+	"github.com/Miku0139oao/sidera-core/log"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/rw"
 	"github.com/sagernet/sing/common/shell"

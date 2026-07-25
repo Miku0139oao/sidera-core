@@ -1,7 +1,7 @@
 package rule
 
 import (
-	"github.com/sagernet/sing-box/adapter"
+	"github.com/Miku0139oao/sidera-core/adapter"
 )
 
 var _ RuleItem = (*NetworkIsConstrainedItem)(nil)

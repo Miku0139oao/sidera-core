@@ -3,7 +3,7 @@
 package libbox
 
 import (
-	"github.com/sagernet/sing-box/protocol/tailscale/tailssh"
+	"github.com/Miku0139oao/sidera-core/protocol/tailscale/tailssh"
 	"github.com/sagernet/sing/common"
 )
 

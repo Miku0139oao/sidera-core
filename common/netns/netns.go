@@ -3,7 +3,7 @@ package netns
 import (
 	"os"
 
-	"github.com/sagernet/sing-box/adapter"
+	"github.com/Miku0139oao/sidera-core/adapter"
 )
 
 var _ adapter.NetworkNamespaceManager = (*Manager)(nil)

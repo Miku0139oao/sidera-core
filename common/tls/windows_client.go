@@ -14,8 +14,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/sagernet/sing-box/common/schannel"
-	"github.com/sagernet/sing-box/option"
+	"github.com/Miku0139oao/sidera-core/common/schannel"
+	"github.com/Miku0139oao/sidera-core/option"
 	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/bufio"
 	E "github.com/sagernet/sing/common/exceptions"

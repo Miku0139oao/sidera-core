@@ -5,7 +5,7 @@ import (
 	"net"
 	"net/http"
 
-	"github.com/sagernet/sing-box/common/tls"
+	"github.com/Miku0139oao/sidera-core/common/tls"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 )

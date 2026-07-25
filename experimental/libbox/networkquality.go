@@ -4,7 +4,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/sagernet/sing-box/common/networkquality"
+	"github.com/Miku0139oao/sidera-core/common/networkquality"
 )
 
 type NetworkQualityTest struct {

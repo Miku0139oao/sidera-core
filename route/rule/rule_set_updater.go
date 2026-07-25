@@ -5,7 +5,7 @@ import (
 	"runtime"
 	"time"
 
-	"github.com/sagernet/sing-box/adapter"
+	"github.com/Miku0139oao/sidera-core/adapter"
 )
 
 type RuleSetUpdater struct {

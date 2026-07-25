@@ -3,16 +3,16 @@
 package include
 
 import (
-	"github.com/sagernet/sing-box/adapter/inbound"
-	"github.com/sagernet/sing-box/adapter/outbound"
-	"github.com/sagernet/sing-box/adapter/service"
-	"github.com/sagernet/sing-box/dns"
-	"github.com/sagernet/sing-box/dns/transport/quic"
-	"github.com/sagernet/sing-box/protocol/hysteria"
-	"github.com/sagernet/sing-box/protocol/hysteria2"
-	_ "github.com/sagernet/sing-box/protocol/naive/quic"
-	"github.com/sagernet/sing-box/protocol/tuic"
-	_ "github.com/sagernet/sing-box/transport/v2rayquic"
+	"github.com/Miku0139oao/sidera-core/adapter/inbound"
+	"github.com/Miku0139oao/sidera-core/adapter/outbound"
+	"github.com/Miku0139oao/sidera-core/adapter/service"
+	"github.com/Miku0139oao/sidera-core/dns"
+	"github.com/Miku0139oao/sidera-core/dns/transport/quic"
+	"github.com/Miku0139oao/sidera-core/protocol/hysteria"
+	"github.com/Miku0139oao/sidera-core/protocol/hysteria2"
+	_ "github.com/Miku0139oao/sidera-core/protocol/naive/quic"
+	"github.com/Miku0139oao/sidera-core/protocol/tuic"
+	_ "github.com/Miku0139oao/sidera-core/transport/v2rayquic"
 )
 
 func registerQUICInbounds(registry *inbound.Registry) {

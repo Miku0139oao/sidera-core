@@ -1,31 +1,49 @@
-# sing-box
+# Sidera Core
 
-The universal proxy platform.
+Sidera Core is a single-data-plane universal proxy core for Linux and Windows.
+It is derived from sing-box and is being extended with selected Xray-core
+capabilities behind one router, DNS engine, lifecycle, and configuration model.
 
-[![Packaging status](https://repology.org/badge/vertical-allrepos/sing-box.svg)](https://repology.org/project/sing-box/versions)
+The project is under active development. No compatibility or security claim is
+made until the corresponding item is green in the published compatibility
+matrix.
 
-## Documentation
+## Configuration Status
 
-https://sing-box.sagernet.org
+- Native sing-box JSON remains the default and is decoded unchanged.
+- Xray JSON is detected automatically. The current translation slice covers
+  local SOCKS, mixed, and HTTP inbounds; VLESS, freedom, and blackhole
+  outbounds; TLS, REALITY, WebSocket, gRPC, HTTPUpgrade; and common field-based
+  routing rules.
+- Unsupported Xray fields fail with an explicit error. Multi-file Xray merge,
+  mixed-dialect merge, and rewriting Xray input through `format` or `merge` are
+  not enabled yet because their native semantics are not preserved.
+
+## Goals
+
+- Load native sing-box and Xray configuration dialects without silent field loss.
+- Preserve the broad protocol, DNS, routing, TUN, endpoint, and service support
+  of the sing-box architecture.
+- Add Xray capabilities such as VLESS Encryption, current Vision/XUDP behavior,
+  XHTTP, FinalMask, fallback, and reverse proxy without embedding a second core.
+- Gate releases on bidirectional upstream interoperability, fuzzing, race tests,
+  and repeatable performance measurements.
+
+## Build
+
+```sh
+go build ./cmd/sidera
+```
+
+The release build profiles and optional feature tags are listed in `release/`.
+
+## Provenance
+
+Sidera Core is an independent derivative and is not affiliated with SagerNet,
+sing-box, Project X, or Xray-core. See `UPSTREAM.md` and `NOTICE.md` for pinned
+source revisions and attribution.
 
 ## License
 
-```
-Copyright (C) 2022 by nekohasekai <contact-sagernet@sekai.icu>
-
-This program is free software: you can redistribute it and/or modify
-it under the terms of the GNU General Public License as published by
-the Free Software Foundation, either version 3 of the License, or
-(at your option) any later version.
-
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-GNU General Public License for more details.
-
-You should have received a copy of the GNU General Public License
-along with this program. If not, see <http://www.gnu.org/licenses/>.
-
-In addition, no derivative work may use the name or imply association
-with this application without prior consent.
-```
+The combined project is distributed under GPL-3.0-or-later. Files derived from
+MPL-2.0 sources retain their notices and MPL-2.0 obligations.

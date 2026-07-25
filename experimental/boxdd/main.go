@@ -6,9 +6,9 @@ import (
 	"os"
 	"time"
 
-	C "github.com/sagernet/sing-box/constant"
-	"github.com/sagernet/sing-box/daemon"
-	"github.com/sagernet/sing-box/log"
+	C "github.com/Miku0139oao/sidera-core/constant"
+	"github.com/Miku0139oao/sidera-core/daemon"
+	"github.com/Miku0139oao/sidera-core/log"
 
 	"github.com/spf13/cobra"
 )

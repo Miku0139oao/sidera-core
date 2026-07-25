@@ -4,7 +4,7 @@ import (
 	"net"
 	"strings"
 
-	"github.com/sagernet/sing-box/adapter"
+	"github.com/Miku0139oao/sidera-core/adapter"
 )
 
 var _ RuleItem = (*SourceMACAddressItem)(nil)

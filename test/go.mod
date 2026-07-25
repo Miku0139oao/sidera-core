@@ -2,9 +2,9 @@ module test
 
 go 1.24.7
 
-require github.com/sagernet/sing-box v0.0.0
+require github.com/Miku0139oao/sidera-core v0.0.0
 
-replace github.com/sagernet/sing-box => ../
+replace github.com/Miku0139oao/sidera-core => ../
 
 require (
 	github.com/docker/docker v27.3.1+incompatible

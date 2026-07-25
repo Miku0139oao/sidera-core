@@ -1,6 +1,6 @@
 package geosite
 
-import "github.com/sagernet/sing-box/option"
+import "github.com/Miku0139oao/sidera-core/option"
 
 type ItemType = uint8
 

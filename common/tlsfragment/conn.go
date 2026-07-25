@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	C "github.com/sagernet/sing-box/constant"
+	C "github.com/Miku0139oao/sidera-core/constant"
 	N "github.com/sagernet/sing/common/network"
 
 	"golang.org/x/net/publicsuffix"

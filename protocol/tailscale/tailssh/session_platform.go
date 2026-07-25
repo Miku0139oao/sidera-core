@@ -6,7 +6,7 @@ import (
 	"os"
 	"syscall"
 
-	"github.com/sagernet/sing-box/adapter"
+	"github.com/Miku0139oao/sidera-core/adapter"
 	"github.com/sagernet/sing/common"
 )
 

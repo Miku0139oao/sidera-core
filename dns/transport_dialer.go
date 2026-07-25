@@ -3,8 +3,8 @@ package dns
 import (
 	"context"
 
-	"github.com/sagernet/sing-box/common/dialer"
-	"github.com/sagernet/sing-box/option"
+	"github.com/Miku0139oao/sidera-core/common/dialer"
+	"github.com/Miku0139oao/sidera-core/option"
 	N "github.com/sagernet/sing/common/network"
 )
 

@@ -3,7 +3,7 @@ package option
 import (
 	"reflect"
 
-	"github.com/sagernet/sing-box/schema"
+	"github.com/Miku0139oao/sidera-core/schema"
 	"github.com/sagernet/sing/common/byteformats"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/json"

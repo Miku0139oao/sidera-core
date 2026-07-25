@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/sagernet/sing-box/log"
+	"github.com/Miku0139oao/sidera-core/log"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/service/filemanager"
 )

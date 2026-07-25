@@ -1,7 +1,7 @@
 package build_shared
 
 import (
-	"github.com/sagernet/sing-box/common/badversion"
+	"github.com/Miku0139oao/sidera-core/common/badversion"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/shell"
 )

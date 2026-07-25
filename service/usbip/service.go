@@ -3,9 +3,9 @@
 package usbip
 
 import (
-	boxService "github.com/sagernet/sing-box/adapter/service"
-	C "github.com/sagernet/sing-box/constant"
-	"github.com/sagernet/sing-box/option"
+	boxService "github.com/Miku0139oao/sidera-core/adapter/service"
+	C "github.com/Miku0139oao/sidera-core/constant"
+	"github.com/Miku0139oao/sidera-core/option"
 	"github.com/sagernet/sing-usbip"
 )
 

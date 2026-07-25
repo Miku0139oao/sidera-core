@@ -3,7 +3,7 @@ package ccm
 import (
 	"sync"
 
-	"github.com/sagernet/sing-box/option"
+	"github.com/Miku0139oao/sidera-core/option"
 )
 
 type UserManager struct {

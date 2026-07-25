@@ -9,29 +9,29 @@ import (
 	"runtime/debug"
 	"time"
 
-	"github.com/sagernet/sing-box/adapter"
-	boxCertificate "github.com/sagernet/sing-box/adapter/certificate"
-	"github.com/sagernet/sing-box/adapter/endpoint"
-	"github.com/sagernet/sing-box/adapter/inbound"
-	"github.com/sagernet/sing-box/adapter/outbound"
-	boxService "github.com/sagernet/sing-box/adapter/service"
-	"github.com/sagernet/sing-box/common/certificate"
-	"github.com/sagernet/sing-box/common/dialer"
-	"github.com/sagernet/sing-box/common/httpclient"
-	"github.com/sagernet/sing-box/common/netns"
-	"github.com/sagernet/sing-box/common/taskmonitor"
-	"github.com/sagernet/sing-box/common/tls"
-	"github.com/sagernet/sing-box/common/trafficcontrol"
-	"github.com/sagernet/sing-box/common/urltest"
-	C "github.com/sagernet/sing-box/constant"
-	"github.com/sagernet/sing-box/dns"
-	"github.com/sagernet/sing-box/experimental"
-	"github.com/sagernet/sing-box/experimental/cachefile"
-	"github.com/sagernet/sing-box/experimental/deprecated"
-	"github.com/sagernet/sing-box/log"
-	"github.com/sagernet/sing-box/option"
-	"github.com/sagernet/sing-box/protocol/direct"
-	"github.com/sagernet/sing-box/route"
+	"github.com/Miku0139oao/sidera-core/adapter"
+	boxCertificate "github.com/Miku0139oao/sidera-core/adapter/certificate"
+	"github.com/Miku0139oao/sidera-core/adapter/endpoint"
+	"github.com/Miku0139oao/sidera-core/adapter/inbound"
+	"github.com/Miku0139oao/sidera-core/adapter/outbound"
+	boxService "github.com/Miku0139oao/sidera-core/adapter/service"
+	"github.com/Miku0139oao/sidera-core/common/certificate"
+	"github.com/Miku0139oao/sidera-core/common/dialer"
+	"github.com/Miku0139oao/sidera-core/common/httpclient"
+	"github.com/Miku0139oao/sidera-core/common/netns"
+	"github.com/Miku0139oao/sidera-core/common/taskmonitor"
+	"github.com/Miku0139oao/sidera-core/common/tls"
+	"github.com/Miku0139oao/sidera-core/common/trafficcontrol"
+	"github.com/Miku0139oao/sidera-core/common/urltest"
+	C "github.com/Miku0139oao/sidera-core/constant"
+	"github.com/Miku0139oao/sidera-core/dns"
+	"github.com/Miku0139oao/sidera-core/experimental"
+	"github.com/Miku0139oao/sidera-core/experimental/cachefile"
+	"github.com/Miku0139oao/sidera-core/experimental/deprecated"
+	"github.com/Miku0139oao/sidera-core/log"
+	"github.com/Miku0139oao/sidera-core/option"
+	"github.com/Miku0139oao/sidera-core/protocol/direct"
+	"github.com/Miku0139oao/sidera-core/route"
 	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
 	F "github.com/sagernet/sing/common/format"
@@ -497,7 +497,7 @@ func (s *Box) PreStart() error {
 		s.Close()
 		return err
 	}
-	s.logger.Info("sing-box pre-started (", F.Seconds(time.Since(s.createdAt).Seconds()), "s)")
+	s.logger.Info("Sidera Core pre-started (", F.Seconds(time.Since(s.createdAt).Seconds()), "s)")
 	return nil
 }
 
@@ -516,7 +516,7 @@ func (s *Box) Start() error {
 		s.Close()
 		return err
 	}
-	s.logger.Info("sing-box started (", F.Seconds(time.Since(s.createdAt).Seconds()), "s)")
+	s.logger.Info("Sidera Core started (", F.Seconds(time.Since(s.createdAt).Seconds()), "s)")
 	return nil
 }
 

@@ -1,7 +1,7 @@
 package hysteria
 
 import (
-	"github.com/sagernet/sing-box/option"
+	"github.com/Miku0139oao/sidera-core/option"
 	qtls "github.com/sagernet/sing-quic"
 )
 

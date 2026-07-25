@@ -1,6 +1,6 @@
 package settings
 
-import "github.com/sagernet/sing-box/adapter"
+import "github.com/Miku0139oao/sidera-core/adapter"
 
 type WIFIMonitor interface {
 	ReadWIFIState() adapter.WIFIState

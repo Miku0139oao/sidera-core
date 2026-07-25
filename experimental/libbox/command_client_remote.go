@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/sagernet/sing-box/daemon"
+	"github.com/Miku0139oao/sidera-core/daemon"
 	E "github.com/sagernet/sing/common/exceptions"
 
 	"google.golang.org/grpc"
