@@ -1,14 +1,14 @@
 -s dir
---name sing-box
+--name sidera
 --category net
 --license GPL-3.0-or-later
---description "The universal proxy platform."
---url "https://sing-box.sagernet.org/"
---maintainer "nekohasekai <contact-git@sekai.icu>"
+--description "Single-data-plane universal proxy core."
+--url "https://github.com/Miku0139oao/sidera-core"
+--maintainer "Miku0139oao <62833794+Miku0139oao@users.noreply.github.com>"
 --no-deb-generate-changes
 
---config-files /etc/config/sing-box
---config-files /etc/sing-box/config.json
+--config-files /etc/config/sidera
+--config-files /etc/sidera/config.json
 
 --depends ca-bundle
 --depends kmod-inet-diag
@@ -18,14 +18,14 @@
 
 --before-remove release/config/openwrt.prerm
 
-release/config/config.json=/etc/sing-box/config.json
+release/config/config.json=/etc/sidera/config.json
 
-release/config/openwrt.conf=/etc/config/sing-box
-release/config/openwrt.init=/etc/init.d/sing-box
-release/config/openwrt.keep=/lib/upgrade/keep.d/sing-box
+release/config/openwrt.conf=/etc/config/sidera
+release/config/openwrt.init=/etc/init.d/sidera
+release/config/openwrt.keep=/lib/upgrade/keep.d/sidera
 
-release/completions/sing-box.bash=/usr/share/bash-completion/completions/sing-box.bash
-release/completions/sing-box.fish=/usr/share/fish/vendor_completions.d/sing-box.fish
-release/completions/sing-box.zsh=/usr/share/zsh/site-functions/_sing-box
+release/completions/sidera.bash=/usr/share/bash-completion/completions/sidera.bash
+release/completions/sidera.fish=/usr/share/fish/vendor_completions.d/sidera.fish
+release/completions/sidera.zsh=/usr/share/zsh/site-functions/_sidera
 
-LICENSE=/usr/share/licenses/sing-box/LICENSE
+LICENSE=/usr/share/licenses/sidera/LICENSE

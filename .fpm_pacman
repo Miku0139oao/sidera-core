@@ -1,23 +1,23 @@
 -s dir
---name sing-box
+--name sidera
 --category net
 --license GPL-3.0-or-later
---description "The universal proxy platform."
---url "https://sing-box.sagernet.org/"
---maintainer "nekohasekai <contact-git@sekai.icu>"
---config-files etc/sing-box/config.json
---after-install release/config/sing-box.postinst
+--description "Single-data-plane universal proxy core."
+--url "https://github.com/Miku0139oao/sidera-core"
+--maintainer "Miku0139oao <62833794+Miku0139oao@users.noreply.github.com>"
+--config-files etc/sidera/config.json
+--after-install release/config/sidera.postinst
 
-release/config/config.json=/etc/sing-box/config.json
+release/config/config.json=/etc/sidera/config.json
 
-release/config/sing-box.service=/usr/lib/systemd/system/sing-box.service
-release/config/sing-box@.service=/usr/lib/systemd/system/sing-box@.service
-release/config/sing-box.sysusers=/usr/lib/sysusers.d/sing-box.conf
-release/config/sing-box.rules=usr/share/polkit-1/rules.d/sing-box.rules
-release/config/sing-box-split-dns.xml=/usr/share/dbus-1/system.d/sing-box-split-dns.conf
+release/config/sidera.service=/usr/lib/systemd/system/sidera.service
+release/config/sidera@.service=/usr/lib/systemd/system/sidera@.service
+release/config/sidera.sysusers=/usr/lib/sysusers.d/sidera.conf
+release/config/sidera.rules=/usr/share/polkit-1/rules.d/sidera.rules
+release/config/sidera-split-dns.xml=/usr/share/dbus-1/system.d/sidera-split-dns.conf
 
-release/completions/sing-box.bash=/usr/share/bash-completion/completions/sing-box.bash
-release/completions/sing-box.fish=/usr/share/fish/vendor_completions.d/sing-box.fish
-release/completions/sing-box.zsh=/usr/share/zsh/site-functions/_sing-box
+release/completions/sidera.bash=/usr/share/bash-completion/completions/sidera.bash
+release/completions/sidera.fish=/usr/share/fish/vendor_completions.d/sidera.fish
+release/completions/sidera.zsh=/usr/share/zsh/site-functions/_sidera
 
-LICENSE=/usr/share/licenses/sing-box/LICENSE
+LICENSE=/usr/share/licenses/sidera/LICENSE

@@ -1,23 +1,23 @@
 #!/sbin/openrc-run
 
 name=$RC_SVCNAME
-description="sing-box service"
+description="Sidera Core service"
 supervisor="supervise-daemon"
-command="/usr/bin/sing-box"
+command="/usr/bin/sidera"
 extra_commands="checkconfig"
 extra_started_commands="reload"
 
-: ${SINGBOX_CONFIG:=${config:-"/etc/sing-box"}}
+: ${SIDERA_CONFIG:=${config:-"/etc/sidera"}}
 
-if [ -d "$SINGBOX_CONFIG" ]; then
-	_config_opt="-C $SINGBOX_CONFIG"
-elif [ -z "$SINGBOX_CONFIG" ]; then
+if [ -d "$SIDERA_CONFIG" ]; then
+	_config_opt="-C $SIDERA_CONFIG"
+elif [ -z "$SIDERA_CONFIG" ]; then
 	_config_opt=""
 else
-	_config_opt="-c $SINGBOX_CONFIG"
+	_config_opt="-c $SIDERA_CONFIG"
 fi
 
-_workdir=${SINGBOX_WORKDIR:-${workdir:-"/var/lib/sing-box"}}
+_workdir=${SIDERA_WORKDIR:-${workdir:-"/var/lib/sidera"}}
 
 command_args="run --disable-color
 	-D $_workdir
@@ -29,7 +29,7 @@ depend() {
 
 checkconfig() {
 	ebegin "Checking $RC_SVCNAME configuration"
-	sing-box check -D "$_workdir" $_config_opt
+	sidera check -D "$_workdir" $_config_opt
 	eend $?
 }
 

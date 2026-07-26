@@ -21,6 +21,7 @@ type _APIDashboardOptions struct {
 	Enabled        bool               `json:"enabled,omitempty"`
 	Path           string             `json:"path,omitempty"`
 	DownloadURL    string             `json:"download_url,omitempty"`
+	DataPath       string             `json:"data_path,omitempty"`
 	HTTPClient     *HTTPClientOptions `json:"http_client,omitempty"`
 	UpdateInterval badoption.Duration `json:"update_interval,omitempty"`
 }
@@ -28,7 +29,7 @@ type _APIDashboardOptions struct {
 type APIDashboardOptions _APIDashboardOptions
 
 func (o APIDashboardOptions) MarshalJSON() ([]byte, error) {
-	if o.DownloadURL == "" && o.HTTPClient == nil && o.UpdateInterval == 0 {
+	if o.DownloadURL == "" && o.DataPath == "" && o.HTTPClient == nil && o.UpdateInterval == 0 {
 		if o.Path == "" {
 			return json.Marshal(o.Enabled)
 		}

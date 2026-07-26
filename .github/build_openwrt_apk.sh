@@ -38,21 +38,21 @@ prepare_apk_root
 trap 'rm -rf "$ROOT_DIR" "$APK_ROOT_DIR"' EXIT
 
 # Binary
-install -Dm755 "$BINARY_PATH" "$ROOT_DIR/usr/bin/sing-box"
+install -Dm755 "$BINARY_PATH" "$ROOT_DIR/usr/bin/sidera"
 
 # Config files
-install -Dm644 "$PROJECT/release/config/config.json" "$ROOT_DIR/etc/sing-box/config.json"
-install -Dm644 "$PROJECT/release/config/openwrt.conf" "$ROOT_DIR/etc/config/sing-box"
-install -Dm755 "$PROJECT/release/config/openwrt.init" "$ROOT_DIR/etc/init.d/sing-box"
-install -Dm644 "$PROJECT/release/config/openwrt.keep" "$ROOT_DIR/lib/upgrade/keep.d/sing-box"
+install -Dm644 "$PROJECT/release/config/config.json" "$ROOT_DIR/etc/sidera/config.json"
+install -Dm644 "$PROJECT/release/config/openwrt.conf" "$ROOT_DIR/etc/config/sidera"
+install -Dm755 "$PROJECT/release/config/openwrt.init" "$ROOT_DIR/etc/init.d/sidera"
+install -Dm644 "$PROJECT/release/config/openwrt.keep" "$ROOT_DIR/lib/upgrade/keep.d/sidera"
 
 # Completions
-install -Dm644 "$PROJECT/release/completions/sing-box.bash" "$ROOT_DIR/usr/share/bash-completion/completions/sing-box.bash"
-install -Dm644 "$PROJECT/release/completions/sing-box.fish" "$ROOT_DIR/usr/share/fish/vendor_completions.d/sing-box.fish"
-install -Dm644 "$PROJECT/release/completions/sing-box.zsh" "$ROOT_DIR/usr/share/zsh/site-functions/_sing-box"
+install -Dm644 "$PROJECT/release/completions/sidera.bash" "$ROOT_DIR/usr/share/bash-completion/completions/sidera.bash"
+install -Dm644 "$PROJECT/release/completions/sidera.fish" "$ROOT_DIR/usr/share/fish/vendor_completions.d/sidera.fish"
+install -Dm644 "$PROJECT/release/completions/sidera.zsh" "$ROOT_DIR/usr/share/zsh/site-functions/_sidera"
 
 # License
-install -Dm644 "$PROJECT/LICENSE" "$ROOT_DIR/usr/share/licenses/sing-box/LICENSE"
+install -Dm644 "$PROJECT/LICENSE" "$ROOT_DIR/usr/share/licenses/sidera/LICENSE"
 
 # APK metadata
 PACKAGES_DIR="$ROOT_DIR/lib/apk/packages"
@@ -60,8 +60,8 @@ mkdir -p "$PACKAGES_DIR"
 
 # .conffiles
 cat > "$PACKAGES_DIR/.conffiles" <<'EOF'
-/etc/config/sing-box
-/etc/sing-box/config.json
+/etc/config/sidera
+/etc/sidera/config.json
 EOF
 
 # .conffiles_static (sha256 checksums)
@@ -78,14 +78,14 @@ done < "$PACKAGES_DIR/.conffiles" > "$PACKAGES_DIR/.conffiles_static"
 
 # Build APK
 apk --root "$APK_ROOT_DIR" mkpkg \
-  --info "name:sing-box" \
+  --info "name:sidera" \
   --info "version:${APK_VERSION}" \
-  --info "description:The universal proxy platform." \
+  --info "description:Single-data-plane universal proxy core." \
   --info "arch:${ARCHITECTURE}" \
   --info "license:GPL-3.0-or-later" \
-  --info "origin:sing-box" \
-  --info "url:https://sing-box.sagernet.org/" \
-  --info "maintainer:nekohasekai <contact-git@sekai.icu>" \
+  --info "origin:sidera" \
+  --info "url:https://github.com/Miku0139oao/sidera-core" \
+  --info "maintainer:Miku0139oao <62833794+Miku0139oao@users.noreply.github.com>" \
   --info "depends:ca-bundle kmod-inet-diag kmod-tun firewall4 kmod-nft-queue" \
   --info "provider-priority:100" \
   --script "pre-deinstall:${PROJECT}/release/config/openwrt.prerm" \

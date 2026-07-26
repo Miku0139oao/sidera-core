@@ -4,9 +4,9 @@ icon: material/new-box
 
 !!! question "自 sing-box 1.14.0 起"
 
-# sing-box API
+# Sidera API
 
-sing-box API 服务是用于观察与控制正在运行的 sing-box 实例的 gRPC 服务器。
+Sidera API 服务提供 gRPC 远程控制、内置 Material 3 管理界面、节点与用户管理、流量额度和实时连接管理。
 
 它可以由 iOS、macOS 和 Android 上的 [sing-box 图形客户端](/zh/clients/)（通过 Remote Control 功能）或 [sing-box dashboard](https://github.com/SagerNet/sing-box-dashboard) 访问。
 
@@ -28,6 +28,7 @@ sing-box API 服务是用于观察与控制正在运行的 sing-box 实例的 gR
     "enabled": true,
     "path": "",
     "download_url": "",
+    "data_path": "sidera-dashboard.json",
     "http_client": "", // 或 {}
     "update_interval": ""
   },
@@ -59,7 +60,9 @@ API 密钥。
 
 #### dashboard
 
-下载并通过 API 监听器在 `/dashboard/` 提供的 Web 仪表板；其他浏览器请求将被重定向到该路径。
+通过 API 监听器在 `/dashboard/` 提供的 Web 仪表板；其他浏览器请求将被重定向到该路径。`path` 与 `download_url` 均为空时使用内置 Sidera 管理界面。
+
+内置管理界面支持所有远程 Server 协议：SOCKS、HTTP、Mixed、Shadowsocks、Snell、VMess、Trojan、Naive、ShadowTLS、VLESS、AnyTLS、Hysteria、TUIC、Hysteria2 与 OpenVPN Server。结构变更会先持久化，再通过经过完整检查的 Core 重载套用。
 
 !!! info ""
 
@@ -72,9 +75,7 @@ API 密钥。
 
 ##### path
 
-存放仪表板文件的目录。
-
-默认使用工作目录下的 `dashboard`。
+自定义仪表板文件目录。留空时使用内置管理界面，除非配置了 `download_url`。
 
 如果目录为空，将下载仪表板，并在其中存放 `.etag` 文件以跳过未变更的更新。
 非空且不含 `.etag` 文件的目录将按原样提供，且不会自动更新。
@@ -83,7 +84,15 @@ API 密钥。
 
 仪表板压缩包（zip）的下载 URL。
 
-默认使用 `https://github.com/SagerNet/sing-box-dashboard/archive/refs/heads/gh-pages.zip`。
+留空时使用内置 Sidera 管理界面。
+
+##### data_path
+
+管理数据 sidecar 路径，保存由面板建立的 Server 配置、凭证、额度、到期时间与流量统计。文件以 `0600` 权限原子写入，父目录使用 `0700`。
+
+默认使用工作目录下的 `sidera-dashboard.json`。
+
+当 Xray/x-ui 从 `config.json` 启动时，可额外建立原生 `config.json.sidera.json`，其中仅配置 Sidera API 服务。这样 x-ui 重新生成主配置时不会移除管理界面；面板节点则从 `data_path` 载入。
 
 ##### http_client
 

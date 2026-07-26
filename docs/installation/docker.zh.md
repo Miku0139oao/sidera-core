@@ -8,12 +8,12 @@ icon: material/docker
 
 ```bash
 docker run -d \
-  -v /etc/sing-box:/etc/sing-box/ \
-  --name=sing-box \
+  -v /etc/sidera:/etc/sidera/ \
+  --name=sidera \
   --restart=always \
-  ghcr.io/sagernet/sing-box \
-  -D /var/lib/sing-box \
-  -C /etc/sing-box/ run
+  ghcr.io/miku0139oao/sidera \
+  -D /var/lib/sidera \
+  -C /etc/sidera/ run
 ```
 
 ## :material-box-shadow: Compose
@@ -21,11 +21,11 @@ docker run -d \
 ```yaml
 version: "3.8"
 services:
-  sing-box:
-    image: ghcr.io/sagernet/sing-box
-    container_name: sing-box
+  sidera:
+    image: ghcr.io/miku0139oao/sidera
+    container_name: sidera
     restart: always
     volumes:
-      - /etc/sing-box:/etc/sing-box/
-    command: -D /var/lib/sing-box -C /etc/sing-box/ run
+      - /etc/sidera:/etc/sidera/
+    command: -D /var/lib/sidera -C /etc/sidera/ run
 ```

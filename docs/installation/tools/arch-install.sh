@@ -12,11 +12,11 @@ case "${ARCH_RAW}" in
     *)          echo "Unsupported architecture: ${ARCH_RAW}"; exit 1;;
 esac
 
-VERSION=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest \
+VERSION=$(curl -s https://api.github.com/repos/Miku0139oao/sidera-core/releases/latest \
     | grep tag_name \
     | cut -d ":" -f2 \
     | sed 's/\"//g;s/\,//g;s/\ //g;s/v//')
 
-curl -Lo sing-box.pkg.tar.zst "https://github.com/SagerNet/sing-box/releases/download/v${VERSION}/sing-box_${VERSION}_linux_${ARCH}.pkg.tar.zst"
-sudo pacman -U sing-box.pkg.tar.zst
-rm sing-box.pkg.tar.zst
+curl -Lo sidera.pkg.tar.zst "https://github.com/Miku0139oao/sidera-core/releases/download/v${VERSION}/sidera_${VERSION}_linux_${ARCH}.pkg.tar.zst"
+sudo pacman -U sidera.pkg.tar.zst
+rm sidera.pkg.tar.zst

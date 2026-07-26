@@ -41,6 +41,7 @@ type dashboard struct {
 	url            string
 	updateInterval time.Duration
 	fileServer     http.Handler
+	builtIn        bool
 	httpClient     *http.Client
 	lastEtag       string
 	lastUpdated    time.Time
@@ -48,6 +49,17 @@ type dashboard struct {
 
 func newDashboard(ctx context.Context, logger log.ContextLogger, options option.APIDashboardOptions) *dashboard {
 	ctx, cancel := context.WithCancel(ctx)
+	builtIn := options.Path == "" && options.DownloadURL == ""
+	if builtIn {
+		return &dashboard{
+			ctx:        ctx,
+			cancel:     cancel,
+			logger:     logger,
+			options:    options,
+			fileServer: http.StripPrefix(dashboardRoutePrefix, newBuiltInDashboardHandler()),
+			builtIn:    true,
+		}
+	}
 	path := options.Path
 	if path == "" {
 		path = "dashboard"
@@ -74,6 +86,9 @@ func newDashboard(ctx context.Context, logger log.ContextLogger, options option.
 }
 
 func (d *dashboard) start() error {
+	if d.builtIn {
+		return nil
+	}
 	_, err := filemanager.ReadDir(d.ctx, d.path)
 	if err != nil && !os.IsNotExist(err) {
 		return E.Cause(err, "read dashboard directory")
@@ -271,11 +286,28 @@ func (d *dashboard) extract(body io.Reader, etag string) error {
 		filemanager.RemoveAll(d.ctx, tempDir)
 		return err
 	}
-	err = filemanager.RemoveAll(d.ctx, d.path)
-	if err != nil {
+	backupDir := d.path + ".old"
+	_ = filemanager.RemoveAll(d.ctx, backupDir)
+	_, statErr := filemanager.Stat(d.ctx, d.path)
+	hasCurrent := statErr == nil
+	if statErr != nil && !os.IsNotExist(statErr) {
+		return statErr
+	}
+	if hasCurrent {
+		if err = filemanager.Rename(d.ctx, d.path, backupDir); err != nil {
+			return err
+		}
+	}
+	if err = filemanager.Rename(d.ctx, tempDir, d.path); err != nil {
+		if hasCurrent {
+			_ = filemanager.Rename(d.ctx, backupDir, d.path)
+		}
 		return err
 	}
-	return filemanager.Rename(d.ctx, tempDir, d.path)
+	if hasCurrent {
+		_ = filemanager.RemoveAll(d.ctx, backupDir)
+	}
+	return nil
 }
 
 func extractZipEntry(ctx context.Context, file *zip.File, savePath string) error {

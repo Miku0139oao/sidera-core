@@ -43,13 +43,20 @@ type ClashAPIOptions struct {
 }
 
 type V2RayAPIOptions struct {
-	Listen string                    `json:"listen,omitempty"`
-	Stats  *V2RayStatsServiceOptions `json:"stats,omitempty"`
+	Listen       string                    `json:"listen,omitempty"`
+	Stats        *V2RayStatsServiceOptions `json:"stats,omitempty"`
+	Metrics      *V2RayMetricsOptions      `json:"metrics,omitempty"`
+	XrayServices []string                  `json:"xray_services,omitempty"`
 }
 
 type V2RayStatsServiceOptions struct {
-	Enabled   bool     `json:"enabled,omitempty"`
-	Inbounds  []string `json:"inbounds,omitempty"`
-	Outbounds []string `json:"outbounds,omitempty"`
-	Users     []string `json:"users,omitempty"`
+	Enabled     bool     `json:"enabled,omitempty"`
+	Inbounds    []string `json:"inbounds,omitempty"`
+	Outbounds   []string `json:"outbounds,omitempty"`
+	Users       []string `json:"users,omitempty"`
+	UsersOnline []string `json:"users_online,omitempty"`
+}
+
+type V2RayMetricsOptions struct {
+	Listen string `json:"listen,omitempty"`
 }

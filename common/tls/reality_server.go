@@ -9,6 +9,8 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/Miku0139oao/sidera-core/common/dialer"
@@ -101,6 +103,14 @@ func NewRealityServer(ctx context.Context, logger log.ContextLogger, options opt
 		return nil, E.New("invalid private key")
 	}
 	tlsConfig.PrivateKey = privateKey
+	tlsConfig.MinClientVer, err = parseRealityClientVersion(options.Reality.MinClientVersion)
+	if err != nil {
+		return nil, E.Cause(err, "parse REALITY min_client_version")
+	}
+	tlsConfig.MaxClientVer, err = parseRealityClientVersion(options.Reality.MaxClientVersion)
+	if err != nil {
+		return nil, E.Cause(err, "parse REALITY max_client_version")
+	}
 	tlsConfig.MaxTimeDiff = time.Duration(options.Reality.MaxTimeDifference)
 
 	tlsConfig.ShortIds = make(map[[8]byte]bool)
@@ -153,6 +163,25 @@ func NewRealityServer(ctx context.Context, logger log.ContextLogger, options opt
 		}
 	}
 	return config, nil
+}
+
+func parseRealityClientVersion(version string) ([]byte, error) {
+	if version == "" {
+		return nil, nil
+	}
+	parts := strings.Split(version, ".")
+	if len(parts) > 3 {
+		return nil, E.New("version must contain at most three components")
+	}
+	parsed := make([]byte, 3)
+	for index, part := range parts {
+		value, err := strconv.ParseUint(part, 10, 8)
+		if err != nil {
+			return nil, E.Cause(err, "parse version component ", index)
+		}
+		parsed[index] = byte(value)
+	}
+	return parsed, nil
 }
 
 func (c *RealityServerConfig) ServerName() string {

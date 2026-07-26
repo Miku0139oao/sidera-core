@@ -88,13 +88,27 @@ func inspectEndpointEvidence(raw stdjson.RawMessage, field string, singBoxEviden
 		return
 	}
 	for index, entry := range entries {
-		if hasJSONField(entry, "type") {
+		hasType := hasJSONField(entry, "type")
+		if hasType {
 			*singBoxEvidence = append(*singBoxEvidence, field+"["+strconv.Itoa(index)+"].type")
 		}
-		if hasJSONField(entry, "protocol") {
+		if hasJSONField(entry, "protocol") && !isNativeEndpointProtocol(entry, field) {
 			*xrayEvidence = append(*xrayEvidence, field+"["+strconv.Itoa(index)+"].protocol")
 		}
 	}
+}
+
+func isNativeEndpointProtocol(entry map[string]stdjson.RawMessage, field string) bool {
+	rawType, loaded := entry["type"]
+	if !loaded {
+		return false
+	}
+	var endpointType string
+	if err := json.Unmarshal(rawType, &endpointType); err != nil {
+		return false
+	}
+	return (field == "inbounds" && endpointType == "cloudflared") ||
+		(field == "outbounds" && endpointType == "shadowsocksr")
 }
 
 func inspectObjectEvidence(raw stdjson.RawMessage, field string, singBoxFields, xrayFields []string, singBoxEvidence, xrayEvidence *[]string) {

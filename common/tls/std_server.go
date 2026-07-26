@@ -9,12 +9,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/sagernet/fswatch"
 	"github.com/Miku0139oao/sidera-core/adapter"
 	C "github.com/Miku0139oao/sidera-core/constant"
 	"github.com/Miku0139oao/sidera-core/experimental/deprecated"
 	"github.com/Miku0139oao/sidera-core/log"
 	"github.com/Miku0139oao/sidera-core/option"
+	"github.com/sagernet/fswatch"
 	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/ntp"
@@ -362,6 +362,7 @@ func NewSTDServer(ctx context.Context, logger log.ContextLogger, options option.
 		tlsConfig = &tls.Config{}
 	}
 	tlsConfig.Time = ntp.TimeFuncFromContext(ctx)
+	tlsConfig.SessionTicketsDisabled = options.DisableSessionTickets
 	if options.ServerName != "" {
 		tlsConfig.ServerName = options.ServerName
 	}

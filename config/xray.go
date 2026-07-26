@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	stdjson "encoding/json"
+	"net"
 	"net/netip"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -82,8 +84,8 @@ type xrayMux struct {
 type xrayStream struct {
 	Address             *string            `json:"address"`
 	Port                uint16             `json:"port"`
-	Method              string             `json:"method"`
-	Network             string             `json:"network"`
+	Method              *string            `json:"method"`
+	Network             *string            `json:"network"`
 	Security            string             `json:"security"`
 	FinalMask           stdjson.RawMessage `json:"finalmask"`
 	TLSSettings         *xrayTLS           `json:"tlsSettings"`
@@ -170,12 +172,12 @@ type xrayReality struct {
 	Dest         stdjson.RawMessage `json:"dest"`
 	Type         string             `json:"type"`
 	XVer         uint64             `json:"xver"`
-	ServerNames  xrayStringList     `json:"serverNames"`
+	ServerNames  []string           `json:"serverNames"`
 	PrivateKey   string             `json:"privateKey"`
 	MinClientVer string             `json:"minClientVer"`
 	MaxClientVer string             `json:"maxClientVer"`
 	MaxTimeDiff  uint64             `json:"maxTimeDiff"`
-	ShortIDs     xrayStringList     `json:"shortIds"`
+	ShortIDs     []string           `json:"shortIds"`
 	MLDSA65Seed  string             `json:"mldsa65Seed"`
 
 	LimitFallbackUpload   xrayLimitFallback `json:"limitFallbackUpload"`
@@ -230,6 +232,15 @@ type xrayVLESSSettings struct {
 	TestPre    uint32             `json:"testpre"`
 	TestSeed   []uint32           `json:"testseed"`
 	VNext      []xrayVLESSNext    `json:"vnext"`
+}
+
+type xrayVLESSInboundSettings struct {
+	Users      []xrayVLESSUser      `json:"users"`
+	Clients    *[]xrayVLESSUser     `json:"clients"`
+	Decryption string               `json:"decryption"`
+	Fallbacks  []stdjson.RawMessage `json:"fallbacks"`
+	Flow       string               `json:"flow"`
+	TestSeed   []uint32             `json:"testseed"`
 }
 
 type xrayVLESSNext struct {
@@ -305,7 +316,7 @@ func (l *xrayStringList) UnmarshalJSON(content []byte) error {
 	}
 	var single string
 	if err := json.Unmarshal(content, &single); err == nil {
-		*l = xrayStringList{single}
+		*l = strings.Split(single, ",")
 		return nil
 	}
 	return json.Unmarshal(content, (*[]string)(l))
@@ -323,10 +334,6 @@ func translateXray(ctx context.Context, content []byte) (option.Options, error) 
 		{"transport", source.Transport},
 		{"env", source.Env},
 		{"dns", source.DNS},
-		{"policy", source.Policy},
-		{"api", source.API},
-		{"metrics", source.Metrics},
-		{"stats", source.Stats},
 		{"reverse", source.Reverse},
 		{"fakeDns", source.FakeDNS},
 		{"observatory", source.Observatory},
@@ -338,7 +345,14 @@ func translateXray(ctx context.Context, content []byte) (option.Options, error) 
 			return option.Options{}, unsupportedXrayField(field.name)
 		}
 	}
+	experimentalOptions, exclusions, err := translateXrayManagement(ctx, source)
+	if err != nil {
+		return option.Options{}, err
+	}
 	canonical := make(map[string]any)
+	if experimentalOptions != nil {
+		canonical["experimental"] = experimentalOptions
+	}
 	if source.Log == nil {
 		canonical["log"] = map[string]any{"level": "warn"}
 	} else {
@@ -354,6 +368,9 @@ func translateXray(ctx context.Context, content []byte) (option.Options, error) 
 	if len(source.Inbounds) > 0 {
 		inbounds := make([]map[string]any, 0, len(source.Inbounds))
 		for index, inbound := range source.Inbounds {
+			if exclusions.inbounds[index] {
+				continue
+			}
 			converted, generatedRules, convertErr := translateXrayInbound(ctx, inbound)
 			if convertErr != nil {
 				return option.Options{}, E.Cause(convertErr, "inbounds[", index, "]")
@@ -374,7 +391,7 @@ func translateXray(ctx context.Context, content []byte) (option.Options, error) 
 		}
 		canonical["outbounds"] = outbounds
 	}
-	convertedRoute, convertErr := translateXrayRouting(ctx, source.Routing)
+	convertedRoute, convertErr := translateXrayRouting(ctx, source.Routing, exclusions.routingRules)
 	if convertErr != nil {
 		return option.Options{}, convertErr
 	}
@@ -391,6 +408,15 @@ func translateXray(ctx context.Context, content []byte) (option.Options, error) 
 	options, err := json.UnmarshalExtendedContext[option.Options](ctx, canonicalContent)
 	if err != nil {
 		return option.Options{}, E.Cause(err, "decode canonical config")
+	}
+	for index, outbound := range source.Outbounds {
+		if !strings.EqualFold(outbound.Protocol, "vless") {
+			continue
+		}
+		vlessOptions, loaded := options.Outbounds[index].Options.(*option.VLESSOutboundOptions)
+		if loaded && vlessOptions.Flow == "" {
+			vlessOptions.XrayPacketEncoding = true
+		}
 	}
 	return options, nil
 }
@@ -440,9 +466,6 @@ func translateXrayInbound(ctx context.Context, source xrayInbound) (map[string]a
 	if source.Protocol == "" {
 		return nil, nil, E.New("missing protocol")
 	}
-	if source.StreamSettings != nil {
-		return nil, nil, unsupportedXrayField("streamSettings for inbound protocol " + source.Protocol)
-	}
 	port, err := parseSinglePort(source.Port)
 	if err != nil {
 		return nil, nil, E.Cause(err, "port")
@@ -466,6 +489,10 @@ func translateXrayInbound(ctx context.Context, source xrayInbound) (map[string]a
 	var generatedRules []map[string]any
 	switch strings.ToLower(source.Protocol) {
 	case "socks", "mixed":
+		if source.StreamSettings != nil {
+			return nil, nil, unsupportedXrayField("streamSettings for inbound protocol " + source.Protocol)
+		}
+		result["type"] = "mixed"
 		settings, decodeErr := decodeXrayObject[xraySocksSettings](ctx, source.Settings, "settings")
 		if decodeErr != nil {
 			return nil, nil, decodeErr
@@ -493,6 +520,9 @@ func translateXrayInbound(ctx context.Context, source xrayInbound) (map[string]a
 			return nil, nil, unsupportedXrayField("settings.ip")
 		}
 	case "http":
+		if source.StreamSettings != nil {
+			return nil, nil, unsupportedXrayField("streamSettings for inbound protocol " + source.Protocol)
+		}
 		settings, decodeErr := decodeXrayObject[xrayHTTPSettings](ctx, source.Settings, "settings")
 		if decodeErr != nil {
 			return nil, nil, decodeErr
@@ -509,6 +539,33 @@ func translateXrayInbound(ctx context.Context, source xrayInbound) (map[string]a
 		}
 		if len(accounts) > 0 {
 			result["users"] = translateAccounts(accounts)
+		}
+	case "vless":
+		settings, decodeErr := decodeXrayObject[xrayVLESSInboundSettings](ctx, source.Settings, "settings")
+		if decodeErr != nil {
+			return nil, nil, decodeErr
+		}
+		converted, convertErr := translateXrayVLESSInbound(settings)
+		if convertErr != nil {
+			return nil, nil, convertErr
+		}
+		for key, value := range converted {
+			result[key] = value
+		}
+		stream, convertErr := translateXrayVLESSInboundStream(source.StreamSettings)
+		if convertErr != nil {
+			return nil, nil, convertErr
+		}
+		for key, value := range stream {
+			result[key] = value
+		}
+	case "hysteria":
+		converted, convertErr := translateXrayHysteria2Inbound(ctx, source)
+		if convertErr != nil {
+			return nil, nil, convertErr
+		}
+		for key, value := range converted {
+			result[key] = value
 		}
 	default:
 		return nil, nil, E.New("unsupported Xray inbound protocol: ", source.Protocol)
@@ -547,12 +604,81 @@ func translateXrayInbound(ctx context.Context, source xrayInbound) (map[string]a
 	return result, generatedRules, nil
 }
 
+func translateXrayVLESSInbound(source xrayVLESSInboundSettings) (map[string]any, error) {
+	if source.Decryption == "" {
+		return nil, E.New("VLESS settings.decryption must be explicitly configured")
+	}
+	if len(source.Fallbacks) > 0 {
+		return nil, E.New("VLESS fallbacks are not implemented")
+	}
+	if source.Flow != "" && source.Flow != "xtls-rprx-vision" {
+		return nil, E.New("unsupported VLESS flow: ", source.Flow)
+	}
+	if !isDefaultXrayVisionSeed(source.TestSeed) {
+		return nil, E.New("custom VLESS testseed is not implemented")
+	}
+	users := source.Users
+	if source.Clients != nil {
+		users = *source.Clients
+	}
+	convertedUsers := make([]map[string]any, len(users))
+	for index, user := range users {
+		if user.ID == "" {
+			return nil, E.New("VLESS user ", index, " id is required")
+		}
+		if user.Level != 0 {
+			return nil, E.New("VLESS user level has no current Sidera equivalent")
+		}
+		if user.Encryption != "" {
+			return nil, E.New("VLESS inbound users cannot configure encryption")
+		}
+		if hasJSONValue(user.Reverse) || user.TestPre != 0 {
+			return nil, E.New("VLESS reverse/testpre fields are not supported")
+		}
+		if !isDefaultXrayVisionSeed(user.TestSeed) {
+			return nil, E.New("custom VLESS user testseed is not implemented")
+		}
+		flow := user.Flow
+		if flow == "" {
+			flow = source.Flow
+		}
+		if flow != "" && flow != "xtls-rprx-vision" {
+			return nil, E.New("unsupported VLESS user flow: ", flow)
+		}
+		convertedUser := map[string]any{
+			"name": user.Email,
+			"uuid": user.ID,
+		}
+		if flow != "" {
+			convertedUser["flow"] = flow
+		}
+		convertedUsers[index] = convertedUser
+	}
+	return map[string]any{
+		"users":      convertedUsers,
+		"decryption": source.Decryption,
+	}, nil
+}
+
+func isDefaultXrayVisionSeed(seed []uint32) bool {
+	if len(seed) < 4 {
+		return true
+	}
+	defaultSeed := [...]uint32{900, 500, 900, 256}
+	for index, value := range defaultSeed {
+		if seed[index] != value {
+			return false
+		}
+	}
+	return true
+}
+
 func translateAccounts(accounts []xrayAccount) []map[string]any {
 	result := make([]map[string]any, 0, len(accounts))
 	for _, account := range accounts {
 		result = append(result, map[string]any{
-			"username": account.User,
-			"password": account.Pass,
+			"Username": account.User,
+			"Password": account.Pass,
 		})
 	}
 	return result
@@ -603,7 +729,9 @@ func translateXrayOutbound(ctx context.Context, source xrayOutbound) (map[string
 				result[key] = value
 			}
 		}
-		if _, secure := result["tls"]; !secure && !isXrayPrivateAddress(converted["server"].(string)) {
+		_, secure := result["tls"]
+		encryption, _ := converted["encryption"].(string)
+		if !secure && encryption == "none" && !isXrayPrivateAddress(converted["server"].(string)) {
 			return nil, E.New("VLESS without TLS or other encryption is prohibited for a public server address")
 		}
 	case "freedom", "direct":
@@ -615,7 +743,7 @@ func translateXrayOutbound(ctx context.Context, source xrayOutbound) (map[string
 		if err != nil {
 			return nil, err
 		}
-		if err = validateFreedomSettings(settings); err != nil {
+		if err = validateFreedomSettings(ctx, settings); err != nil {
 			return nil, err
 		}
 	case "blackhole", "block":
@@ -685,11 +813,8 @@ func translateXrayVLESS(source xrayVLESSSettings) (map[string]any, error) {
 	if hasJSONValue(user.Reverse) || user.TestPre != 0 || len(user.TestSeed) > 0 {
 		return nil, E.New("VLESS reverse/test fields are not supported")
 	}
-	if user.Encryption != "none" {
-		if user.Encryption == "" {
-			return nil, E.New("VLESS user encryption must be explicitly set to none")
-		}
-		return nil, E.New("VLESS Encryption is not implemented: ", user.Encryption)
+	if user.Encryption == "" {
+		return nil, E.New("VLESS user encryption must be explicitly configured")
 	}
 	switch user.Flow {
 	case "", "xtls-rprx-vision":
@@ -702,6 +827,7 @@ func translateXrayVLESS(source xrayVLESSSettings) (map[string]any, error) {
 		"server":      address,
 		"server_port": port,
 		"uuid":        user.ID,
+		"encryption":  user.Encryption,
 	}
 	if user.Flow != "" {
 		result["flow"] = user.Flow
@@ -709,7 +835,170 @@ func translateXrayVLESS(source xrayVLESSSettings) (map[string]any, error) {
 	return result, nil
 }
 
-func validateFreedomSettings(source xrayFreedomSettings) error {
+func translateXrayVLESSInboundStream(source *xrayStream) (map[string]any, error) {
+	if source == nil {
+		source = new(xrayStream)
+	}
+	if source.Address != nil || source.Port != 0 {
+		return nil, E.New("streamSettings address/port overrides are not supported")
+	}
+	if err := rejectNonEmptyObject(source.FinalMask, "streamSettings.finalmask"); err != nil {
+		return nil, err
+	}
+	if err := rejectNonEmptyObject(source.SocketSettings, "streamSettings.sockopt"); err != nil {
+		return nil, err
+	}
+	network, err := xrayStreamNetwork(source)
+	if err != nil {
+		return nil, err
+	}
+	if network != "" && network != "raw" && network != "tcp" {
+		return nil, E.New("Xray VLESS inbound transport is not implemented: ", network)
+	}
+	tcpSettings := source.TCPSettings
+	if source.RawSettings != nil {
+		tcpSettings = source.RawSettings
+	}
+	if tcpSettings != nil {
+		if tcpSettings.AcceptProxyProtocol {
+			return nil, unsupportedXrayField("streamSettings.rawSettings.acceptProxyProtocol")
+		}
+		if err = validateXrayTCPHeader(tcpSettings.Header); err != nil {
+			return nil, err
+		}
+	}
+	result := make(map[string]any)
+	switch strings.ToLower(source.Security) {
+	case "", "none":
+	case "reality":
+		tlsOptions, translateErr := translateXrayInboundReality(source.RealitySettings)
+		if translateErr != nil {
+			return nil, translateErr
+		}
+		result["tls"] = tlsOptions
+	default:
+		return nil, E.New("unsupported Xray VLESS inbound stream security: ", source.Security)
+	}
+	return result, nil
+}
+
+func xrayStreamNetwork(source *xrayStream) (string, error) {
+	var network string
+	if source.Network != nil {
+		network = strings.ToLower(*source.Network)
+		if network == "" {
+			return "", E.New("streamSettings.network cannot be empty")
+		}
+	}
+	if source.Method != nil {
+		network = strings.ToLower(*source.Method)
+		if network == "" {
+			return "", E.New("streamSettings.method cannot be empty")
+		}
+	}
+	return network, nil
+}
+
+func validateXrayTCPHeader(raw stdjson.RawMessage) error {
+	if !hasJSONValue(raw) {
+		return nil
+	}
+	var header map[string]stdjson.RawMessage
+	if err := json.Unmarshal(raw, &header); err != nil {
+		return E.Cause(err, "decode streamSettings raw header")
+	}
+	var headerType string
+	if rawType, loaded := header["type"]; loaded {
+		if err := json.Unmarshal(rawType, &headerType); err != nil {
+			return E.Cause(err, "decode streamSettings raw header type")
+		}
+	}
+	if headerType != "" && !strings.EqualFold(headerType, "none") {
+		return unsupportedXrayField("streamSettings raw header type=" + headerType)
+	}
+	return nil
+}
+
+func translateXrayInboundReality(source *xrayReality) (map[string]any, error) {
+	if source == nil {
+		return nil, E.New("streamSettings.realitySettings is required")
+	}
+	if source.MasterKeyLog != "" || source.Type != "" && !strings.EqualFold(source.Type, "tcp") || source.XVer != 0 || source.MLDSA65Seed != "" || source.LimitFallbackUpload != (xrayLimitFallback{}) || source.LimitFallbackDownload != (xrayLimitFallback{}) {
+		return nil, E.New("Xray REALITY server settings contain fields without a current Sidera equivalent")
+	}
+	if source.Fingerprint != "" || source.ServerName != "" || source.Password != "" || source.PublicKey != "" || source.ShortID != "" || source.MLDSA65Verify != "" || source.SpiderX != "" {
+		return nil, E.New("Xray REALITY client settings cannot be used on an inbound")
+	}
+	if len(source.ServerNames) != 1 {
+		return nil, E.New("Xray REALITY inbound currently requires exactly one serverName")
+	}
+	if source.PrivateKey == "" || len(source.ShortIDs) == 0 {
+		return nil, E.New("Xray REALITY privateKey and shortIds are required")
+	}
+	target := source.Target
+	if !hasJSONValue(target) {
+		target = source.Dest
+	}
+	server, port, err := parseXrayRealityTarget(target)
+	if err != nil {
+		return nil, err
+	}
+	reality := map[string]any{
+		"enabled": true,
+		"handshake": map[string]any{
+			"server":      server,
+			"server_port": port,
+		},
+		"private_key":        source.PrivateKey,
+		"short_id":           []string(source.ShortIDs),
+		"min_client_version": "26.3.27",
+	}
+	if source.MinClientVer != "" {
+		reality["min_client_version"] = source.MinClientVer
+	}
+	if source.MaxClientVer != "" {
+		reality["max_client_version"] = source.MaxClientVer
+	}
+	if source.MaxTimeDiff != 0 {
+		reality["max_time_difference"] = strconv.FormatUint(source.MaxTimeDiff, 10) + "ms"
+	}
+	return map[string]any{
+		"enabled":     true,
+		"server_name": source.ServerNames[0],
+		"reality":     reality,
+	}, nil
+}
+
+func parseXrayRealityTarget(raw stdjson.RawMessage) (string, uint16, error) {
+	if !hasJSONValue(raw) {
+		return "", 0, E.New("Xray REALITY target is required")
+	}
+	var numericPort uint16
+	if err := json.Unmarshal(raw, &numericPort); err == nil {
+		if numericPort == 0 {
+			return "", 0, E.New("Xray REALITY target port must be greater than zero")
+		}
+		return "localhost", numericPort, nil
+	}
+	var target string
+	if err := json.Unmarshal(raw, &target); err != nil || target == "" {
+		return "", 0, E.New("Xray REALITY target must be a TCP host and port")
+	}
+	if port, err := strconv.ParseUint(target, 10, 16); err == nil && port > 0 {
+		return "localhost", uint16(port), nil
+	}
+	host, portString, err := net.SplitHostPort(target)
+	if err != nil || host == "" {
+		return "", 0, E.New("Xray REALITY target must be a TCP host and port: ", target)
+	}
+	port, err := strconv.ParseUint(portString, 10, 16)
+	if err != nil || port == 0 {
+		return "", 0, E.New("invalid Xray REALITY target port: ", portString)
+	}
+	return host, uint16(port), nil
+}
+
+func validateFreedomSettings(ctx context.Context, source xrayFreedomSettings) error {
 	strategy := source.TargetStrategy
 	if strategy == "" {
 		strategy = source.DomainStrategy
@@ -719,8 +1008,23 @@ func validateFreedomSettings(source xrayFreedomSettings) error {
 	default:
 		return unsupportedXrayField("settings.targetStrategy=" + strategy)
 	}
-	if source.Redirect != "" || source.UserLevel != 0 || source.ProxyProtocol != 0 || hasJSONValue(source.Fragment) || hasJSONValue(source.Noise) || hasJSONValue(source.Noises) || hasJSONValue(source.IPsBlocked) || hasJSONValue(source.FinalRules) {
+	if source.Redirect != "" || source.UserLevel != 0 || source.ProxyProtocol != 0 || hasJSONValue(source.Fragment) || hasJSONValue(source.Noise) || hasJSONValue(source.Noises) || hasJSONValue(source.IPsBlocked) {
 		return E.New("Xray direct outbound contains fields without a current Sidera equivalent")
+	}
+	if hasJSONValue(source.FinalRules) {
+		var rules []struct {
+			Action     string             `json:"action"`
+			Network    stdjson.RawMessage `json:"network"`
+			Port       stdjson.RawMessage `json:"port"`
+			IP         stdjson.RawMessage `json:"ip"`
+			BlockDelay stdjson.RawMessage `json:"blockDelay"`
+		}
+		if err := decodeXrayInto(ctx, source.FinalRules, "settings.finalRules", &rules); err != nil {
+			return err
+		}
+		if len(rules) != 1 || !strings.EqualFold(rules[0].Action, "allow") || hasJSONValue(rules[0].Network) || hasJSONValue(rules[0].Port) || hasJSONValue(rules[0].IP) || hasJSONValue(rules[0].BlockDelay) {
+			return E.New("only one unconditional Xray freedom finalRules allow rule is supported")
+		}
 	}
 	return nil
 }
@@ -735,12 +1039,22 @@ func translateXrayStream(source *xrayStream) (map[string]any, error) {
 	if err := rejectNonEmptyObject(source.SocketSettings, "streamSettings.sockopt"); err != nil {
 		return nil, err
 	}
-	network := source.Network
-	if source.Method != "" {
-		network = source.Method
+	var network string
+	if source.Network != nil {
+		network = *source.Network
+		if network == "" {
+			return nil, E.New("streamSettings.network cannot be empty")
+		}
+	}
+	if source.Method != nil {
+		network = *source.Method
+		if network == "" {
+			return nil, E.New("streamSettings.method cannot be empty")
+		}
 	}
 	result := make(map[string]any)
-	switch strings.ToLower(network) {
+	normalizedNetwork := strings.ToLower(network)
+	switch normalizedNetwork {
 	case "", "raw", "tcp":
 		tcpSettings := source.TCPSettings
 		if source.RawSettings != nil {
@@ -820,11 +1134,12 @@ func translateXrayWebSocket(source *xrayWebSocket) (map[string]any, error) {
 		return nil, unsupportedXrayField("streamSettings.wsSettings.heartbeatPeriod")
 	}
 	path := source.Path
-	var earlyData uint64
+	var earlyData uint32
 	if parsed, err := url.Parse(path); err == nil {
 		query := parsed.Query()
 		if value := query.Get("ed"); value != "" {
-			earlyData, _ = strconv.ParseUint(value, 10, 32)
+			parsedEarlyData, _ := strconv.Atoi(value)
+			earlyData = uint32(parsedEarlyData)
 			query.Del("ed")
 			parsed.RawQuery = query.Encode()
 			path = parsed.String()
@@ -864,6 +1179,9 @@ func translateXrayGRPC(source *xrayGRPC) (map[string]any, error) {
 	}
 	if source.Authority != "" || source.MultiMode || source.HealthCheckTimeout != 0 || source.InitialWindowsSize != 0 || source.UserAgent != "" {
 		return nil, E.New("Xray gRPC settings contain fields without a current Sidera equivalent")
+	}
+	if strings.HasPrefix(source.ServiceName, "/") {
+		return nil, E.New("Xray custom gRPC service paths have no current Sidera equivalent")
 	}
 	result := map[string]any{"type": "grpc"}
 	if source.ServiceName != "" {
@@ -913,27 +1231,28 @@ func translateXrayTLS(source *xrayTLS) (map[string]any, error) {
 	if len(source.Certificates) > 0 || source.EnableSessionResumption || source.DisableSystemRoot || source.CipherSuites != "" || source.RejectUnknownSNI || len(source.CurvePreferences) > 0 || source.MasterKeyLog != "" || source.PinnedPeerCertSHA256 != "" || source.VerifyPeerCertByName != "" || source.ECHServerKeys != "" || source.ECHConfigList != "" || hasJSONValue(source.ECHSocketSettings) {
 		return nil, E.New("Xray TLS settings contain fields without a current Sidera equivalent")
 	}
-	result := map[string]any{"enabled": true}
 	if source.AllowInsecure {
-		result["insecure"] = true
+		return nil, E.New("Xray allowInsecure has been removed and cannot be translated")
 	}
+	result := map[string]any{"enabled": true}
 	if source.ServerName != "" {
 		result["server_name"] = source.ServerName
 	}
 	if len(source.ALPN) > 0 {
 		result["alpn"] = []string(source.ALPN)
 	}
-	if source.MinVersion != "" {
+	if isXrayTLSVersion(source.MinVersion) {
 		result["min_version"] = source.MinVersion
 	}
-	if source.MaxVersion != "" {
+	if isXrayTLSVersion(source.MaxVersion) {
 		result["max_version"] = source.MaxVersion
 	}
-	if source.Fingerprint != "" {
-		result["utls"] = map[string]any{
-			"enabled":     true,
-			"fingerprint": strings.ToLower(source.Fingerprint),
-		}
+	utlsOptions, err := translateXrayFingerprint(source.Fingerprint, true)
+	if err != nil {
+		return nil, err
+	}
+	if utlsOptions != nil {
+		result["utls"] = utlsOptions
 	}
 	return result, nil
 }
@@ -969,16 +1288,48 @@ func translateXrayReality(source *xrayReality) (map[string]any, error) {
 	if source.ServerName != "" {
 		result["server_name"] = source.ServerName
 	}
-	if source.Fingerprint != "" {
-		result["utls"] = map[string]any{
-			"enabled":     true,
-			"fingerprint": strings.ToLower(source.Fingerprint),
-		}
+	utlsOptions, err := translateXrayFingerprint(source.Fingerprint, false)
+	if err != nil {
+		return nil, err
+	}
+	if utlsOptions != nil {
+		result["utls"] = utlsOptions
 	}
 	return result, nil
 }
 
-func translateXrayRouting(ctx context.Context, source *xrayRouting) ([]map[string]any, error) {
+func isXrayTLSVersion(version string) bool {
+	switch version {
+	case "1.0", "1.1", "1.2", "1.3":
+		return true
+	default:
+		return false
+	}
+}
+
+func translateXrayFingerprint(fingerprint string, allowStandardTLS bool) (map[string]any, error) {
+	fingerprint = strings.ToLower(fingerprint)
+	if fingerprint == "unsafe" {
+		if allowStandardTLS {
+			return nil, nil
+		}
+		return nil, E.New("Xray REALITY does not support fingerprint unsafe")
+	}
+	if fingerprint == "" {
+		fingerprint = "chrome"
+	}
+	switch fingerprint {
+	case "chrome", "firefox", "edge", "safari", "360", "qq", "ios", "android", "random", "randomized":
+	default:
+		return nil, E.New("Xray fingerprint has no current Sidera equivalent: ", fingerprint)
+	}
+	return map[string]any{
+		"enabled":     true,
+		"fingerprint": fingerprint,
+	}, nil
+}
+
+func translateXrayRouting(ctx context.Context, source *xrayRouting, excluded map[int]bool) ([]map[string]any, error) {
 	if source == nil {
 		return nil, nil
 	}
@@ -992,6 +1343,9 @@ func translateXrayRouting(ctx context.Context, source *xrayRouting) ([]map[strin
 	}
 	rules := make([]map[string]any, 0, len(source.Rules))
 	for index, rawRule := range source.Rules {
+		if excluded[index] {
+			continue
+		}
 		rule, err := decodeXrayObject[xrayRoutingRule](ctx, rawRule, "routing.rules["+strconv.Itoa(index)+"]")
 		if err != nil {
 			return nil, err
@@ -1022,13 +1376,11 @@ func translateXrayRoutingRule(source xrayRoutingRule) (map[string]any, error) {
 	if len(source.Network) > 0 {
 		var networks []string
 		for _, item := range source.Network {
-			for _, network := range strings.Split(item, ",") {
-				network = strings.TrimSpace(strings.ToLower(network))
-				if network != "tcp" && network != "udp" {
-					return nil, E.New("unsupported network: ", network)
-				}
-				networks = append(networks, network)
+			network := strings.ToLower(item)
+			if network != "tcp" && network != "udp" {
+				return nil, E.New("unsupported network: ", network)
 			}
+			networks = append(networks, network)
 		}
 		result["network"] = networks
 	}
@@ -1036,7 +1388,23 @@ func translateXrayRoutingRule(source xrayRoutingRule) (map[string]any, error) {
 		result["protocol"] = []string(source.Protocols)
 	}
 	if len(source.User) > 0 {
-		result["auth_user"] = []string(source.User)
+		var users []string
+		for _, user := range source.User {
+			if user == "" {
+				continue
+			}
+			if strings.HasPrefix(user, "regexp:") {
+				if _, err := regexp.Compile(strings.TrimPrefix(user, "regexp:")); err == nil {
+					return nil, E.New("Xray regexp user rules have no current Sidera equivalent")
+				}
+				continue
+			}
+			users = append(users, user)
+		}
+		if len(users) == 0 {
+			return nil, E.New("Xray user rule has no translatable matchers")
+		}
+		result["auth_user"] = users
 	}
 	if err := appendPortMatch(result, "port", "port_range", source.Port); err != nil {
 		return nil, E.Cause(err, "port")
@@ -1061,6 +1429,9 @@ func translateXrayRoutingRule(source xrayRoutingRule) (map[string]any, error) {
 	if err := appendIPMatch(result, "source_ip_cidr", sourceIPs); err != nil {
 		return nil, E.Cause(err, "sourceIP")
 	}
+	if len(result) == 1 {
+		return nil, E.New("this rule has no effective fields")
+	}
 	return result, nil
 }
 
@@ -1079,6 +1450,16 @@ func appendDomainMatch(result map[string]any, domains []string) error {
 			keyword = append(keyword, strings.TrimPrefix(domain, "keyword:"))
 		case strings.HasPrefix(domain, "regexp:"):
 			regex = append(regex, strings.TrimPrefix(domain, "regexp:"))
+		case strings.HasPrefix(domain, "dotless:"):
+			substring := strings.TrimPrefix(domain, "dotless:")
+			if strings.Contains(substring, ".") {
+				return E.New("substring in dotless rule must not contain a dot")
+			}
+			if substring == "" {
+				regex = append(regex, "^[^.]*$")
+			} else {
+				regex = append(regex, "^[^.]*"+substring+"[^.]*$")
+			}
 		case strings.HasPrefix(domain, "geosite:") || strings.HasPrefix(domain, "ext:"):
 			return E.New("geodata domain rule is not implemented: ", domain)
 		default:
@@ -1101,14 +1482,25 @@ func appendDomainMatch(result map[string]any, domains []string) error {
 }
 
 func appendIPMatch(result map[string]any, field string, values []string) error {
+	var translated []string
 	for _, value := range values {
 		lowerValue := strings.ToLower(value)
+		if strings.HasPrefix(value, "!") {
+			return E.New("negated IP rules have no current Sidera equivalent: ", value)
+		}
+		if lowerValue == "geoip:private" {
+			for _, prefix := range xrayPrivatePrefixes {
+				translated = append(translated, prefix.String())
+			}
+			continue
+		}
 		if strings.HasPrefix(lowerValue, "geoip:") || strings.HasPrefix(lowerValue, "ext:") {
 			return E.New("geodata IP rule is not implemented: ", value)
 		}
+		translated = append(translated, value)
 	}
-	if len(values) > 0 {
-		result[field] = []string(values)
+	if len(translated) > 0 {
+		result[field] = translated
 	}
 	return nil
 }
@@ -1157,6 +1549,9 @@ func appendPortMatch(result map[string]any, portField, rangeField string, raw st
 	}
 	if len(ranges) > 0 {
 		result[rangeField] = ranges
+	}
+	if len(ports) == 0 && len(ranges) == 0 {
+		return E.New("empty port expression has no exact Sidera equivalent")
 	}
 	return nil
 }

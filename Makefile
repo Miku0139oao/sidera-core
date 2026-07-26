@@ -282,8 +282,8 @@ docs_install:
 	source ./venv/bin/activate && pip install --force-reinstall mkdocs-material=="9.7.2" mkdocs-static-i18n=="1.2.*"
 
 clean:
-	rm -rf bin dist sing-box
-	rm -f $(shell go env GOPATH)/sing-box
+	rm -rf bin dist sidera
+	rm -f $(shell go env GOPATH)/bin/sidera
 
 update:
 	git fetch

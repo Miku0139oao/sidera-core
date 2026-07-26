@@ -39,6 +39,7 @@ type Service struct {
 	grpcServer     *grpc.Server
 	httpServer     *http.Server
 	dashboard      *dashboard
+	admin          *adminAPI
 }
 
 func NewService(ctx context.Context, logger log.ContextLogger, tag string, options option.APIServiceOptions) (adapter.Service, error) {
@@ -66,6 +67,12 @@ func NewService(ctx context.Context, logger log.ContextLogger, tag string, optio
 	}
 	if options.Dashboard != nil && options.Dashboard.Enabled {
 		s.dashboard = newDashboard(ctx, logger, *options.Dashboard)
+		admin, err := newAdminAPI(ctx, logger, options.Secret, options.Dashboard.DataPath)
+		if err != nil {
+			cancel()
+			return nil, E.Cause(err, "initialize dashboard management")
+		}
+		s.admin = admin
 	}
 	return s, nil
 }
@@ -83,7 +90,7 @@ func (s *Service) Start(stage adapter.StartStage) error {
 		}
 	}
 	s.httpServer = &http.Server{
-		Handler: h2c.NewHandler(newHTTPHandler(s.logger, s.grpcServer, s.options, s.dashboard), new(http2.Server)),
+		Handler: h2c.NewHandler(newHTTPHandler(s.logger, s.grpcServer, s.options, s.dashboard, s.admin), new(http2.Server)),
 		BaseContext: func(net.Listener) context.Context {
 			return s.ctx
 		},
@@ -107,6 +114,11 @@ func (s *Service) Start(stage adapter.StartStage) error {
 	if s.tlsConfig != nil {
 		tcpListener = aTLS.NewListener(tcpListener, s.tlsConfig)
 	}
+	if s.admin != nil {
+		if err = s.admin.start(); err != nil {
+			return E.Cause(err, "start dashboard management")
+		}
+	}
 	go func() {
 		serveErr := s.httpServer.Serve(tcpListener)
 		if serveErr != nil && s.ctx.Err() == nil {
@@ -117,6 +129,9 @@ func (s *Service) Start(stage adapter.StartStage) error {
 }
 
 func (s *Service) Close() error {
+	if s.admin != nil {
+		s.admin.close()
+	}
 	s.cancel()
 	if s.dashboard != nil {
 		s.dashboard.close()

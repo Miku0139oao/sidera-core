@@ -4,6 +4,7 @@ import (
 	std_bufio "bufio"
 	"context"
 	"net"
+	"sync/atomic"
 
 	"github.com/Miku0139oao/sidera-core/adapter"
 	"github.com/Miku0139oao/sidera-core/adapter/inbound"
@@ -24,24 +25,40 @@ func RegisterInbound(registry *inbound.Registry) {
 	inbound.Register[option.HTTPMixedInboundOptions](registry, C.TypeHTTP, NewInbound)
 }
 
-var _ adapter.TCPInjectableInbound = (*Inbound)(nil)
+var (
+	_ adapter.TCPInjectableInbound = (*Inbound)(nil)
+	_ adapter.ManagedUserService   = (*Inbound)(nil)
+)
+
+type userState struct {
+	users         []adapter.ManagedUser
+	authenticator *auth.Authenticator
+}
 
 type Inbound struct {
 	inbound.Adapter
-	router        adapter.ConnectionRouterEx
-	logger        log.ContextLogger
-	listener      *listener.Listener
-	authenticator *auth.Authenticator
-	tlsConfig     tls.ServerConfig
+	router    adapter.ConnectionRouterEx
+	logger    log.ContextLogger
+	listener  *listener.Listener
+	userState atomic.Pointer[userState]
+	tlsConfig tls.ServerConfig
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.HTTPMixedInboundOptions) (adapter.Inbound, error) {
-	inbound := &Inbound{
-		Adapter:       inbound.NewAdapter(C.TypeHTTP, tag),
-		router:        uot.NewRouter(router, logger),
-		logger:        logger,
-		authenticator: auth.NewAuthenticator(options.Users),
+	users := make([]adapter.ManagedUser, len(options.Users))
+	for index, user := range options.Users {
+		users[index] = adapter.ManagedUser{Name: user.Username, Password: user.Password}
 	}
+	userState, err := newUserState(users)
+	if err != nil {
+		return nil, err
+	}
+	inbound := &Inbound{
+		Adapter: inbound.NewAdapter(C.TypeHTTP, tag),
+		router:  uot.NewRouter(router, logger),
+		logger:  logger,
+	}
+	inbound.userState.Store(userState)
 	if options.TLS != nil {
 		tlsConfig, err := tls.NewServerWithOptions(tls.ServerOptions{
 			Context:        ctx,
@@ -86,6 +103,48 @@ func (h *Inbound) Close() error {
 	)
 }
 
+func (h *Inbound) ManagedUserSchema() adapter.ManagedUserSchema {
+	return adapter.ManagedUserSchema{Credential: adapter.ManagedUserCredentialPassword}
+}
+
+func (h *Inbound) ManagedUsers() []adapter.ManagedUser {
+	users := h.userState.Load().users
+	return append([]adapter.ManagedUser(nil), users...)
+}
+
+func (h *Inbound) UpdateManagedUsers(users []adapter.ManagedUser) error {
+	userState, err := newUserState(users)
+	if err != nil {
+		return err
+	}
+	h.userState.Store(userState)
+	return nil
+}
+
+func newUserState(users []adapter.ManagedUser) (*userState, error) {
+	names := make(map[string]struct{}, len(users))
+	usersCopy := make([]adapter.ManagedUser, len(users))
+	authUsers := make([]auth.User, len(users))
+	for index, user := range users {
+		if user.Name == "" {
+			return nil, E.New("missing name for user[", index, "]")
+		}
+		if user.Password == "" {
+			return nil, E.New("missing password for user[", index, "]")
+		}
+		if _, exists := names[user.Name]; exists {
+			return nil, E.New("duplicate name for user[", index, "]: ", user.Name)
+		}
+		names[user.Name] = struct{}{}
+		usersCopy[index] = adapter.ManagedUser{Name: user.Name, Password: user.Password}
+		authUsers[index] = auth.User{Username: user.Name, Password: user.Password}
+	}
+	return &userState{
+		users:         usersCopy,
+		authenticator: auth.NewAuthenticator(authUsers),
+	}, nil
+}
+
 func (h *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
 	if h.tlsConfig != nil {
 		tlsConn, err := tls.ServerHandshake(ctx, conn, h.tlsConfig)
@@ -96,7 +155,8 @@ func (h *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
 		}
 		conn = tlsConn
 	}
-	err := http.HandleConnectionEx(ctx, conn, std_bufio.NewReader(conn), h.authenticator, adapter.NewUpstreamHandler(metadata, h.newUserConnection, h.streamUserPacketConnection), metadata.Source, onClose)
+	authenticator := h.userState.Load().authenticator
+	err := http.HandleConnectionEx(ctx, conn, std_bufio.NewReader(conn), authenticator, adapter.NewUpstreamHandler(metadata, h.newUserConnection, h.streamUserPacketConnection), metadata.Source, onClose)
 	if err != nil {
 		N.CloseOnHandshakeFailure(conn, onClose, err)
 		h.logger.ErrorContext(ctx, E.Cause(err, "process connection from ", metadata.Source))

@@ -134,7 +134,7 @@ jobs:
         run: |
           set -xeuo pipefail
           mkdir -p dist
-          go build -v -trimpath -o dist/sing-box -tags "${BUILD_TAGS}" \
+          go build -v -trimpath -o dist/sidera -tags "${BUILD_TAGS}" \
           -ldflags "-X 'github.com/Miku0139oao/sidera-core/constant.Version=${{ needs.calculate_version.outputs.version }}' ${LDFLAGS_SHARED} -s -w -buildid=" \
           ./cmd/sidera
         env:
@@ -150,7 +150,7 @@ jobs:
         run: |
           set -xeuo pipefail
           mkdir -p dist
-          go build -v -trimpath -o dist/sing-box -tags "${BUILD_TAGS}" \
+          go build -v -trimpath -o dist/sidera -tags "${BUILD_TAGS}" \
           -ldflags "-X 'github.com/Miku0139oao/sidera-core/constant.Version=${{ needs.calculate_version.outputs.version }}' ${LDFLAGS_SHARED} -s -w -buildid=" \
           ./cmd/sidera
         env:
@@ -161,7 +161,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Set mtime
         run: |-
-          TZ=UTC touch -t '197001010000' dist/sing-box
+          TZ=UTC touch -t '197001010000' dist/sidera
       - name: Detect track
         run: bash .github/detect_track.sh
       - name: Set version
@@ -181,7 +181,7 @@ jobs:
             -v "$PKG_VERSION" \
             -p "dist/${NAME}_${{ needs.calculate_version.outputs.version }}_linux_${{ matrix.debian }}.deb" \
             --architecture ${{ matrix.debian }} \
-            dist/sing-box=/usr/bin/sing-box
+            dist/sidera=/usr/bin/sidera
           rm -rf $HOME/.gnupg
           gpg --pinentry-mode loopback --passphrase "${{ secrets.GPG_PASSPHRASE }}" --import <<EOF
           ${{ secrets.GPG_KEY }}
@@ -198,7 +198,7 @@ jobs:
             -v "$PKG_VERSION" \
             -p "dist/${NAME}_${{ needs.calculate_version.outputs.version }}_linux_${{ matrix.rpm }}.rpm" \
             --architecture ${{ matrix.rpm }} \
-            dist/sing-box=/usr/bin/sing-box
+            dist/sidera=/usr/bin/sidera
           cat > $HOME/.rpmmacros <<EOF
           %_gpg_name ${{ secrets.GPG_KEY_ID }}
           %_gpg_sign_cmd_extra_args --pinentry-mode loopback --passphrase ${{ secrets.GPG_PASSPHRASE }}
@@ -208,7 +208,7 @@ jobs:
           EOF
           rpmsign --addsign dist/*.rpm
       - name: Cleanup
-        run: rm dist/sing-box
+        run: rm dist/sidera
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -238,4 +238,11 @@ jobs:
       - name: Publish packages
         if: github.event_name != 'push'
         run: |-
-          ls dist | xargs -I {} curl -F "package=@dist/{}" https://${{ secrets.FURY_TOKEN }}@push.fury.io/sagernet/
+          if [[ -z "$FURY_ACCOUNT" ]]; then
+            echo "FURY_ACCOUNT repository variable is required" >&2
+            exit 1
+          fi
+          ls dist | xargs -I {} curl -F "package=@dist/{}" "https://${FURY_TOKEN}@push.fury.io/${FURY_ACCOUNT}/"
+        env:
+          FURY_ACCOUNT: ${{ vars.FURY_ACCOUNT }}
+          FURY_TOKEN: ${{ secrets.FURY_TOKEN }}

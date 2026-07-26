@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"io"
 	"os"
 	"os/signal"
@@ -17,6 +18,7 @@ import (
 	C "github.com/Miku0139oao/sidera-core/constant"
 	"github.com/Miku0139oao/sidera-core/log"
 	"github.com/Miku0139oao/sidera-core/option"
+	apiService "github.com/Miku0139oao/sidera-core/service/api"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/json"
 	"github.com/sagernet/sing/common/json/badjson"
@@ -37,6 +39,7 @@ var commandRun = &cobra.Command{
 
 func init() {
 	mainCommand.AddCommand(commandRun)
+	mainCommand.Run = commandRun.Run
 }
 
 type OptionsEntry struct {
@@ -107,7 +110,67 @@ func readConfigAndMerge() (option.Options, error) {
 	if err != nil {
 		return option.Options{}, err
 	}
-	return mergeOptionsList(optionsList)
+	return mergeOptionsListWithDashboard(optionsList)
+}
+
+func mergeOptionsListWithDashboard(optionsList []*OptionsEntry) (option.Options, error) {
+	options, err := mergeOptionsList(optionsList)
+	if err != nil {
+		return option.Options{}, err
+	}
+	if err = mergeXrayDashboardSidecar(&options, optionsList); err != nil {
+		return option.Options{}, err
+	}
+	if err = apiService.MergeDashboardProfiles(globalCtx, &options); err != nil {
+		return option.Options{}, E.Cause(err, "load dashboard server profiles")
+	}
+	return options, nil
+}
+
+func mergeXrayDashboardSidecar(options *option.Options, optionsList []*OptionsEntry) error {
+	if len(optionsList) != 1 || optionsList[0].dialect != config.DialectXray || optionsList[0].path == "stdin" {
+		return nil
+	}
+	sidecarPath := optionsList[0].path + ".sidera.json"
+	content, err := os.ReadFile(sidecarPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return E.Cause(err, "read Sidera dashboard sidecar at ", sidecarPath)
+	}
+	sidecar, dialect, err := config.Decode(globalCtx, content)
+	if err != nil {
+		return E.Cause(err, "decode Sidera dashboard sidecar at ", sidecarPath)
+	}
+	if dialect != config.DialectSingBox {
+		return E.New("Sidera dashboard sidecar must use native configuration syntax: ", sidecarPath)
+	}
+	if sidecar.Log != nil || sidecar.DNS != nil || sidecar.NTP != nil || sidecar.Certificate != nil ||
+		len(sidecar.CertificateProviders) > 0 || len(sidecar.HTTPClients) > 0 || len(sidecar.NetworkNamespaces) > 0 ||
+		len(sidecar.Endpoints) > 0 || len(sidecar.Inbounds) > 0 || len(sidecar.Outbounds) > 0 || sidecar.Route != nil || sidecar.Experimental != nil {
+		return E.New("Xray-adjacent Sidera sidecar may only contain the dashboard API service: ", sidecarPath)
+	}
+	usedTags := make(map[string]bool, len(options.Services))
+	for _, current := range options.Services {
+		if current.Tag != "" {
+			usedTags[current.Tag] = true
+		}
+	}
+	for _, serviceOptions := range sidecar.Services {
+		if serviceOptions.Type != C.TypeAPI {
+			return E.New("Xray-adjacent Sidera sidecar only supports service type api")
+		}
+		if serviceOptions.Tag == "" {
+			return E.New("Sidera dashboard API service requires an explicit tag")
+		}
+		if usedTags[serviceOptions.Tag] {
+			return E.New("duplicate service tag in Sidera dashboard sidecar: ", serviceOptions.Tag)
+		}
+		usedTags[serviceOptions.Tag] = true
+		options.Services = append(options.Services, serviceOptions)
+	}
+	return nil
 }
 
 func mergeOptionsList(optionsList []*OptionsEntry) (option.Options, error) {
@@ -199,7 +262,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	options, err := mergeOptionsList(optionsList)
+	options, err := mergeOptionsListWithDashboard(optionsList)
 	if err != nil {
 		return err
 	}

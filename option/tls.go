@@ -29,6 +29,7 @@ type InboundTLSOptions struct {
 	KeyPath                          string                              `json:"key_path,omitempty"`
 	KernelTx                         bool                                `json:"kernel_tx,omitempty"`
 	KernelRx                         bool                                `json:"kernel_rx,omitempty"`
+	DisableSessionTickets            bool                                `json:"disable_session_tickets,omitempty"`
 	HandshakeTimeout                 badoption.Duration                  `json:"handshake_timeout,omitempty"`
 	CertificateProvider              *CertificateProviderOptions         `json:"certificate_provider,omitempty"`
 
@@ -213,6 +214,8 @@ type InboundRealityOptions struct {
 	Handshake         InboundRealityHandshakeOptions `json:"handshake,omitempty"`
 	PrivateKey        string                         `json:"private_key,omitempty"`
 	ShortID           badoption.Listable[string]     `json:"short_id,omitempty"`
+	MinClientVersion  string                         `json:"min_client_version,omitempty"`
+	MaxClientVersion  string                         `json:"max_client_version,omitempty"`
 	MaxTimeDifference badoption.Duration             `json:"max_time_difference,omitempty"`
 }
 

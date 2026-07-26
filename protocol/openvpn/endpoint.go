@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"slices"
 	"strings"
+	"sync/atomic"
 
 	"github.com/Miku0139oao/sidera-core/adapter"
 	"github.com/Miku0139oao/sidera-core/adapter/endpoint"
@@ -361,19 +362,56 @@ func packetSourceAddress(packet []byte, inet4Address netip.Addr, inet6Address ne
 	return inet4Address
 }
 
-func authenticatorFromUsers(users []auth.User) ovpn.UserPassAuthenticator {
-	if len(users) == 0 {
-		return nil
-	}
+type openVPNUserState struct {
+	users              []auth.User
+	passwordByUsername map[string]string
+}
+
+type openVPNUserManager struct {
+	state atomic.Pointer[openVPNUserState]
+}
+
+func newOpenVPNUserManager(users []auth.User) *openVPNUserManager {
+	manager := new(openVPNUserManager)
+	manager.update(users)
+	return manager
+}
+
+func (m *openVPNUserManager) update(users []auth.User) {
+	users = slices.Clone(users)
 	passwordByUsername := make(map[string]string, len(users))
 	for _, user := range users {
 		passwordByUsername[user.Username] = user.Password
 	}
-	return func(ctx context.Context, username string, password string) error {
-		expectedPassword, found := passwordByUsername[username]
-		if !found || subtle.ConstantTimeCompare([]byte(expectedPassword), []byte(password)) != 1 {
-			return E.New("invalid username or password")
-		}
+	m.state.Store(&openVPNUserState{
+		users:              users,
+		passwordByUsername: passwordByUsername,
+	})
+}
+
+func (m *openVPNUserManager) users() []auth.User {
+	state := m.state.Load()
+	if state == nil {
 		return nil
 	}
+	return slices.Clone(state.users)
+}
+
+func (m *openVPNUserManager) authenticate(ctx context.Context, username string, password string) error {
+	state := m.state.Load()
+	if state == nil || len(state.users) == 0 {
+		return nil
+	}
+	expectedPassword, found := state.passwordByUsername[username]
+	if !found || subtle.ConstantTimeCompare([]byte(expectedPassword), []byte(password)) != 1 {
+		return E.New("invalid username or password")
+	}
+	return nil
+}
+
+func authenticatorFromUsers(users []auth.User) ovpn.UserPassAuthenticator {
+	if len(users) == 0 {
+		return nil
+	}
+	return newOpenVPNUserManager(users).authenticate
 }

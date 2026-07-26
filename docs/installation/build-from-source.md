@@ -105,13 +105,13 @@ NaiveProxy outbound requires special build configurations depending on your targ
 
 Use `with_purego` tag.
 
-For official releases, `libcronet.dll` is included in the archive. For self-built binaries, download from [cronet-go releases](https://github.com/sagernet/cronet-go/releases) and place in the same directory as `sing-box.exe` or in a directory listed in `PATH`.
+For official releases, `libcronet.dll` is included in the archive. For self-built binaries, download from [cronet-go releases](https://github.com/sagernet/cronet-go/releases) and place in the same directory as `sidera.exe` or in a directory listed in `PATH`.
 
 ### Linux (purego, amd64/arm64 only)
 
 Use `with_purego` tag.
 
-For official releases, `libcronet.so` is included in the archive. For self-built binaries, download from [cronet-go releases](https://github.com/sagernet/cronet-go/releases) and place in the same directory as sing-box binary or in system library path.
+For official releases, `libcronet.so` is included in the archive. For self-built binaries, download from [cronet-go releases](https://github.com/sagernet/cronet-go/releases) and place in the same directory as the Sidera binary or in the system library path.
 
 ### Linux (CGO)
 

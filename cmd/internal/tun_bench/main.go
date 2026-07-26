@@ -48,7 +48,7 @@ func runTests() ([]TestResult, error) {
 	boxPaths := []string{
 		os.ExpandEnv("$HOME/Downloads/sing-box-1.11.15-darwin-arm64/sing-box"),
 		//"/Users/sekai/Downloads/sing-box-1.11.15-linux-arm64/sing-box",
-		"./sing-box",
+		"./sidera",
 	}
 	stacks := []string{
 		"gvisor",

@@ -1,0 +1,6 @@
+# /etc/conf.d/sidera: config file for /etc/init.d/sidera
+
+# Sidera configuration path, could be file or directory
+# SIDERA_CONFIG=/etc/sidera
+
+# SIDERA_WORKDIR=/var/lib/sidera

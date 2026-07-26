@@ -43,6 +43,9 @@ type Manager struct {
 	connections             compatible.Map[uuid.UUID, Tracker]
 	closedConnectionsAccess sync.Mutex
 	closedConnections       list.List[TrackerMetadata]
+	closeHooksAccess        sync.RWMutex
+	closeHooks              map[uint64]func(*TrackerMetadata)
+	nextCloseHookID         atomic.Uint64
 
 	eventSubscriber *observable.Subscriber[ConnectionEvent]
 	eventObserver   *observable.Observer[ConnectionEvent]
@@ -53,6 +56,7 @@ func NewManager(outbound adapter.OutboundManager) *Manager {
 	return &Manager{
 		outbound:        outbound,
 		eventSubscriber: observable.NewSubscriber[ConnectionEvent](256),
+		closeHooks:      make(map[uint64]func(*TrackerMetadata)),
 	}
 }
 
@@ -111,12 +115,31 @@ func (m *Manager) leave(tracker Tracker) {
 	}
 	m.closedConnections.PushBack(metadataCopy)
 	m.closedConnectionsAccess.Unlock()
+	m.closeHooksAccess.RLock()
+	for _, closeHook := range m.closeHooks {
+		closeHook(&metadataCopy)
+	}
+	m.closeHooksAccess.RUnlock()
 	m.eventSubscriber.Emit(ConnectionEvent{
 		Type:     ConnectionEventClosed,
 		ID:       metadata.ID,
 		Metadata: &metadataCopy,
 		ClosedAt: closedAt,
 	})
+}
+
+// AddCloseHook registers lossless, synchronous connection accounting. Hooks
+// should only update in-memory state and return quickly.
+func (m *Manager) AddCloseHook(hook func(*TrackerMetadata)) func() {
+	id := m.nextCloseHookID.Add(1)
+	m.closeHooksAccess.Lock()
+	m.closeHooks[id] = hook
+	m.closeHooksAccess.Unlock()
+	return func() {
+		m.closeHooksAccess.Lock()
+		delete(m.closeHooks, id)
+		m.closeHooksAccess.Unlock()
+	}
 }
 
 func (m *Manager) Total() (uplinkTotal int64, downlinkTotal int64) {

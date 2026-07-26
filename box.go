@@ -159,7 +159,7 @@ func New(options Options) (*Box, error) {
 	if experimentalOptions.ClashAPI != nil || options.PlatformLogWriter != nil {
 		needClashAPI = true
 	}
-	if experimentalOptions.V2RayAPI != nil && experimentalOptions.V2RayAPI.Listen != "" {
+	if experimentalOptions.V2RayAPI != nil && (experimentalOptions.V2RayAPI.Listen != "" || experimentalOptions.V2RayAPI.Metrics != nil && experimentalOptions.V2RayAPI.Metrics.Listen != "") {
 		needV2RayAPI = true
 	}
 	needAPIService := common.Any(options.Services, func(it option.Service) bool {
@@ -435,9 +435,9 @@ func New(options Options) (*Box, error) {
 		}
 		if v2rayServer.StatsService() != nil {
 			router.AppendTracker(v2rayServer.StatsService())
-			internalServices = append(internalServices, v2rayServer)
-			service.MustRegister[adapter.V2RayServer](ctx, v2rayServer)
 		}
+		internalServices = append(internalServices, v2rayServer)
+		service.MustRegister[adapter.V2RayServer](ctx, v2rayServer)
 	}
 	if ntpOptions.Enabled {
 		if ntpOptions.WriteToSystem {

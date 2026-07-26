@@ -2,10 +2,12 @@ package openvpn
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/netip"
 	"slices"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -19,6 +21,7 @@ import (
 	ovpntransport "github.com/Miku0139oao/sidera-core/transport/openvpn"
 	ovpn "github.com/sagernet/sing-openvpn"
 	"github.com/sagernet/sing-tun"
+	"github.com/sagernet/sing/common/auth"
 	"github.com/sagernet/sing/common/buf"
 	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
@@ -28,6 +31,7 @@ import (
 
 var (
 	_ adapter.FlowOutbound               = (*ServerEndpoint)(nil)
+	_ adapter.ManagedUserService         = (*ServerEndpoint)(nil)
 	_ dialer.PacketDialerWithDestination = (*ServerEndpoint)(nil)
 )
 
@@ -40,8 +44,10 @@ type ServerEndpoint struct {
 	serverOptions  ovpn.ServerOptions
 	dnsRouter      adapter.DNSRouter
 	listener       *listener.Listener
-	server         *ovpn.Server
+	server         atomic.Pointer[ovpn.Server]
 	device         ovpntransport.Device
+	userManager    *openVPNUserManager
+	runtimeAccess  sync.Mutex
 	localAddresses []netip.Prefix
 	started        atomic.Bool
 	readLoopDone   chan struct{}
@@ -71,7 +77,6 @@ func NewServerEndpoint(ctx context.Context, router adapter.Router, logger log.Co
 	if options.MTU == 0 {
 		options.MTU = ovpntransport.DefaultMTU
 	}
-	loopContext, cancelLoop := context.WithCancel(ctx)
 	serverEndpoint := &ServerEndpoint{
 		endpointBase: endpointBase{
 			Adapter: endpoint.NewAdapter(C.TypeOpenVPNServer, tag, []string{N.NetworkTCP, N.NetworkUDP, N.NetworkICMP}, nil),
@@ -79,20 +84,18 @@ func NewServerEndpoint(ctx context.Context, router adapter.Router, logger log.Co
 			logger:  logger,
 		},
 		ctx:            ctx,
-		loopContext:    loopContext,
-		cancelLoop:     cancelLoop,
 		options:        options,
 		dnsRouter:      service.FromContext[adapter.DNSRouter](ctx),
 		localAddresses: options.Address,
 	}
 	serverOptions, err := buildServerOptions(options)
 	if err != nil {
-		cancelLoop()
 		return nil, err
 	}
-	serverOptions.Context = loopContext
 	if serverOptions.Mode == ovpn.ModeTLS {
-		serverOptions.Authentication.Authenticator = authenticatorFromUsers(options.Users)
+		userManager := newOpenVPNUserManager(options.Users)
+		serverEndpoint.userManager = userManager
+		serverOptions.Authentication.Authenticator = userManager.authenticate
 		serverOptions.Authentication.DuplicateCN = options.DuplicateCN
 	}
 	serverOptions.Logger = logger
@@ -121,7 +124,6 @@ func NewServerEndpoint(ctx context.Context, router adapter.Router, logger log.Co
 		},
 	})
 	if err != nil {
-		cancelLoop()
 		return nil, err
 	}
 	serverEndpoint.device = device
@@ -160,12 +162,85 @@ func validateServerTopology(topology string) error {
 	}
 }
 
+func (s *ServerEndpoint) ManagedUserSchema() adapter.ManagedUserSchema {
+	if s.serverOptions.Mode != ovpn.ModeTLS {
+		return adapter.ManagedUserSchema{}
+	}
+	return adapter.ManagedUserSchema{Credential: adapter.ManagedUserCredentialPassword, NoTraffic: true}
+}
+
+func (s *ServerEndpoint) ManagedUsers() []adapter.ManagedUser {
+	if s.userManager == nil {
+		return nil
+	}
+	users := s.userManager.users()
+	managedUsers := make([]adapter.ManagedUser, len(users))
+	for userIndex, user := range users {
+		managedUsers[userIndex] = adapter.ManagedUser{
+			Name:     user.Username,
+			Password: user.Password,
+		}
+	}
+	return managedUsers
+}
+
+func (s *ServerEndpoint) UpdateManagedUsers(users []adapter.ManagedUser) error {
+	if s.userManager == nil {
+		return E.New("managed users are not supported in static_key mode")
+	}
+	authUsers := make([]auth.User, len(users))
+	usernames := make(map[string]struct{}, len(users))
+	for userIndex, user := range users {
+		if user.Name == "" {
+			return E.New("user[", userIndex, "]: missing name")
+		}
+		if user.Password == "" {
+			return E.New("user[", userIndex, "]: missing password")
+		}
+		if _, exists := usernames[user.Name]; exists {
+			return E.New("user[", userIndex, "]: duplicate name: ", user.Name)
+		}
+		usernames[user.Name] = struct{}{}
+		authUsers[userIndex] = auth.User{
+			Username: user.Name,
+			Password: user.Password,
+		}
+	}
+	s.runtimeAccess.Lock()
+	defer s.runtimeAccess.Unlock()
+	oldUsers := s.userManager.users()
+	s.userManager.update(authUsers)
+	if !s.started.Load() {
+		return nil
+	}
+	stopErr := s.stopRuntimeLocked()
+	startErr := s.startRuntimeLocked(false)
+	if startErr == nil {
+		if stopErr != nil {
+			s.logger.Warn(E.Cause(stopErr, "close previous OpenVPN server"))
+		}
+		return nil
+	}
+	s.userManager.update(oldUsers)
+	restoreErr := s.startRuntimeLocked(false)
+	if restoreErr != nil {
+		restoreErr = E.Cause(restoreErr, "restore previous OpenVPN server")
+	}
+	return errors.Join(startErr, restoreErr)
+}
+
 func (s *ServerEndpoint) Start(stage adapter.StartStage) error {
 	if stage != adapter.StartStateStart {
 		return nil
 	}
+	s.runtimeAccess.Lock()
+	defer s.runtimeAccess.Unlock()
+	return s.startRuntimeLocked(true)
+}
+
+func (s *ServerEndpoint) startRuntimeLocked(startDevice bool) error {
 	protocol := s.serverOptions.Transport.Protocol
-	s.listener = listener.New(listener.Options{
+	serverListener := listener.New(listener.Options{
 		Context: s.ctx,
 		Logger:  s.logger,
 		Network: []string{protocol},
@@ -177,7 +252,7 @@ func (s *ServerEndpoint) Start(stage adapter.StartStage) error {
 		err            error
 	)
 	if protocol == N.NetworkTCP {
-		streamListener, err = s.listener.ListenTCP()
+		streamListener, err = serverListener.ListenTCP()
 	} else {
 		var listenConfig net.ListenConfig
 		var egressEnabled bool
@@ -195,7 +270,7 @@ func (s *ServerEndpoint) Start(stage adapter.StartStage) error {
 			}
 			listenConfig.Control, egressEnabled = udpDialer.UDPListenerControl()
 		}
-		packetConn, err = s.listener.ListenUDPWithConfig(listenConfig)
+		packetConn, err = serverListener.ListenUDPWithConfig(listenConfig)
 		if err == nil {
 			tuneOpenVPNUDPSocket(packetConn)
 			if egressEnabled {
@@ -224,7 +299,9 @@ func (s *ServerEndpoint) Start(stage adapter.StartStage) error {
 	if err != nil {
 		return err
 	}
+	loopContext, cancelLoop := context.WithCancel(s.ctx)
 	serverOptions := s.serverOptions
+	serverOptions.Context = loopContext
 	if streamListener != nil {
 		serverOptions.Transport.ListenAddress = streamListener.Addr().String()
 	} else if packetConn != nil {
@@ -234,29 +311,42 @@ func (s *ServerEndpoint) Start(stage adapter.StartStage) error {
 	serverOptions.Transport.PacketConn = packetConn
 	server, err := ovpn.NewServer(serverOptions)
 	if err != nil {
+		cancelLoop()
 		if packetConn != nil {
 			_ = packetConn.Close()
 		}
-		s.listener.Close()
+		serverListener.Close()
 		return err
 	}
-	s.server = server
-	err = s.device.Start()
-	if err != nil {
-		s.listener.Close()
-		server.Close()
-		return err
+	s.server.Store(server)
+	if startDevice {
+		err = s.device.Start()
+		if err != nil {
+			s.server.Store(nil)
+			cancelLoop()
+			serverListener.Close()
+			server.Close()
+			return err
+		}
 	}
 	err = server.Start()
 	if err != nil {
-		s.device.Close()
-		s.listener.Close()
+		s.server.Store(nil)
+		cancelLoop()
+		if startDevice {
+			s.device.Close()
+		}
+		serverListener.Close()
 		server.Close()
 		return err
 	}
+	s.loopContext = loopContext
+	s.cancelLoop = cancelLoop
+	s.listener = serverListener
 	s.started.Store(true)
-	s.readLoopDone = make(chan struct{})
-	go s.readLoop()
+	readLoopDone := make(chan struct{})
+	s.readLoopDone = readLoopDone
+	go s.readLoop(server, loopContext, readLoopDone)
 	return nil
 }
 
@@ -597,12 +687,12 @@ func applyServerPushOptions(serverOptions *ovpn.ServerOptions, options option.Op
 	return nil
 }
 
-func (s *ServerEndpoint) readLoop() {
-	defer close(s.readLoopDone)
+func (s *ServerEndpoint) readLoop(server *ovpn.Server, loopContext context.Context, done chan struct{}) {
+	defer close(done)
 	for {
-		serverPacketBuffers, err := s.server.ReadDataPackets(s.loopContext)
+		serverPacketBuffers, err := server.ReadDataPackets(loopContext)
 		if err != nil {
-			if E.IsClosedOrCanceled(err) || s.loopContext.Err() != nil {
+			if E.IsClosedOrCanceled(err) || loopContext.Err() != nil {
 				return
 			}
 			s.logger.Error(E.Cause(err, "server terminated"))
@@ -622,24 +712,36 @@ func (s *ServerEndpoint) readLoop() {
 }
 
 func (s *ServerEndpoint) Close() error {
-	s.started.Store(false)
-	s.cancelLoop()
-	var serverErr error
-	if s.server != nil {
-		serverErr = s.server.Close()
-	}
-	if s.readLoopDone != nil {
-		<-s.readLoopDone
-	}
+	s.runtimeAccess.Lock()
+	serverErr := s.stopRuntimeLocked()
 	var deviceErr error
 	if s.device != nil {
 		deviceErr = s.device.Close()
 	}
+	s.runtimeAccess.Unlock()
+	return E.Errors(serverErr, deviceErr)
+}
+
+func (s *ServerEndpoint) stopRuntimeLocked() error {
+	s.started.Store(false)
+	if s.cancelLoop != nil {
+		s.cancelLoop()
+		s.cancelLoop = nil
+	}
+	var serverErr error
+	if server := s.server.Swap(nil); server != nil {
+		serverErr = server.Close()
+	}
+	if s.readLoopDone != nil {
+		<-s.readLoopDone
+		s.readLoopDone = nil
+	}
 	var listenerErr error
 	if s.listener != nil {
 		listenerErr = s.listener.Close()
+		s.listener = nil
 	}
-	return E.Errors(serverErr, deviceErr, listenerErr)
+	return E.Errors(serverErr, listenerErr)
 }
 
 func (s *ServerEndpoint) PreMatchFlow(network string, destination netip.Addr) adapter.PreMatchAction {
@@ -671,14 +773,15 @@ func (s *ServerEndpoint) NewDNSPacket(payload []byte, source M.Socksaddr, destin
 }
 
 func (s *ServerEndpoint) WritePackets(packets [][]byte) error {
-	if !s.started.Load() {
+	server := s.server.Load()
+	if !s.started.Load() || server == nil {
 		return E.New("endpoint is not ready yet")
 	}
 	packetBuffers := make([]*buf.Buffer, len(packets))
 	for i, packet := range packets {
 		packetBuffers[i] = buf.As(packet)
 	}
-	routeMisses, err := s.server.WriteDataPacketBuffersByDestination(packetBuffers)
+	routeMisses, err := server.WriteDataPacketBuffersByDestination(packetBuffers)
 	if len(routeMisses) > 0 {
 		s.writeRouteMisses(routeMisses)
 	}
@@ -686,7 +789,11 @@ func (s *ServerEndpoint) WritePackets(packets [][]byte) error {
 }
 
 func (s *ServerEndpoint) writePacketBuffersByDestination(packetBuffers []*buf.Buffer) error {
-	routeMisses, err := s.server.WriteDataPacketBuffersByDestination(packetBuffers)
+	server := s.server.Load()
+	if server == nil {
+		return E.New("endpoint is not ready yet")
+	}
+	routeMisses, err := server.WriteDataPacketBuffersByDestination(packetBuffers)
 	if len(routeMisses) > 0 {
 		s.writeRouteMisses(routeMisses)
 	}

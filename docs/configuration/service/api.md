@@ -4,9 +4,10 @@ icon: material/new-box
 
 !!! question "Since sing-box 1.14.0"
 
-# sing-box API
+# Sidera API
 
-The sing-box API service is a gRPC server for observing and controlling the running sing-box instance.
+The Sidera API service provides gRPC remote control, the built-in Material 3
+dashboard, server profile management, users, quotas, traffic, and connections.
 
 It can be accessed by the [sing-box graphical clients](/clients/) for iOS, macOS, and
 Android (via the Remote Control feature), or the
@@ -31,6 +32,7 @@ for bidirectional streaming methods.
     "enabled": true,
     "path": "",
     "download_url": "",
+    "data_path": "sidera-dashboard.json",
     "http_client": "", // or {}
     "update_interval": ""
   },
@@ -62,8 +64,16 @@ Allow access from private network.
 
 #### dashboard
 
-Web dashboard downloaded and served over the API listener at `/dashboard/`; other browser
-requests are redirected to it.
+Web dashboard served over the API listener at `/dashboard/`; other browser
+requests are redirected to it. When both `path` and `download_url` are empty,
+the built-in Sidera dashboard is used.
+
+The built-in dashboard manages all remotely consumable Sidera server protocols:
+SOCKS, HTTP, Mixed, Shadowsocks, Snell, VMess, Trojan, Naive, ShadowTLS,
+VLESS, AnyTLS, Hysteria, TUIC, Hysteria2, and OpenVPN Server. Structural
+changes are persisted first and applied through a checked Core reload. Existing
+base-configuration servers remain read-only, while supported user databases can
+still be updated at runtime.
 
 !!! info ""
 
@@ -76,19 +86,32 @@ Enable the dashboard.
 
 ##### path
 
-Directory the dashboard files are stored in.
+Directory containing custom dashboard files. Leave empty to use the built-in
+dashboard unless `download_url` is configured.
 
-`dashboard` in the working directory will be used by default.
-
-If the directory is empty, the dashboard is downloaded and an `.etag` file is stored inside
-it to skip unchanged updates. A non-empty directory without an `.etag` file is served as-is
-and never updated automatically.
+When a managed dashboard archive is used, an `.etag` file is stored inside the
+directory to skip unchanged updates. A non-empty directory without an `.etag`
+file is served as-is and never updated automatically.
 
 ##### download_url
 
 Download URL of the dashboard archive (zip).
 
-`https://github.com/SagerNet/sing-box-dashboard/archive/refs/heads/gh-pages.zip` will be used by default.
+Leave empty to use the built-in Sidera dashboard.
+
+##### data_path
+
+Path to the dashboard management sidecar. It stores dashboard-owned server
+profiles, credentials, quotas, expiry times, and traffic counters. The file is
+written atomically with mode `0600`; its parent directory is created with mode
+`0700`.
+
+`sidera-dashboard.json` in the working directory is used by default.
+
+For an Xray/x-ui configuration loaded from `config.json`, an optional native
+bootstrap file named `config.json.sidera.json` may contain only the Sidera API
+service. This keeps the dashboard configuration independent from files x-ui
+regenerates. Dashboard-owned server profiles are then loaded from `data_path`.
 
 ##### http_client
 

@@ -130,7 +130,7 @@ func TestDecodeXrayVLESSClient(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, config.DialectXray, dialect)
 	require.Len(t, options.Inbounds, 1)
-	require.Equal(t, "socks", options.Inbounds[0].Type)
+	require.Equal(t, "mixed", options.Inbounds[0].Type)
 	require.Len(t, options.Outbounds, 3)
 
 	vlessOptions, loaded := options.Outbounds[0].Options.(*option.VLESSOutboundOptions)
@@ -146,6 +146,7 @@ func TestDecodeXrayVLESSClient(t *testing.T) {
 	require.Equal(t, "ws", vlessOptions.Transport.Type)
 	require.Equal(t, "/ws", vlessOptions.Transport.WebsocketOptions.Path)
 	require.Equal(t, uint32(2048), vlessOptions.Transport.WebsocketOptions.MaxEarlyData)
+	require.True(t, vlessOptions.XrayPacketEncoding)
 	require.Len(t, options.Route.Rules, 3)
 }
 
@@ -228,8 +229,8 @@ func TestDecodeXrayDefaultsInboundListenToAnyIP(t *testing.T) {
 		"outbounds": [{"protocol": "freedom"}]
 	}`))
 	require.NoError(t, err)
-	socksOptions := options.Inbounds[0].Options.(*option.SocksInboundOptions)
-	require.Equal(t, netip.IPv4Unspecified(), socksOptions.Listen.Build(netip.Addr{}))
+	mixedOptions := options.Inbounds[0].Options.(*option.HTTPMixedInboundOptions)
+	require.Equal(t, netip.IPv4Unspecified(), mixedOptions.Listen.Build(netip.Addr{}))
 }
 
 func TestDecodeXrayRejectsDisabledSOCKSUDP(t *testing.T) {
@@ -264,6 +265,7 @@ func TestDecodeXrayRoutingAliasPrecedence(t *testing.T) {
 		}, {
 			"sourceIP": [],
 			"source": ["10.0.0.0/8"],
+			"network": "tcp",
 			"outboundTag": "direct"
 		}]}
 	}`))

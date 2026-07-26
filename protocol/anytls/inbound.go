@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"strings"
+	"sync"
 
 	"github.com/Miku0139oao/sidera-core/adapter"
 	"github.com/Miku0139oao/sidera-core/adapter/inbound"
@@ -28,13 +29,20 @@ func RegisterInbound(registry *inbound.Registry) {
 	inbound.Register[option.AnyTLSInboundOptions](registry, C.TypeAnyTLS, NewInbound)
 }
 
+var (
+	_ adapter.TCPInjectableInbound = (*Inbound)(nil)
+	_ adapter.ManagedUserService   = (*Inbound)(nil)
+)
+
 type Inbound struct {
 	inbound.Adapter
-	tlsConfig tls.ServerConfig
-	router    adapter.ConnectionRouterEx
-	logger    logger.ContextLogger
-	listener  *listener.Listener
-	service   *anytls.Service
+	tlsConfig     tls.ServerConfig
+	router        adapter.ConnectionRouterEx
+	logger        logger.ContextLogger
+	listener      *listener.Listener
+	serviceAccess sync.RWMutex
+	service       *anytls.Service
+	users         []adapter.ManagedUser
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.AnyTLSInboundOptions) (adapter.Inbound, error) {
@@ -57,10 +65,16 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		paddingScheme = []byte(strings.Join(options.PaddingScheme, "\n"))
 	}
 
+	users := make([]adapter.ManagedUser, len(options.Users))
+	for index, user := range options.Users {
+		users[index] = adapter.ManagedUser{Name: user.Name, Password: user.Password}
+	}
+	users, serviceUsers, err := buildUsers(users)
+	if err != nil {
+		return nil, err
+	}
 	service, err := anytls.NewService(anytls.ServiceConfig{
-		Users: common.Map(options.Users, func(it option.AnyTLSUser) anytls.User {
-			return (anytls.User)(it)
-		}),
+		Users:         serviceUsers,
 		PaddingScheme: paddingScheme,
 		Handler:       (*inboundHandler)(inbound),
 		Logger:        logger,
@@ -69,6 +83,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		return nil, err
 	}
 	inbound.service = service
+	inbound.users = users
 	inbound.listener = listener.New(listener.Options{
 		Context:           ctx,
 		Logger:            logger,
@@ -96,6 +111,50 @@ func (h *Inbound) Close() error {
 	return common.Close(h.listener, h.tlsConfig)
 }
 
+func (h *Inbound) ManagedUserSchema() adapter.ManagedUserSchema {
+	return adapter.ManagedUserSchema{Credential: adapter.ManagedUserCredentialPassword}
+}
+
+func (h *Inbound) ManagedUsers() []adapter.ManagedUser {
+	h.serviceAccess.RLock()
+	users := append([]adapter.ManagedUser(nil), h.users...)
+	h.serviceAccess.RUnlock()
+	return users
+}
+
+func (h *Inbound) UpdateManagedUsers(users []adapter.ManagedUser) error {
+	usersCopy, serviceUsers, err := buildUsers(users)
+	if err != nil {
+		return err
+	}
+	h.serviceAccess.Lock()
+	h.service.UpdateUsers(serviceUsers)
+	h.users = usersCopy
+	h.serviceAccess.Unlock()
+	return nil
+}
+
+func buildUsers(users []adapter.ManagedUser) ([]adapter.ManagedUser, []anytls.User, error) {
+	names := make(map[string]struct{}, len(users))
+	usersCopy := make([]adapter.ManagedUser, len(users))
+	serviceUsers := make([]anytls.User, len(users))
+	for index, user := range users {
+		if user.Name == "" {
+			return nil, nil, E.New("missing name for user[", index, "]")
+		}
+		if user.Password == "" {
+			return nil, nil, E.New("missing password for user[", index, "]")
+		}
+		if _, exists := names[user.Name]; exists {
+			return nil, nil, E.New("duplicate name for user[", index, "]: ", user.Name)
+		}
+		names[user.Name] = struct{}{}
+		usersCopy[index] = adapter.ManagedUser{Name: user.Name, Password: user.Password}
+		serviceUsers[index] = anytls.User{Name: user.Name, Password: user.Password}
+	}
+	return usersCopy, serviceUsers, nil
+}
+
 func (h *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
 	if h.tlsConfig != nil {
 		tlsConn, err := tls.ServerHandshake(ctx, conn, h.tlsConfig)
@@ -106,7 +165,9 @@ func (h *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
 		}
 		conn = tlsConn
 	}
+	h.serviceAccess.RLock()
 	err := h.service.NewConnection(adapter.WithContext(ctx, &metadata), conn, metadata.Source, onClose)
+	h.serviceAccess.RUnlock()
 	if err != nil {
 		N.CloseOnHandshakeFailure(conn, onClose, err)
 		h.logger.ErrorContext(ctx, E.Cause(err, "process connection from ", metadata.Source))

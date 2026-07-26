@@ -3,6 +3,7 @@ name: Test
 on:
   push:
     branches:
+      - main
       - stable
       - testing
       - unstable
@@ -12,6 +13,7 @@ on:
       - '!.github/workflows/test.yml'
   pull_request:
     branches:
+      - main
       - stable
       - testing
       - unstable
@@ -41,6 +43,9 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: ${{ matrix.go }}
+          cache-dependency-path: |
+            go.sum
+            test/go.sum
       - name: Set build tags and ldflags
         shell: bash
         run: |
@@ -53,3 +58,7 @@ jobs:
         if: matrix.os == 'windows-latest'
         shell: bash
         run: go test -v -tags "$BUILD_TAGS" -ldflags "$LDFLAGS_SHARED" ./...
+      - name: Compile integration tests
+        shell: bash
+        working-directory: test
+        run: go test -mod=readonly -c -o "$RUNNER_TEMP/sidera-integration.test" -tags "$BUILD_TAGS" -ldflags "$LDFLAGS_SHARED" .

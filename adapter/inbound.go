@@ -44,6 +44,45 @@ type InboundManager interface {
 	Create(ctx context.Context, router Router, logger log.ContextLogger, tag string, inboundType string, options any) error
 }
 
+// ManagedUser describes the protocol-specific credentials for one inbound user.
+// Fields that are not used by a protocol are left empty.
+type ManagedUser struct {
+	Name     string
+	UUID     string
+	Password string
+	Flow     string
+	AlterID  int
+}
+
+const (
+	ManagedUserCredentialPassword     = "password"
+	ManagedUserCredentialUUID         = "uuid"
+	ManagedUserCredentialUUIDPassword = "uuid_password"
+	ManagedUserPasswordOpaque         = "opaque"
+	ManagedUserPasswordBase64         = "base64"
+)
+
+// ManagedUserSchema lets management clients render the right credential fields
+// without maintaining their own protocol allow-list.
+type ManagedUserSchema struct {
+	Credential       string
+	PasswordEncoding string
+	PasswordBytes    int
+	Flow             bool
+	AlterID          bool
+	NoTraffic        bool
+}
+
+// ManagedUserService is implemented by inbounds and server endpoints whose
+// authentication database can be replaced safely while the service is running.
+type ManagedUserService interface {
+	Type() string
+	Tag() string
+	ManagedUserSchema() ManagedUserSchema
+	ManagedUsers() []ManagedUser
+	UpdateManagedUsers(users []ManagedUser) error
+}
+
 type InboundContext struct {
 	Inbound     string
 	InboundType string

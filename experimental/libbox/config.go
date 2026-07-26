@@ -9,6 +9,7 @@ import (
 
 	box "github.com/Miku0139oao/sidera-core"
 	"github.com/Miku0139oao/sidera-core/adapter"
+	"github.com/Miku0139oao/sidera-core/config"
 	C "github.com/Miku0139oao/sidera-core/constant"
 	"github.com/Miku0139oao/sidera-core/dns"
 	"github.com/Miku0139oao/sidera-core/include"
@@ -39,17 +40,17 @@ func baseContext(platformInterface PlatformInterface) context.Context {
 	return box.Context(ctx, include.InboundRegistry(), include.OutboundRegistry(), include.EndpointRegistry(), dnsRegistry, include.ServiceRegistry(), include.CertificateProviderRegistry())
 }
 
-func parseConfig(ctx context.Context, configContent string) (option.Options, error) {
-	options, err := json.UnmarshalExtendedContext[option.Options](ctx, []byte(configContent))
+func parseConfig(ctx context.Context, configContent string) (option.Options, config.Dialect, error) {
+	options, dialect, err := config.Decode(ctx, []byte(configContent))
 	if err != nil {
-		return option.Options{}, E.Cause(err, "decode config")
+		return option.Options{}, "", E.Cause(err, "decode config")
 	}
-	return options, nil
+	return options, dialect, nil
 }
 
 func CheckConfig(configContent string) error {
 	ctx := baseContext(nil)
-	options, err := parseConfig(ctx, configContent)
+	options, _, err := parseConfig(ctx, configContent)
 	if err != nil {
 		return err
 	}
@@ -252,9 +253,12 @@ func GenerateConfigSchema() (*StringBox, error) {
 }
 
 func FormatConfig(configContent string) (*StringBox, error) {
-	options, err := parseConfig(baseContext(nil), configContent)
+	options, dialect, err := parseConfig(baseContext(nil), configContent)
 	if err != nil {
 		return nil, err
+	}
+	if dialect == config.DialectXray {
+		return nil, E.New("formatting Xray configuration files is not implemented")
 	}
 	var buffer bytes.Buffer
 	encoder := json.NewEncoder(&buffer)

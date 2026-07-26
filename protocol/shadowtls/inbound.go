@@ -3,6 +3,8 @@ package shadowtls
 import (
 	"context"
 	"net"
+	"sync"
+	"sync/atomic"
 
 	"github.com/Miku0139oao/sidera-core/adapter"
 	"github.com/Miku0139oao/sidera-core/adapter/inbound"
@@ -24,12 +26,25 @@ func RegisterInbound(registry *inbound.Registry) {
 	inbound.Register[option.ShadowTLSInboundOptions](registry, C.TypeShadowTLS, NewInbound)
 }
 
+var (
+	_ adapter.TCPInjectableInbound = (*Inbound)(nil)
+	_ adapter.ManagedUserService   = (*Inbound)(nil)
+)
+
+type serviceState struct {
+	service *shadowtls.Service
+	users   []adapter.ManagedUser
+}
+
 type Inbound struct {
 	inbound.Adapter
-	router   adapter.Router
-	logger   logger.ContextLogger
-	listener *listener.Listener
-	service  *shadowtls.Service
+	router        adapter.Router
+	logger        logger.ContextLogger
+	listener      *listener.Listener
+	version       int
+	serviceConfig shadowtls.ServiceConfig
+	updateAccess  sync.Mutex
+	serviceState  atomic.Pointer[serviceState]
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.ShadowTLSInboundOptions) (adapter.Inbound, error) {
@@ -67,12 +82,24 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	if err != nil {
 		return nil, err
 	}
-	service, err := shadowtls.NewService(shadowtls.ServiceConfig{
+	serviceUsers := common.Map(options.Users, func(it option.ShadowTLSUser) shadowtls.User {
+		return (shadowtls.User)(it)
+	})
+	var managedUsers []adapter.ManagedUser
+	if options.Version == 3 {
+		users := make([]adapter.ManagedUser, len(options.Users))
+		for index, user := range options.Users {
+			users[index] = adapter.ManagedUser{Name: user.Name, Password: user.Password}
+		}
+		managedUsers, serviceUsers, err = buildUsers(users)
+		if err != nil {
+			return nil, err
+		}
+	}
+	serviceConfig := shadowtls.ServiceConfig{
 		Version:  options.Version,
 		Password: options.Password,
-		Users: common.Map(options.Users, func(it option.ShadowTLSUser) shadowtls.User {
-			return (shadowtls.User)(it)
-		}),
+		Users:    serviceUsers,
 		Handshake: shadowtls.HandshakeConfig{
 			Server: options.Handshake.ServerOptions.Build(),
 			Dialer: handshakeDialer,
@@ -82,11 +109,14 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		WildcardSNI:            shadowtls.WildcardSNI(options.WildcardSNI),
 		Handler:                (*inboundHandler)(inbound),
 		Logger:                 logger,
-	})
+	}
+	service, err := shadowtls.NewService(serviceConfig)
 	if err != nil {
 		return nil, err
 	}
-	inbound.service = service
+	inbound.version = options.Version
+	inbound.serviceConfig = serviceConfig
+	inbound.serviceState.Store(&serviceState{service: service, users: managedUsers})
 	inbound.listener = listener.New(listener.Options{
 		Context:           ctx,
 		Logger:            logger,
@@ -108,8 +138,67 @@ func (h *Inbound) Close() error {
 	return h.listener.Close()
 }
 
+func (h *Inbound) ManagedUserSchema() adapter.ManagedUserSchema {
+	if h.version != 3 {
+		return adapter.ManagedUserSchema{}
+	}
+	return adapter.ManagedUserSchema{Credential: adapter.ManagedUserCredentialPassword}
+}
+
+func (h *Inbound) ManagedUsers() []adapter.ManagedUser {
+	if h.version != 3 {
+		return nil
+	}
+	users := h.serviceState.Load().users
+	return append([]adapter.ManagedUser(nil), users...)
+}
+
+func (h *Inbound) UpdateManagedUsers(users []adapter.ManagedUser) error {
+	if h.version != 3 {
+		return E.New("managed users are only supported by ShadowTLS version 3")
+	}
+	usersCopy, serviceUsers, err := buildUsers(users)
+	if err != nil {
+		return err
+	}
+
+	h.updateAccess.Lock()
+	defer h.updateAccess.Unlock()
+	serviceConfig := h.serviceConfig
+	serviceConfig.Users = serviceUsers
+	service, err := shadowtls.NewService(serviceConfig)
+	if err != nil {
+		return err
+	}
+	h.serviceConfig = serviceConfig
+	h.serviceState.Store(&serviceState{service: service, users: usersCopy})
+	return nil
+}
+
+func buildUsers(users []adapter.ManagedUser) ([]adapter.ManagedUser, []shadowtls.User, error) {
+	names := make(map[string]struct{}, len(users))
+	usersCopy := make([]adapter.ManagedUser, len(users))
+	serviceUsers := make([]shadowtls.User, len(users))
+	for index, user := range users {
+		if user.Name == "" {
+			return nil, nil, E.New("missing name for user[", index, "]")
+		}
+		if user.Password == "" {
+			return nil, nil, E.New("missing password for user[", index, "]")
+		}
+		if _, exists := names[user.Name]; exists {
+			return nil, nil, E.New("duplicate name for user[", index, "]: ", user.Name)
+		}
+		names[user.Name] = struct{}{}
+		usersCopy[index] = adapter.ManagedUser{Name: user.Name, Password: user.Password}
+		serviceUsers[index] = shadowtls.User{Name: user.Name, Password: user.Password}
+	}
+	return usersCopy, serviceUsers, nil
+}
+
 func (h *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
-	err := h.service.NewConnection(adapter.WithContext(log.ContextWithNewID(ctx), &metadata), conn, metadata.Source, metadata.Destination, onClose)
+	service := h.serviceState.Load().service
+	err := service.NewConnection(adapter.WithContext(log.ContextWithNewID(ctx), &metadata), conn, metadata.Source, metadata.Destination, onClose)
 	N.CloseOnHandshakeFailure(conn, onClose, err)
 	if err != nil {
 		if E.IsClosedOrCanceled(err) {

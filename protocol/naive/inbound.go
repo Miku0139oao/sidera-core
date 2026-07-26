@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"sync/atomic"
 
 	"github.com/Miku0139oao/sidera-core/adapter"
 	"github.com/Miku0139oao/sidera-core/adapter/inbound"
@@ -34,6 +35,8 @@ var (
 	WrapError                  func(error) error
 )
 
+var _ adapter.ManagedUserService = (*Inbound)(nil)
+
 func RegisterInbound(registry *inbound.Registry) {
 	inbound.Register[option.NaiveInboundOptions](registry, C.TypeNaive, NewInbound)
 }
@@ -47,13 +50,26 @@ type Inbound struct {
 	listener         *listener.Listener
 	network          []string
 	networkIsDefault bool
-	authenticator    *auth.Authenticator
+	userState        atomic.Pointer[userState]
 	tlsConfig        tls.ServerConfig
 	httpServer       *http.Server
 	h3Server         io.Closer
 }
 
+type userState struct {
+	users         []adapter.ManagedUser
+	authenticator *auth.Authenticator
+}
+
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.NaiveInboundOptions) (adapter.Inbound, error) {
+	users := make([]adapter.ManagedUser, len(options.Users))
+	for index, user := range options.Users {
+		users[index] = adapter.ManagedUser{Name: user.Username, Password: user.Password}
+	}
+	userState, err := newUserState(users)
+	if err != nil {
+		return nil, err
+	}
 	inbound := &Inbound{
 		Adapter: inbound.NewAdapter(C.TypeNaive, tag),
 		ctx:     ctx,
@@ -66,8 +82,8 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		}),
 		networkIsDefault: options.Network == "",
 		network:          options.Network.Build(),
-		authenticator:    auth.NewAuthenticator(options.Users),
 	}
+	inbound.userState.Store(userState)
 	if common.Contains(inbound.network, N.NetworkUDP) {
 		if options.TLS == nil || !options.TLS.Enabled {
 			return nil, E.New("TLS is required for QUIC server")
@@ -147,6 +163,48 @@ func (n *Inbound) Close() error {
 	)
 }
 
+func (n *Inbound) ManagedUserSchema() adapter.ManagedUserSchema {
+	return adapter.ManagedUserSchema{Credential: adapter.ManagedUserCredentialPassword}
+}
+
+func (n *Inbound) ManagedUsers() []adapter.ManagedUser {
+	users := n.userState.Load().users
+	return append([]adapter.ManagedUser(nil), users...)
+}
+
+func (n *Inbound) UpdateManagedUsers(users []adapter.ManagedUser) error {
+	userState, err := newUserState(users)
+	if err != nil {
+		return err
+	}
+	n.userState.Store(userState)
+	return nil
+}
+
+func newUserState(users []adapter.ManagedUser) (*userState, error) {
+	names := make(map[string]struct{}, len(users))
+	usersCopy := make([]adapter.ManagedUser, len(users))
+	authUsers := make([]auth.User, len(users))
+	for index, user := range users {
+		if user.Name == "" {
+			return nil, E.New("missing name for user[", index, "]")
+		}
+		if user.Password == "" {
+			return nil, E.New("missing password for user[", index, "]")
+		}
+		if _, exists := names[user.Name]; exists {
+			return nil, E.New("duplicate name for user[", index, "]: ", user.Name)
+		}
+		names[user.Name] = struct{}{}
+		usersCopy[index] = adapter.ManagedUser{Name: user.Name, Password: user.Password}
+		authUsers[index] = auth.User{Username: user.Name, Password: user.Password}
+	}
+	return &userState{
+		users:         usersCopy,
+		authenticator: auth.NewAuthenticator(authUsers),
+	}, nil
+}
+
 func (n *Inbound) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	ctx := log.ContextWithNewID(request.Context())
 	if request.Method != "CONNECT" {
@@ -158,9 +216,10 @@ func (n *Inbound) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		n.badRequest(ctx, request, E.New("missing naive padding"))
 		return
 	}
+	authenticator := n.userState.Load().authenticator
 	userName, password, authOk := sHttp.ParseBasicAuth(request.Header.Get("Proxy-Authorization"))
 	if authOk {
-		authOk = n.authenticator.Verify(userName, password)
+		authOk = authenticator != nil && authenticator.Verify(userName, password)
 	}
 	if !authOk {
 		rejectHTTP(writer, http.StatusProxyAuthRequired)

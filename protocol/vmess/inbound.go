@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"os"
+	"sync"
 
 	"github.com/Miku0139oao/sidera-core/adapter"
 	"github.com/Miku0139oao/sidera-core/adapter/inbound"
@@ -21,7 +22,6 @@ import (
 	"github.com/sagernet/sing/common/auth"
 	"github.com/sagernet/sing/common/bufio"
 	E "github.com/sagernet/sing/common/exceptions"
-	F "github.com/sagernet/sing/common/format"
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
@@ -32,7 +32,10 @@ func RegisterInbound(registry *inbound.Registry) {
 	inbound.Register[option.VMessInboundOptions](registry, C.TypeVMess, NewInbound)
 }
 
-var _ adapter.TCPInjectableInbound = (*Inbound)(nil)
+var (
+	_ adapter.TCPInjectableInbound = (*Inbound)(nil)
+	_ adapter.ManagedUserService   = (*Inbound)(nil)
+)
 
 type Inbound struct {
 	inbound.Adapter
@@ -40,10 +43,14 @@ type Inbound struct {
 	router    adapter.ConnectionRouterEx
 	logger    logger.ContextLogger
 	listener  *listener.Listener
-	service   *vmess.Service[int]
-	users     []option.VMessUser
+	service   *vmess.Service[string]
 	tlsConfig tls.ServerConfig
 	transport adapter.V2RayServerTransport
+
+	serviceAccess sync.RWMutex
+	usersAccess   sync.RWMutex
+	users         map[string]option.VMessUser
+	managedUsers  []adapter.ManagedUser
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.VMessInboundOptions) (adapter.Inbound, error) {
@@ -52,7 +59,6 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		ctx:     ctx,
 		router:  uot.NewRouter(router, logger),
 		logger:  logger,
-		users:   options.Users,
 	}
 	var err error
 	inbound.router, err = mux.NewRouterWithOptions(inbound.router, logger, common.PtrValueOrDefault(options.Multiplex))
@@ -66,15 +72,13 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	if options.Transport != nil && options.Transport.Type != "" {
 		serviceOptions = append(serviceOptions, vmess.ServiceWithDisableHeaderProtection())
 	}
-	service := vmess.NewService[int](adapter.NewUpstreamContextHandler(inbound.newConnectionEx, inbound.newPacketConnectionEx), serviceOptions...)
+	service := vmess.NewService[string](adapter.NewUpstreamContextHandler(inbound.newConnectionEx, inbound.newPacketConnectionEx), serviceOptions...)
 	inbound.service = service
-	err = service.UpdateUsers(common.MapIndexed(options.Users, func(index int, it option.VMessUser) int {
-		return index
-	}), common.Map(options.Users, func(it option.VMessUser) string {
-		return it.UUID
-	}), common.Map(options.Users, func(it option.VMessUser) int {
-		return it.AlterId
-	}))
+	managedUsers := make([]adapter.ManagedUser, len(options.Users))
+	for index, user := range options.Users {
+		managedUsers[index] = adapter.ManagedUser{Name: user.Name, UUID: user.UUID, AlterID: user.AlterId}
+	}
+	err = inbound.UpdateManagedUsers(managedUsers)
 	if err != nil {
 		return nil, err
 	}
@@ -98,6 +102,57 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		ConnectionHandler: inbound,
 	})
 	return inbound, nil
+}
+
+func (h *Inbound) ManagedUserSchema() adapter.ManagedUserSchema {
+	return adapter.ManagedUserSchema{
+		Credential: adapter.ManagedUserCredentialUUID,
+		AlterID:    true,
+	}
+}
+
+func (h *Inbound) ManagedUsers() []adapter.ManagedUser {
+	h.usersAccess.RLock()
+	defer h.usersAccess.RUnlock()
+	return append([]adapter.ManagedUser(nil), h.managedUsers...)
+}
+
+func (h *Inbound) UpdateManagedUsers(users []adapter.ManagedUser) error {
+	userList := make([]string, len(users))
+	uuidList := make([]string, len(users))
+	alterIDList := make([]int, len(users))
+	userMap := make(map[string]option.VMessUser, len(users))
+	managedUsers := make([]adapter.ManagedUser, len(users))
+	for index, user := range users {
+		if user.UUID == "" {
+			return E.New("missing uuid for user ", index)
+		}
+		protocolUser := option.VMessUser{Name: user.Name, UUID: user.UUID, AlterId: user.AlterID}
+		userList[index] = user.UUID
+		uuidList[index] = user.UUID
+		alterIDList[index] = user.AlterID
+		userMap[user.UUID] = protocolUser
+		managedUsers[index] = adapter.ManagedUser{Name: user.Name, UUID: user.UUID, AlterID: user.AlterID}
+	}
+
+	h.serviceAccess.Lock()
+	err := h.service.UpdateUsers(userList, uuidList, alterIDList)
+	h.serviceAccess.Unlock()
+	if err != nil {
+		return err
+	}
+	h.usersAccess.Lock()
+	h.users = userMap
+	h.managedUsers = managedUsers
+	h.usersAccess.Unlock()
+	return nil
+}
+
+func (h *Inbound) userName(userID string) string {
+	h.usersAccess.RLock()
+	user := h.users[userID]
+	h.usersAccess.RUnlock()
+	return user.Name
 }
 
 func (h *Inbound) Start(stage adapter.StartStage) error {
@@ -163,7 +218,9 @@ func (h *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
 		}
 		conn = tlsConn
 	}
+	h.serviceAccess.RLock()
 	err := h.service.NewConnection(adapter.WithContext(ctx, &metadata), conn, metadata.Source, onClose)
+	h.serviceAccess.RUnlock()
 	if err != nil {
 		N.CloseOnHandshakeFailure(conn, onClose, err)
 		h.logger.ErrorContext(ctx, E.Cause(err, "process connection from ", metadata.Source))
@@ -173,14 +230,14 @@ func (h *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
 func (h *Inbound) newConnectionEx(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
 	metadata.Inbound = h.Tag()
 	metadata.InboundType = h.Type()
-	userIndex, loaded := auth.UserFromContext[int](ctx)
+	userID, loaded := auth.UserFromContext[string](ctx)
 	if !loaded {
 		N.CloseOnHandshakeFailure(conn, onClose, os.ErrInvalid)
 		return
 	}
-	user := h.users[userIndex].Name
+	user := h.userName(userID)
 	if user == "" {
-		user = F.ToString(userIndex)
+		user = userID
 	} else {
 		metadata.User = user
 	}
@@ -191,14 +248,14 @@ func (h *Inbound) newConnectionEx(ctx context.Context, conn net.Conn, metadata a
 func (h *Inbound) newPacketConnectionEx(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
 	metadata.Inbound = h.Tag()
 	metadata.InboundType = h.Type()
-	userIndex, loaded := auth.UserFromContext[int](ctx)
+	userID, loaded := auth.UserFromContext[string](ctx)
 	if !loaded {
 		N.CloseOnHandshakeFailure(conn, onClose, os.ErrInvalid)
 		return
 	}
-	user := h.users[userIndex].Name
+	user := h.userName(userID)
 	if user == "" {
-		user = F.ToString(userIndex)
+		user = userID
 	} else {
 		metadata.User = user
 	}

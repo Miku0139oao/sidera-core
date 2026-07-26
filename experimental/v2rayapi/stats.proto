@@ -1,6 +1,6 @@
 syntax = "proto3";
 
-package experimental.v2rayapi;
+package xray.app.stats.command;
 option go_package = "github.com/Miku0139oao/sidera-core/experimental/v2rayapi";
 
 message GetStatsRequest {
@@ -17,6 +17,42 @@ message Stat {
 
 message GetStatsResponse {
   Stat stat = 1;
+}
+
+message GetStatsOnlineIpListResponse {
+  string name = 1;
+  map<string, int64> ips = 2;
+}
+
+message GetAllOnlineUsersRequest {}
+
+message GetAllOnlineUsersResponse {
+  repeated string users = 1;
+}
+
+message OnlineIPEntry {
+  string ip = 1;
+  int64 last_seen = 2;
+}
+
+message TrafficUserStat {
+  int64 uplink = 1;
+  int64 downlink = 2;
+}
+
+message UserStat {
+  string email = 1;
+  repeated OnlineIPEntry ips = 2;
+  TrafficUserStat traffic = 3;
+}
+
+message GetUsersStatsRequest {
+  bool include_traffic = 1;
+  bool reset = 2;
+}
+
+message GetUsersStatsResponse {
+  repeated UserStat users = 1;
 }
 
 message QueryStatsRequest {
@@ -48,6 +84,10 @@ message SysStatsResponse {
 
 service StatsService {
   rpc GetStats(GetStatsRequest) returns (GetStatsResponse) {}
+  rpc GetStatsOnline(GetStatsRequest) returns (GetStatsResponse) {}
   rpc QueryStats(QueryStatsRequest) returns (QueryStatsResponse) {}
   rpc GetSysStats(SysStatsRequest) returns (SysStatsResponse) {}
+  rpc GetStatsOnlineIpList(GetStatsRequest) returns (GetStatsOnlineIpListResponse) {}
+  rpc GetAllOnlineUsers(GetAllOnlineUsersRequest) returns (GetAllOnlineUsersResponse) {}
+  rpc GetUsersStats(GetUsersStatsRequest) returns (GetUsersStatsResponse) {}
 }

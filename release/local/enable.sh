@@ -2,6 +2,6 @@
 
 set -e -o pipefail
 
-sudo systemctl enable sing-box
-sudo systemctl start sing-box
-sudo journalctl -u sing-box --output cat -f
+sudo systemctl enable sidera
+sudo systemctl start sidera
+sudo journalctl -u sidera --output cat -f

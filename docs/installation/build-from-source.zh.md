@@ -109,13 +109,13 @@ NaiveProxy 出站需要根据目标平台进行特殊的构建配置。
 
 使用 `with_purego` 标记。
 
-官方发布版本已包含 `libcronet.dll`。自行构建时，从 [cronet-go releases](https://github.com/sagernet/cronet-go/releases) 下载并放置在 `sing-box.exe` 相同目录或 `PATH` 中的任意目录。
+官方发布版本已包含 `libcronet.dll`。自行构建时，从 [cronet-go releases](https://github.com/sagernet/cronet-go/releases) 下载并放置在 `sidera.exe` 相同目录或 `PATH` 中的任意目录。
 
 ### Linux (purego, 仅 amd64/arm64)
 
 使用 `with_purego` 标记。
 
-官方发布版本已包含 `libcronet.so`。自行构建时，从 [cronet-go releases](https://github.com/sagernet/cronet-go/releases) 下载并放置在 sing-box 二进制文件相同目录或系统库路径中。
+官方发布版本已包含 `libcronet.so`。自行构建时，从 [cronet-go releases](https://github.com/sagernet/cronet-go/releases) 下载并放置在 Sidera 二进制文件相同目录或系统库路径中。
 
 ### Linux (CGO)
 
