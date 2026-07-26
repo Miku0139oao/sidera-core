@@ -2,11 +2,10 @@ package box
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"io"
 	"net/http"
 	"os"
-	"runtime/debug"
 	"time"
 
 	"github.com/Miku0139oao/sidera-core/adapter"
@@ -16,6 +15,7 @@ import (
 	"github.com/Miku0139oao/sidera-core/adapter/outbound"
 	boxService "github.com/Miku0139oao/sidera-core/adapter/service"
 	"github.com/Miku0139oao/sidera-core/common/certificate"
+	"github.com/Miku0139oao/sidera-core/common/dashboardstore"
 	"github.com/Miku0139oao/sidera-core/common/dialer"
 	"github.com/Miku0139oao/sidera-core/common/httpclient"
 	"github.com/Miku0139oao/sidera-core/common/netns"
@@ -23,6 +23,7 @@ import (
 	"github.com/Miku0139oao/sidera-core/common/tls"
 	"github.com/Miku0139oao/sidera-core/common/trafficcontrol"
 	"github.com/Miku0139oao/sidera-core/common/urltest"
+	"github.com/Miku0139oao/sidera-core/common/validation"
 	C "github.com/Miku0139oao/sidera-core/constant"
 	"github.com/Miku0139oao/sidera-core/dns"
 	"github.com/Miku0139oao/sidera-core/experimental"
@@ -68,6 +69,7 @@ type Options struct {
 	Context                    context.Context
 	PlatformLogWriter          log.PlatformWriter
 	NetworkNamespaceHolderArgs []string
+	ValidationOnly             bool
 }
 
 func Context(
@@ -115,6 +117,9 @@ func New(options Options) (*Box, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if options.ValidationOnly {
+		ctx = validation.Context(ctx)
+	}
 	ctx = service.ContextWithDefaultRegistry(ctx)
 
 	endpointRegistry := service.FromContext[adapter.EndpointRegistry](ctx)
@@ -141,6 +146,13 @@ func New(options Options) (*Box, error) {
 	}
 	if certificateProviderRegistry == nil {
 		return nil, E.New("missing certificate provider registry in context")
+	}
+	options.Options = cloneDashboardOptions(options.Options)
+	if err := dashboardstore.MergeProfiles(ctx, &options.Options); err != nil {
+		return nil, E.Cause(err, "load dashboard server profiles")
+	}
+	if err := validateDashboardServices(options.Services); err != nil {
+		return nil, err
 	}
 
 	ctx = pause.WithDefaultManager(ctx)
@@ -482,39 +494,74 @@ func New(options Options) (*Box, error) {
 	}, nil
 }
 
-func (s *Box) PreStart() error {
+func cloneDashboardOptions(options option.Options) option.Options {
+	cloned := options
+	cloned.Inbounds = append([]option.Inbound(nil), options.Inbounds...)
+	cloned.Endpoints = append([]option.Endpoint(nil), options.Endpoints...)
+	cloned.Services = append([]option.Service(nil), options.Services...)
+	for index := range cloned.Services {
+		apiOptions, loaded := cloned.Services[index].Options.(*option.APIServiceOptions)
+		if !loaded {
+			continue
+		}
+		apiCopy := *apiOptions
+		if apiOptions.Dashboard != nil {
+			dashboardCopy := *apiOptions.Dashboard
+			if apiOptions.Dashboard.AppliedServerRevisions != nil {
+				dashboardCopy.AppliedServerRevisions = make(map[string]int64, len(apiOptions.Dashboard.AppliedServerRevisions))
+				for tag, revision := range apiOptions.Dashboard.AppliedServerRevisions {
+					dashboardCopy.AppliedServerRevisions[tag] = revision
+				}
+			}
+			apiCopy.Dashboard = &dashboardCopy
+		}
+		cloned.Services[index].Options = &apiCopy
+	}
+	return cloned
+}
+
+func validateDashboardServices(services []option.Service) error {
+	var dashboardCount int
+	for _, serviceOptions := range services {
+		if serviceOptions.Type != C.TypeAPI {
+			continue
+		}
+		apiOptions, loaded := serviceOptions.Options.(*option.APIServiceOptions)
+		if loaded && apiOptions.Dashboard != nil && apiOptions.Dashboard.Enabled {
+			dashboardCount++
+		}
+	}
+	if dashboardCount > 1 {
+		return E.New("only one dashboard-enabled API service is allowed")
+	}
+	return nil
+}
+
+func (s *Box) PreStart() (result error) {
 	err := s.preStart()
 	if err != nil {
-		// TODO: remove catch error
 		defer func() {
 			v := recover()
 			if v != nil {
-				println(err.Error())
-				debug.PrintStack()
-				panic("panic on early close: " + fmt.Sprint(v))
+				result = errors.Join(err, E.New("panic on early close: ", v))
 			}
 		}()
-		s.Close()
-		return err
+		return errors.Join(err, s.Close())
 	}
 	s.logger.Info("Sidera Core pre-started (", F.Seconds(time.Since(s.createdAt).Seconds()), "s)")
 	return nil
 }
 
-func (s *Box) Start() error {
+func (s *Box) Start() (result error) {
 	err := s.start()
 	if err != nil {
-		// TODO: remove catch error
 		defer func() {
 			v := recover()
 			if v != nil {
-				println(err.Error())
-				debug.PrintStack()
-				println("panic on early start: " + fmt.Sprint(v))
+				result = errors.Join(err, E.New("panic on early start cleanup: ", v))
 			}
 		}()
-		s.Close()
-		return err
+		return errors.Join(err, s.Close())
 	}
 	s.logger.Info("Sidera Core started (", F.Seconds(time.Since(s.createdAt).Seconds()), "s)")
 	return nil

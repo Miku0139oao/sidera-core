@@ -52,3 +52,28 @@ func TestMergeXrayDashboardSidecarRejectsRuntimeConfig(t *testing.T) {
 		path: configPath, dialect: config.DialectXray,
 	}}), "may only contain the dashboard API service")
 }
+
+func TestDashboardStoreSnapshotRestore(t *testing.T) {
+	previousContext := globalCtx
+	globalCtx = include.Context(context.Background())
+	t.Cleanup(func() { globalCtx = previousContext })
+
+	dataPath := filepath.Join(t.TempDir(), "dashboard.json")
+	require.NoError(t, os.WriteFile(dataPath, []byte("before"), 0o600))
+	options := option.Options{Services: []option.Service{{
+		Type: "api",
+		Options: &option.APIServiceOptions{Dashboard: &option.APIDashboardOptions{
+			Enabled: true, DataPath: dataPath,
+		}},
+	}}}
+	snapshot, err := captureDashboardStoreFiles(options)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(dataPath, []byte("after"), 0o600))
+	require.NoError(t, os.WriteFile(dataPath+".bak", []byte("unexpected"), 0o600))
+	require.NoError(t, restoreDashboardStoreFiles(snapshot))
+	content, err := os.ReadFile(dataPath)
+	require.NoError(t, err)
+	require.Equal(t, "before", string(content))
+	_, err = os.Stat(dataPath + ".bak")
+	require.ErrorIs(t, err, os.ErrNotExist)
+}

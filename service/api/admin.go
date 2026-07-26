@@ -8,19 +8,23 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/Miku0139oao/sidera-core/adapter"
+	"github.com/Miku0139oao/sidera-core/common/dashboardstore"
 	"github.com/Miku0139oao/sidera-core/common/trafficcontrol"
+	"github.com/Miku0139oao/sidera-core/common/validation"
 	C "github.com/Miku0139oao/sidera-core/constant"
 	"github.com/Miku0139oao/sidera-core/daemon"
 	"github.com/Miku0139oao/sidera-core/log"
@@ -33,34 +37,53 @@ import (
 )
 
 const (
-	adminRoutePrefix     = "/api/admin"
-	adminStoreVersion    = 2
-	defaultAdminDataPath = "sidera-dashboard.json"
+	adminRoutePrefix  = "/api/admin"
+	adminStoreVersion = dashboardstore.StoreVersion
 )
 
+// ContextWithValidation disables runtime and persistent dashboard mutations
+// while a Box is constructed only to validate configuration.
+func ContextWithValidation(ctx context.Context) context.Context {
+	return validation.Context(ctx)
+}
+
+func ResolveDashboardDataPath(ctx context.Context, dataPath string) string {
+	return dashboardstore.ResolveDataPath(ctx, dataPath)
+}
+
 type adminAPI struct {
-	ctx       context.Context
-	logger    log.ContextLogger
-	secret    string
-	dataPath  string
-	router    http.Handler
-	startedAt time.Time
+	ctx            context.Context
+	logger         log.ContextLogger
+	secret         string
+	dataPath       string
+	router         http.Handler
+	startedAt      time.Time
+	validationOnly bool
 
-	traffic  *trafficcontrol.Manager
-	runtimes map[string]*adminInboundRuntime
-	inbounds []adminInboundRuntime
+	traffic             *trafficcontrol.Manager
+	runtimes            map[string]*adminInboundRuntime
+	inbounds            []adminInboundRuntime
+	serverRevisions     map[string]int64
+	userAliases         map[string]adminManagedUserIdentity
+	processSignalReload bool
 
-	storeAccess       sync.RWMutex
-	store             adminStore
-	mutation          sync.Mutex
-	saveAccess        sync.Mutex
-	trafficAccess     sync.Mutex
-	trafficBaselines  map[uuid.UUID]adminTrafficBaseline
-	runCtx            context.Context
-	cancel            context.CancelFunc
-	workers           sync.WaitGroup
-	removeTrafficHook func()
-	dirty             atomic.Bool
+	storeAccess           sync.RWMutex
+	store                 adminStore
+	mutation              sync.Mutex
+	saveAccess            sync.Mutex
+	trafficAccess         sync.Mutex
+	trafficBaselines      map[uuid.UUID]adminTrafficBaseline
+	pendingTrafficAccess  sync.Mutex
+	pendingTraffic        []adminTrafficEvent
+	runCtx                context.Context
+	cancel                context.CancelFunc
+	workers               sync.WaitGroup
+	handlerAccess         sync.Mutex
+	handlers              sync.WaitGroup
+	closing               bool
+	removeTrafficOpenHook func()
+	removeTrafficHook     func()
+	dirty                 atomic.Bool
 }
 
 type adminInboundRuntime struct {
@@ -102,34 +125,39 @@ type adminServerAdvertise struct {
 }
 
 type adminInboundStore struct {
-	Type          string       `json:"type"`
-	Authoritative bool         `json:"authoritative"`
-	BlockUUID     string       `json:"block_uuid"`
-	BlockPassword string       `json:"block_password"`
-	Users         []*adminUser `json:"users"`
+	Type            string       `json:"type"`
+	Authoritative   bool         `json:"authoritative"`
+	BlockUUID       string       `json:"block_uuid"`
+	BlockPassword   string       `json:"block_password"`
+	Users           []*adminUser `json:"users"`
+	Revision        int64        `json:"revision,omitempty"`
+	AppliedRevision int64        `json:"applied_revision,omitempty"`
 }
 
 type adminUser struct {
-	ID            string `json:"id"`
-	Inbound       string `json:"inbound"`
-	Type          string `json:"type"`
-	Name          string `json:"name"`
-	UUID          string `json:"uuid,omitempty"`
-	Password      string `json:"password,omitempty"`
-	Flow          string `json:"flow,omitempty"`
-	AlterID       int    `json:"alter_id,omitempty"`
-	Enabled       bool   `json:"enabled"`
-	QuotaBytes    int64  `json:"quota_bytes"`
-	ExpiresAt     int64  `json:"expires_at"`
-	UploadBytes   int64  `json:"upload_bytes"`
-	DownloadBytes int64  `json:"download_bytes"`
-	CreatedAt     int64  `json:"created_at"`
-	UpdatedAt     int64  `json:"updated_at"`
+	ID                string `json:"id"`
+	Inbound           string `json:"inbound"`
+	Type              string `json:"type"`
+	Name              string `json:"name"`
+	UUID              string `json:"uuid,omitempty"`
+	Password          string `json:"password,omitempty"`
+	Flow              string `json:"flow,omitempty"`
+	AlterID           int    `json:"alter_id,omitempty"`
+	Enabled           bool   `json:"enabled"`
+	QuotaBytes        int64  `json:"quota_bytes"`
+	ExpiresAt         int64  `json:"expires_at"`
+	UploadBytes       int64  `json:"upload_bytes"`
+	DownloadBytes     int64  `json:"download_bytes"`
+	TrafficGeneration int64  `json:"traffic_generation,omitempty"`
+	CreatedAt         int64  `json:"created_at"`
+	UpdatedAt         int64  `json:"updated_at"`
 }
 
 type adminUserView struct {
 	adminUser
-	ActiveConnections int `json:"active_connections"`
+	ActiveConnections int   `json:"active_connections"`
+	Revision          int64 `json:"revision"`
+	AppliedRevision   int64 `json:"applied_revision"`
 }
 
 type adminUserInput struct {
@@ -142,6 +170,7 @@ type adminUserInput struct {
 	Enabled    *bool  `json:"enabled"`
 	QuotaBytes int64  `json:"quota_bytes"`
 	ExpiresAt  int64  `json:"expires_at"`
+	Revision   int64  `json:"revision"`
 }
 
 type adminInboundSummary struct {
@@ -156,6 +185,9 @@ type adminInboundSummary struct {
 	Traffic          bool   `json:"traffic"`
 	UserCount        int    `json:"user_count"`
 	EnabledUserCount int    `json:"enabled_user_count"`
+	Revision         int64  `json:"revision,omitempty"`
+	AppliedRevision  int64  `json:"applied_revision,omitempty"`
+	Pending          bool   `json:"pending,omitempty"`
 }
 
 type adminUsage struct {
@@ -165,30 +197,51 @@ type adminUsage struct {
 }
 
 type adminTrafficBaseline struct {
-	Upload   int64
-	Download int64
+	Upload     int64
+	Download   int64
+	UserID     string
+	Generation int64
 }
 
-func newAdminAPI(ctx context.Context, logger log.ContextLogger, secret string, dataPath string) (*adminAPI, error) {
-	if dataPath == "" {
-		dataPath = defaultAdminDataPath
-	}
+type adminTrafficEvent struct {
+	Inbound    string
+	User       string
+	UserID     string
+	Generation int64
+	Upload     int64
+	Download   int64
+	UpdatedAt  int64
+}
+
+type adminManagedUserIdentity struct {
+	ID         string
+	Generation int64
+}
+
+func newAdminAPI(ctx context.Context, logger log.ContextLogger, secret string, dataPath string, serverRevisions map[string]int64, processSignalReload bool) (*adminAPI, error) {
 	runCtx, cancel := context.WithCancel(ctx)
 	a := &adminAPI{
-		ctx:              ctx,
-		runCtx:           runCtx,
-		cancel:           cancel,
-		logger:           logger,
-		secret:           secret,
-		dataPath:         filemanager.BasePath(ctx, os.ExpandEnv(dataPath)),
-		traffic:          service.PtrFromContext[trafficcontrol.Manager](ctx),
-		runtimes:         make(map[string]*adminInboundRuntime),
-		trafficBaselines: make(map[uuid.UUID]adminTrafficBaseline),
+		ctx:                 ctx,
+		runCtx:              runCtx,
+		cancel:              cancel,
+		logger:              logger,
+		secret:              secret,
+		dataPath:            ResolveDashboardDataPath(ctx, dataPath),
+		validationOnly:      validation.Only(ctx),
+		traffic:             service.PtrFromContext[trafficcontrol.Manager](ctx),
+		runtimes:            make(map[string]*adminInboundRuntime),
+		serverRevisions:     make(map[string]int64, len(serverRevisions)),
+		userAliases:         make(map[string]adminManagedUserIdentity),
+		processSignalReload: processSignalReload,
+		trafficBaselines:    make(map[uuid.UUID]adminTrafficBaseline),
 		store: adminStore{
 			Version:  adminStoreVersion,
 			Inbounds: make(map[string]*adminInboundStore),
 			Servers:  make(map[string]*adminServerStore),
 		},
+	}
+	for tag, revision := range serverRevisions {
+		a.serverRevisions[tag] = revision
 	}
 	a.discoverServices(ctx)
 	if err := a.loadStore(); err != nil {
@@ -203,12 +256,66 @@ func newAdminAPI(ctx context.Context, logger log.ContextLogger, secret string, d
 		cancel()
 		return nil, E.Cause(err, "apply dashboard users")
 	}
-	if err := a.saveStore(); err != nil {
-		cancel()
-		return nil, E.Cause(err, "save dashboard users")
+	if a.validationOnly {
+		if err := a.validateStoreWritable(); err != nil {
+			cancel()
+			return nil, E.Cause(err, "validate dashboard data path")
+		}
+	} else {
+		if err := a.saveStore(); err != nil {
+			cancel()
+			return nil, E.Cause(err, "save dashboard users")
+		}
 	}
 	a.router = a.buildRouter()
 	return a, nil
+}
+
+func (a *adminAPI) validateStoreWritable() error {
+	if info, err := os.Stat(a.dataPath); err == nil {
+		if info.IsDir() {
+			return E.New("dashboard data path is a directory: ", a.dataPath)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+
+	parent := filepath.Dir(a.dataPath)
+	for {
+		info, err := os.Stat(parent)
+		if err == nil {
+			if !info.IsDir() {
+				return E.New("dashboard data parent is not a directory: ", parent)
+			}
+			probe, createErr := os.CreateTemp(parent, ".sidera-dashboard-check-*")
+			if createErr != nil {
+				return createErr
+			}
+			probePath := probe.Name()
+			renamedPath := probePath + ".renamed"
+			_, writeErr := probe.Write([]byte("sidera-dashboard-check"))
+			syncErr := probe.Sync()
+			closeErr := probe.Close()
+			if writeErr != nil || syncErr != nil || closeErr != nil {
+				_ = os.Remove(probePath)
+				return errors.Join(writeErr, syncErr, closeErr)
+			}
+			renameErr := os.Rename(probePath, renamedPath)
+			if renameErr != nil {
+				_ = os.Remove(probePath)
+				return renameErr
+			}
+			return os.Remove(renamedPath)
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		next := filepath.Dir(parent)
+		if next == parent {
+			return err
+		}
+		parent = next
+	}
 }
 
 func (a *adminAPI) discoverServices(ctx context.Context) {
@@ -256,7 +363,7 @@ func (a *adminAPI) loadStore() error {
 	if err = json.Unmarshal(content, &stored); err != nil {
 		return E.Cause(err, "decode dashboard data")
 	}
-	if stored.Version == 1 {
+	if stored.Version == 1 || stored.Version == 2 {
 		stored.Version = adminStoreVersion
 	} else if stored.Version != adminStoreVersion {
 		return E.New("unsupported dashboard data version: ", stored.Version)
@@ -293,46 +400,20 @@ func (a *adminAPI) synchronizeStore() error {
 		record, exists := a.store.Inbounds[runtimeInbound.Tag]
 		if !exists || record.Type != runtimeInbound.Type {
 			record = &adminInboundStore{Type: runtimeInbound.Type}
-			currentUsers := runtimeInbound.Manager.service.ManagedUsers()
-			record.Authoritative = dashboardOwned && len(currentUsers) > 0
-			for _, currentUser := range currentUsers {
-				id, err := newAdminID()
-				if err != nil {
-					return err
-				}
-				record.Users = append(record.Users, &adminUser{
-					ID:        id,
-					Inbound:   runtimeInbound.Tag,
-					Type:      runtimeInbound.Type,
-					Name:      currentUser.Name,
-					UUID:      currentUser.UUID,
-					Password:  currentUser.Password,
-					Flow:      currentUser.Flow,
-					AlterID:   currentUser.AlterID,
-					Enabled:   true,
-					CreatedAt: now,
-					UpdatedAt: now,
-				})
-			}
 			a.store.Inbounds[runtimeInbound.Tag] = record
-		} else if !record.Authoritative {
-			currentUsers := runtimeInbound.Manager.service.ManagedUsers()
-			if len(currentUsers) > 0 {
-				record.Authoritative = dashboardOwned
-				record.Users = nil
-				for _, currentUser := range currentUsers {
-					id, err := newAdminID()
-					if err != nil {
-						return err
-					}
-					record.Users = append(record.Users, &adminUser{
-						ID: id, Inbound: runtimeInbound.Tag, Type: runtimeInbound.Type,
-						Name: currentUser.Name, UUID: currentUser.UUID, Password: currentUser.Password,
-						Flow: currentUser.Flow, AlterID: currentUser.AlterID, Enabled: true,
-						CreatedAt: now, UpdatedAt: now,
-					})
-				}
+		}
+		if !record.Authoritative {
+			changed, err := mirrorManagedUsers(record, runtimeInbound.Tag, runtimeInbound.Type, runtimeInbound.Manager.service.ManagedUsers(), now)
+			if err != nil {
+				return err
 			}
+			if changed || record.Revision == 0 {
+				record.Revision = nextAdminRevision(record.Revision, now)
+			}
+			record.AppliedRevision = record.Revision
+			record.Authoritative = dashboardOwned
+		} else if record.Revision == 0 {
+			record.Revision = nextAdminRevision(0, now)
 		}
 		if err := ensureBlockCredentials(record, runtimeInbound.Manager.service.ManagedUserSchema()); err != nil {
 			return err
@@ -355,6 +436,59 @@ func (a *adminAPI) synchronizeStore() error {
 		}
 	}
 	return nil
+}
+
+func mirrorManagedUsers(record *adminInboundStore, tag string, inboundType string, runtimeUsers []adapter.ManagedUser, now int64) (bool, error) {
+	existingByName := make(map[string]*adminUser, len(record.Users))
+	for _, user := range record.Users {
+		existingByName[user.Name] = user
+	}
+	seen := make(map[string]bool, len(runtimeUsers))
+	users := make([]*adminUser, 0, len(runtimeUsers))
+	changed := len(record.Users) != len(runtimeUsers)
+	for _, runtimeUser := range runtimeUsers {
+		if seen[runtimeUser.Name] {
+			return false, E.New("duplicate runtime user name: ", runtimeUser.Name)
+		}
+		seen[runtimeUser.Name] = true
+		current := existingByName[runtimeUser.Name]
+		userChanged := false
+		if current == nil {
+			id, err := newAdminID()
+			if err != nil {
+				return false, err
+			}
+			current = &adminUser{ID: id, CreatedAt: now}
+			userChanged = true
+		} else {
+			copyUser := *current
+			current = &copyUser
+		}
+		if current.Inbound != tag || current.Type != inboundType || current.Name != runtimeUser.Name ||
+			current.UUID != runtimeUser.UUID || current.Password != runtimeUser.Password ||
+			current.Flow != runtimeUser.Flow || current.AlterID != runtimeUser.AlterID || !current.Enabled {
+			userChanged = true
+		}
+		current.Inbound = tag
+		current.Type = inboundType
+		current.Name = runtimeUser.Name
+		current.UUID = runtimeUser.UUID
+		current.Password = runtimeUser.Password
+		current.Flow = runtimeUser.Flow
+		current.AlterID = runtimeUser.AlterID
+		current.Enabled = true
+		if userChanged {
+			current.UpdatedAt = now
+		}
+		changed = changed || userChanged
+		users = append(users, current)
+	}
+	record.Users = users
+	return changed, nil
+}
+
+func nextAdminRevision(current int64, now int64) int64 {
+	return max(current+1, now)
 }
 
 func ensureBlockCredentials(record *adminInboundStore, schema adapter.ManagedUserSchema) error {
@@ -392,12 +526,19 @@ func newAdminID() (string, error) {
 }
 
 func (a *adminAPI) start() error {
+	if a.validationOnly {
+		return nil
+	}
 	if err := a.markServerProfilesApplied(); err != nil {
 		return err
 	}
 	a.startedAt = time.Now()
 	if a.traffic != nil {
+		a.removeTrafficOpenHook = a.traffic.AddOpenHook(a.recordTrafficOpen)
 		a.removeTrafficHook = a.traffic.AddCloseHook(a.recordTraffic)
+		for _, metadata := range a.traffic.Connections() {
+			a.recordTrafficOpen(metadata)
+		}
 	}
 	a.workers.Add(1)
 	go func() {
@@ -411,6 +552,10 @@ func (a *adminAPI) markServerProfilesApplied() error {
 	changed := false
 	a.storeAccess.Lock()
 	for tag, profile := range a.store.Servers {
+		expectedRevision, expected := a.serverRevisions[tag]
+		if !expected || expectedRevision != profile.Revision {
+			continue
+		}
 		runtimeInbound := a.runtimes[tag]
 		if profile.Deleted {
 			if runtimeInbound == nil {
@@ -433,16 +578,41 @@ func (a *adminAPI) markServerProfilesApplied() error {
 }
 
 func (a *adminAPI) close() {
+	a.handlerAccess.Lock()
+	a.closing = true
+	a.handlerAccess.Unlock()
+	a.handlers.Wait()
+	if a.removeTrafficOpenHook != nil {
+		a.removeTrafficOpenHook()
+		a.removeTrafficOpenHook = nil
+	}
 	if a.removeTrafficHook != nil {
 		a.removeTrafficHook()
 		a.removeTrafficHook = nil
 	}
 	a.cancel()
 	a.workers.Wait()
+	if a.validationOnly {
+		return
+	}
 	a.snapshotActiveTraffic()
 	if err := a.saveStore(); err != nil {
 		a.logger.Error("dashboard: save data: ", err)
 	}
+}
+
+func (a *adminAPI) recordTrafficOpen(metadata *trafficcontrol.TrackerMetadata) {
+	userName := metadata.Metadata.User
+	if userName == "" {
+		return
+	}
+	userID, generation := a.managedUserIdentity(metadata.Metadata.Inbound, userName)
+	a.trafficAccess.Lock()
+	baseline := a.trafficBaselines[metadata.ID]
+	baseline.UserID = userID
+	baseline.Generation = generation
+	a.trafficBaselines[metadata.ID] = baseline
+	a.trafficAccess.Unlock()
 }
 
 func (a *adminAPI) recordTraffic(metadata *trafficcontrol.TrackerMetadata) {
@@ -450,28 +620,88 @@ func (a *adminAPI) recordTraffic(metadata *trafficcontrol.TrackerMetadata) {
 	if userName == "" {
 		return
 	}
-	a.mutation.Lock()
-	defer a.mutation.Unlock()
 	a.trafficAccess.Lock()
 	baseline := a.trafficBaselines[metadata.ID]
 	delete(a.trafficBaselines, metadata.ID)
 	upload := max(metadata.Upload.Load()-baseline.Upload, 0)
 	download := max(metadata.Download.Load()-baseline.Download, 0)
+	if baseline.UserID == "" {
+		baseline.UserID, baseline.Generation = a.managedUserIdentity(metadata.Metadata.Inbound, userName)
+	}
+	a.trafficAccess.Unlock()
+	if upload == 0 && download == 0 {
+		return
+	}
+	event := adminTrafficEvent{
+		Inbound: metadata.Metadata.Inbound, User: userName,
+		UserID: baseline.UserID, Generation: baseline.Generation,
+		Upload: upload, Download: download, UpdatedAt: time.Now().UnixMilli(),
+	}
+	if !a.mutation.TryLock() {
+		a.pendingTrafficAccess.Lock()
+		a.pendingTraffic = append(a.pendingTraffic, event)
+		a.pendingTrafficAccess.Unlock()
+		a.dirty.Store(true)
+		return
+	}
+	a.flushPendingTrafficLocked()
+	a.applyTrafficEventsLocked([]adminTrafficEvent{event})
+	a.mutation.Unlock()
+}
+
+func (a *adminAPI) applyTrafficEventsLocked(events []adminTrafficEvent) {
 	a.storeAccess.Lock()
-	record := a.store.Inbounds[metadata.Metadata.Inbound]
-	if record != nil {
-		for _, user := range record.Users {
-			if user.Name == userName {
-				user.UploadBytes += upload
-				user.DownloadBytes += download
-				user.UpdatedAt = time.Now().UnixMilli()
-				a.dirty.Store(true)
-				break
+	for _, event := range events {
+		record := a.store.Inbounds[event.Inbound]
+		if record != nil {
+			for _, user := range record.Users {
+				matches := (event.UserID != "" && user.ID == event.UserID) || (event.UserID == "" && user.Name == event.User)
+				if matches && user.TrafficGeneration == event.Generation {
+					user.UploadBytes += event.Upload
+					user.DownloadBytes += event.Download
+					user.UpdatedAt = event.UpdatedAt
+					a.dirty.Store(true)
+					break
+				}
 			}
 		}
 	}
 	a.storeAccess.Unlock()
-	a.trafficAccess.Unlock()
+}
+
+func (a *adminAPI) managedUserIdentity(tag string, name string) (string, int64) {
+	a.storeAccess.RLock()
+	defer a.storeAccess.RUnlock()
+	record := a.store.Inbounds[tag]
+	if record == nil {
+		return "", 0
+	}
+	for _, user := range record.Users {
+		if user.Name == name {
+			return user.ID, user.TrafficGeneration
+		}
+	}
+	alias := a.userAliases[adminUserKey(tag, name)]
+	return alias.ID, alias.Generation
+}
+
+func (a *adminAPI) flushPendingTraffic() {
+	a.mutation.Lock()
+	a.flushPendingTrafficLocked()
+	a.mutation.Unlock()
+}
+
+func (a *adminAPI) flushPendingTrafficLocked() {
+	a.pendingTrafficAccess.Lock()
+	events := a.pendingTraffic
+	a.pendingTraffic = nil
+	a.pendingTrafficAccess.Unlock()
+	a.applyTrafficEventsLocked(events)
+}
+
+func (a *adminAPI) unlockMutation() {
+	a.flushPendingTrafficLocked()
+	a.mutation.Unlock()
 }
 
 func (a *adminAPI) maintenanceLoop() {
@@ -483,6 +713,7 @@ func (a *adminAPI) maintenanceLoop() {
 			return
 		case <-ticker.C:
 		}
+		a.flushPendingTraffic()
 		if err := a.reconcile(); err != nil {
 			a.logger.Error("dashboard: reconcile users: ", err)
 		}
@@ -508,9 +739,11 @@ func (a *adminAPI) reconcile() error {
 		if metadata.Metadata.User == "" {
 			continue
 		}
-		key := adminUserKey(metadata.Metadata.Inbound, metadata.Metadata.User)
+		a.trafficAccess.Lock()
+		baseline := a.trafficBaselines[metadata.ID]
+		a.trafficAccess.Unlock()
 		a.storeAccess.RLock()
-		allowed := a.userAllowedLocked(metadata.Metadata.Inbound, metadata.Metadata.User, now, usage[key])
+		allowed := a.userConnectionAllowedLocked(metadata.Metadata.Inbound, metadata.Metadata.User, baseline.UserID, now, usage)
 		a.storeAccess.RUnlock()
 		if !allowed {
 			if connection := a.traffic.Connection(metadata.ID); connection != nil {
@@ -519,6 +752,22 @@ func (a *adminAPI) reconcile() error {
 		}
 	}
 	return nil
+}
+
+func (a *adminAPI) userConnectionAllowedLocked(inboundTag string, userName string, userID string, now int64, usage map[string]adminUsage) bool {
+	record := a.store.Inbounds[inboundTag]
+	if record == nil || !record.Authoritative {
+		return true
+	}
+	if userID != "" {
+		for _, user := range record.Users {
+			if user.ID == userID {
+				return adminUserEnabled(user, now, usage[adminUserKey(inboundTag, user.Name)])
+			}
+		}
+		return false
+	}
+	return a.userAllowedLocked(inboundTag, userName, now, usage[adminUserKey(inboundTag, userName)])
 }
 
 func (a *adminAPI) userAllowedLocked(inboundTag string, userName string, now int64, usage adminUsage) bool {
@@ -559,6 +808,9 @@ func (a *adminAPI) applyInbound(tag string, force bool) error {
 	if runtimeInbound == nil || runtimeInbound.Manager == nil {
 		return os.ErrNotExist
 	}
+	manager := runtimeInbound.Manager
+	manager.applyAccess.Lock()
+	defer manager.applyAccess.Unlock()
 	active := a.activeUsage()
 	now := time.Now().UnixMilli()
 	a.storeAccess.RLock()
@@ -567,6 +819,7 @@ func (a *adminAPI) applyInbound(tag string, force bool) error {
 		a.storeAccess.RUnlock()
 		return os.ErrNotExist
 	}
+	revision := record.Revision
 	users := make([]adapter.ManagedUser, 0, len(record.Users))
 	for _, user := range record.Users {
 		if adminUserEnabled(user, now, active[adminUserKey(tag, user.Name)]) {
@@ -596,18 +849,24 @@ func (a *adminAPI) applyInbound(tag string, force bool) error {
 	a.storeAccess.RUnlock()
 	signatureBytes, _ := json.Marshal(users)
 	signature := string(signatureBytes)
-
-	manager := runtimeInbound.Manager
-	manager.applyAccess.Lock()
-	defer manager.applyAccess.Unlock()
 	if !force && manager.lastSignature == signature {
+		a.markInboundApplied(tag, revision)
 		return nil
 	}
 	if err := manager.service.UpdateManagedUsers(users); err != nil {
 		return err
 	}
 	manager.lastSignature = signature
+	a.markInboundApplied(tag, revision)
 	return nil
+}
+
+func (a *adminAPI) markInboundApplied(tag string, revision int64) {
+	a.storeAccess.Lock()
+	if record := a.store.Inbounds[tag]; record != nil && record.Revision == revision {
+		record.AppliedRevision = revision
+	}
+	a.storeAccess.Unlock()
 }
 
 func (a *adminAPI) activeUsage() map[string]adminUsage {
@@ -621,9 +880,21 @@ func (a *adminAPI) activeUsage() map[string]adminUsage {
 		if metadata.Metadata.User == "" {
 			continue
 		}
-		key := adminUserKey(metadata.Metadata.Inbound, metadata.Metadata.User)
-		usage := result[key]
 		baseline := a.trafficBaselines[metadata.ID]
+		if baseline.UserID == "" {
+			baseline.UserID, baseline.Generation = a.managedUserIdentity(metadata.Metadata.Inbound, metadata.Metadata.User)
+			a.trafficBaselines[metadata.ID] = baseline
+		}
+		accountingName := metadata.Metadata.User
+		if baseline.UserID != "" {
+			currentName := a.managedUserName(metadata.Metadata.Inbound, baseline.UserID)
+			if currentName == "" {
+				continue
+			}
+			accountingName = currentName
+		}
+		key := adminUserKey(metadata.Metadata.Inbound, accountingName)
+		usage := result[key]
 		usage.Upload += max(metadata.Upload.Load()-baseline.Upload, 0)
 		usage.Download += max(metadata.Download.Load()-baseline.Download, 0)
 		usage.Connections++
@@ -632,10 +903,33 @@ func (a *adminAPI) activeUsage() map[string]adminUsage {
 	return result
 }
 
+func (a *adminAPI) managedUserName(tag string, userID string) string {
+	a.storeAccess.RLock()
+	defer a.storeAccess.RUnlock()
+	record := a.store.Inbounds[tag]
+	if record == nil {
+		return ""
+	}
+	for _, user := range record.Users {
+		if user.ID == userID {
+			return user.Name
+		}
+	}
+	return ""
+}
+
 // baselineUserTrafficLocked resets active-connection accounting for a user.
 // When settle is true, bytes before the new baseline are first persisted.
 // trafficAccess must be held by the caller.
 func (a *adminAPI) baselineUserTrafficLocked(tag string, userName string, settle bool) {
+	if a.traffic == nil || userName == "" {
+		return
+	}
+	userID, generation := a.managedUserIdentity(tag, userName)
+	a.baselineUserTrafficForIdentityLocked(tag, userName, userID, generation, settle)
+}
+
+func (a *adminAPI) baselineUserTrafficForIdentityLocked(tag string, userName string, userID string, generation int64, settle bool) {
 	if a.traffic == nil || userName == "" {
 		return
 	}
@@ -651,7 +945,9 @@ func (a *adminAPI) baselineUserTrafficLocked(tag string, userName string, settle
 			settledUpload += max(currentUpload-baseline.Upload, 0)
 			settledDownload += max(currentDownload-baseline.Download, 0)
 		}
-		a.trafficBaselines[metadata.ID] = adminTrafficBaseline{Upload: currentUpload, Download: currentDownload}
+		a.trafficBaselines[metadata.ID] = adminTrafficBaseline{
+			Upload: currentUpload, Download: currentDownload, UserID: userID, Generation: generation,
+		}
 	}
 	if !settle || settledUpload == 0 && settledDownload == 0 {
 		return
@@ -675,7 +971,7 @@ func (a *adminAPI) snapshotActiveTraffic() {
 		return
 	}
 	a.mutation.Lock()
-	defer a.mutation.Unlock()
+	defer a.unlockMutation()
 	a.trafficAccess.Lock()
 	defer a.trafficAccess.Unlock()
 	a.storeAccess.Lock()
@@ -692,8 +988,18 @@ func (a *adminAPI) snapshotActiveTraffic() {
 		if record == nil {
 			continue
 		}
+		if baseline.UserID == "" {
+			for _, user := range record.Users {
+				if user.Name == userName {
+					baseline.UserID = user.ID
+					baseline.Generation = user.TrafficGeneration
+					break
+				}
+			}
+		}
 		for _, user := range record.Users {
-			if user.Name == userName {
+			matches := (baseline.UserID != "" && user.ID == baseline.UserID) || (baseline.UserID == "" && user.Name == userName)
+			if matches && user.TrafficGeneration == baseline.Generation {
 				user.UploadBytes += upload
 				user.DownloadBytes += download
 				user.UpdatedAt = time.Now().UnixMilli()
@@ -702,6 +1008,7 @@ func (a *adminAPI) snapshotActiveTraffic() {
 		}
 		a.trafficBaselines[metadata.ID] = adminTrafficBaseline{
 			Upload: metadata.Upload.Load(), Download: metadata.Download.Load(),
+			UserID: baseline.UserID, Generation: baseline.Generation,
 		}
 	}
 }
@@ -716,11 +1023,13 @@ func (a *adminAPI) buildRouter() http.Handler {
 	router.Get(adminRoutePrefix+"/overview", a.getOverview)
 	router.Get(adminRoutePrefix+"/protocols", a.listProtocols)
 	router.Get(adminRoutePrefix+"/servers", a.listServers)
+	router.Get(adminRoutePrefix+"/servers/{tag}", a.getServer)
 	router.Post(adminRoutePrefix+"/servers", a.createServer)
 	router.Put(adminRoutePrefix+"/servers/{tag}", a.updateServer)
 	router.Delete(adminRoutePrefix+"/servers/{tag}", a.deleteServer)
 	router.Post(adminRoutePrefix+"/reload", a.reloadCore)
 	router.Get(adminRoutePrefix+"/users", a.listUsers)
+	router.Get(adminRoutePrefix+"/users/{id}", a.getUser)
 	router.Post(adminRoutePrefix+"/users", a.createUser)
 	router.Put(adminRoutePrefix+"/users/{id}", a.updateUser)
 	router.Delete(adminRoutePrefix+"/users/{id}", a.deleteUser)
@@ -732,17 +1041,26 @@ func (a *adminAPI) buildRouter() http.Handler {
 }
 
 func (a *adminAPI) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
+	a.handlerAccess.Lock()
+	if a.closing {
+		a.handlerAccess.Unlock()
+		writeAdminError(writer, http.StatusServiceUnavailable, "管理服務正在關閉")
+		return
+	}
+	a.handlers.Add(1)
+	a.handlerAccess.Unlock()
+	defer a.handlers.Done()
 	writer.Header().Set("Cache-Control", "no-store")
 	a.router.ServeHTTP(writer, request)
 }
 
 func (a *adminAPI) authenticate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if !sameOriginAdminRequest(request) {
+			writeAdminError(writer, http.StatusForbidden, "管理 API 只允許同源瀏覽器請求")
+			return
+		}
 		if a.secret == "" {
-			if !sameOriginAdminRequest(request) {
-				writeAdminError(writer, http.StatusForbidden, "未設定 API Token 時只允許同源請求")
-				return
-			}
 			next.ServeHTTP(writer, request)
 			return
 		}
@@ -766,10 +1084,32 @@ func sameOriginAdminRequest(request *http.Request) bool {
 		return true
 	}
 	parsedOrigin, err := url.Parse(origin)
-	if err != nil || parsedOrigin.Host == "" {
+	if err != nil || parsedOrigin.Host == "" || parsedOrigin.Scheme == "" {
 		return false
 	}
-	return strings.EqualFold(parsedOrigin.Host, request.Host)
+	expectedScheme := "http"
+	if request.TLS != nil {
+		expectedScheme = "https"
+	} else if forwardedScheme := trustedForwardedScheme(request); forwardedScheme != "" {
+		expectedScheme = forwardedScheme
+	}
+	return strings.EqualFold(parsedOrigin.Scheme, expectedScheme) && strings.EqualFold(parsedOrigin.Host, request.Host)
+}
+
+func trustedForwardedScheme(request *http.Request) string {
+	host, _, err := net.SplitHostPort(request.RemoteAddr)
+	if err != nil {
+		host = request.RemoteAddr
+	}
+	address := net.ParseIP(strings.Trim(host, "[]"))
+	if address == nil || !address.IsLoopback() {
+		return ""
+	}
+	forwarded := strings.TrimSpace(strings.Split(request.Header.Get("X-Forwarded-Proto"), ",")[0])
+	if forwarded == "http" || forwarded == "https" {
+		return forwarded
+	}
+	return ""
 }
 
 func (a *adminAPI) getOverview(writer http.ResponseWriter, request *http.Request) {
@@ -854,6 +1194,9 @@ func (a *adminAPI) inboundSummaries(now int64, active map[string]adminUsage) []a
 			summary.Traffic = !schema.NoTraffic
 			if record := a.store.Inbounds[runtimeInbound.Tag]; record != nil {
 				summary.UserCount = len(record.Users)
+				summary.Revision = record.Revision
+				summary.AppliedRevision = record.AppliedRevision
+				summary.Pending = record.Revision != record.AppliedRevision
 				for _, user := range record.Users {
 					if adminUserEnabled(user, now, active[adminUserKey(runtimeInbound.Tag, user.Name)]) {
 						summary.EnabledUserCount++
@@ -879,11 +1222,8 @@ func (a *adminAPI) listUsers(writer http.ResponseWriter, request *http.Request) 
 			continue
 		}
 		for _, user := range record.Users {
-			copyUser := *user
 			usage := active[adminUserKey(tag, user.Name)]
-			copyUser.UploadBytes += usage.Upload
-			copyUser.DownloadBytes += usage.Download
-			views = append(views, adminUserView{adminUser: copyUser, ActiveConnections: usage.Connections})
+			views = append(views, makeAdminUserView(user, record, usage, false))
 		}
 	}
 	a.storeAccess.RUnlock()
@@ -899,13 +1239,46 @@ func (a *adminAPI) listUsers(writer http.ResponseWriter, request *http.Request) 
 	})
 }
 
+func (a *adminAPI) getUser(writer http.ResponseWriter, request *http.Request) {
+	id := chi.URLParam(request, "id")
+	active := a.activeUsage()
+	a.storeAccess.RLock()
+	defer a.storeAccess.RUnlock()
+	for tag, record := range a.store.Inbounds {
+		if runtimeInbound := a.runtimes[tag]; runtimeInbound == nil || runtimeInbound.Manager == nil {
+			continue
+		}
+		for _, user := range record.Users {
+			if user.ID == id {
+				writeAdminJSON(writer, http.StatusOK, makeAdminUserView(user, record, active[adminUserKey(tag, user.Name)], true))
+				return
+			}
+		}
+	}
+	writeAdminError(writer, http.StatusNotFound, "找不到用戶")
+}
+
+func makeAdminUserView(user *adminUser, record *adminInboundStore, usage adminUsage, includeCredentials bool) adminUserView {
+	copyUser := *user
+	if !includeCredentials {
+		copyUser.UUID = ""
+		copyUser.Password = ""
+	}
+	copyUser.UploadBytes += usage.Upload
+	copyUser.DownloadBytes += usage.Download
+	return adminUserView{
+		adminUser: copyUser, ActiveConnections: usage.Connections,
+		Revision: record.Revision, AppliedRevision: record.AppliedRevision,
+	}
+}
+
 func (a *adminAPI) createUser(writer http.ResponseWriter, request *http.Request) {
 	var input adminUserInput
 	if err := decodeAdminJSON(writer, request, &input); err != nil {
 		return
 	}
 	a.mutation.Lock()
-	defer a.mutation.Unlock()
+	defer a.unlockMutation()
 	runtimeInbound := a.runtimes[input.Inbound]
 	if runtimeInbound == nil || runtimeInbound.Manager == nil {
 		writeAdminError(writer, http.StatusBadRequest, "此入站不支援動態用戶管理")
@@ -941,7 +1314,7 @@ func (a *adminAPI) createUser(writer http.ResponseWriter, request *http.Request)
 		CreatedAt:  now,
 		UpdatedAt:  now,
 	}
-	previous, err := a.mutateInbound(input.Inbound, func(record *adminInboundStore) error {
+	previous, err := a.mutateInbound(input.Inbound, normalized.Revision, true, func(record *adminInboundStore) error {
 		if err := validateUniqueUser(record, newUser, ""); err != nil {
 			return err
 		}
@@ -957,7 +1330,10 @@ func (a *adminAPI) createUser(writer http.ResponseWriter, request *http.Request)
 		writeAdminError(writer, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeAdminJSON(writer, http.StatusCreated, adminUserView{adminUser: *newUser})
+	a.storeAccess.RLock()
+	view := makeAdminUserView(newUser, a.store.Inbounds[input.Inbound], adminUsage{}, true)
+	a.storeAccess.RUnlock()
+	writeAdminJSON(writer, http.StatusCreated, view)
 }
 
 func (a *adminAPI) updateUser(writer http.ResponseWriter, request *http.Request) {
@@ -967,7 +1343,7 @@ func (a *adminAPI) updateUser(writer http.ResponseWriter, request *http.Request)
 		return
 	}
 	a.mutation.Lock()
-	defer a.mutation.Unlock()
+	defer a.unlockMutation()
 	tag, current := a.findUser(id)
 	if current == nil {
 		writeAdminError(writer, http.StatusNotFound, "找不到用戶")
@@ -987,13 +1363,38 @@ func (a *adminAPI) updateUser(writer http.ResponseWriter, request *http.Request)
 		writeAdminError(writer, http.StatusBadRequest, err.Error())
 		return
 	}
+	if err = a.requireInboundRevision(tag, normalized.Revision); err != nil {
+		writeAdminError(writer, http.StatusConflict, err.Error())
+		return
+	}
+	candidate := *current
+	candidate.Name = normalized.Name
+	candidate.UUID = normalized.UUID
+	candidate.Password = normalized.Password
+	candidate.Flow = normalized.Flow
+	candidate.AlterID = normalized.AlterID
+	a.storeAccess.RLock()
+	err = validateUniqueUser(a.store.Inbounds[tag], &candidate, id)
+	a.storeAccess.RUnlock()
+	if err != nil {
+		writeAdminError(writer, http.StatusConflict, err.Error())
+		return
+	}
 	if normalized.Name != current.Name {
+		a.storeAccess.Lock()
+		if a.userAliases == nil {
+			a.userAliases = make(map[string]adminManagedUserIdentity)
+		}
+		a.userAliases[adminUserKey(tag, current.Name)] = adminManagedUserIdentity{
+			ID: current.ID, Generation: current.TrafficGeneration,
+		}
+		a.storeAccess.Unlock()
 		a.trafficAccess.Lock()
 		a.baselineUserTrafficLocked(tag, current.Name, true)
 		a.trafficAccess.Unlock()
 	}
 	var updated adminUser
-	previous, err := a.mutateInbound(tag, func(record *adminInboundStore) error {
+	previous, err := a.mutateInbound(tag, normalized.Revision, true, func(record *adminInboundStore) error {
 		for index, user := range record.Users {
 			if user.ID == id {
 				record.Authoritative = true
@@ -1026,22 +1427,31 @@ func (a *adminAPI) updateUser(writer http.ResponseWriter, request *http.Request)
 		writeAdminError(writer, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeAdminJSON(writer, http.StatusOK, adminUserView{adminUser: updated})
+	a.storeAccess.RLock()
+	view := makeAdminUserView(&updated, a.store.Inbounds[tag], adminUsage{}, true)
+	a.storeAccess.RUnlock()
+	writeAdminJSON(writer, http.StatusOK, view)
 }
 
 func (a *adminAPI) deleteUser(writer http.ResponseWriter, request *http.Request) {
 	id := chi.URLParam(request, "id")
+	expectedRevision, err := requestedAdminRevision(request)
+	if err != nil {
+		writeAdminError(writer, http.StatusBadRequest, err.Error())
+		return
+	}
 	a.mutation.Lock()
-	defer a.mutation.Unlock()
+	defer a.unlockMutation()
 	tag, current := a.findUser(id)
 	if current == nil {
 		writeAdminError(writer, http.StatusNotFound, "找不到用戶")
 		return
 	}
-	a.trafficAccess.Lock()
-	a.baselineUserTrafficLocked(tag, current.Name, false)
-	a.trafficAccess.Unlock()
-	previous, err := a.mutateInbound(tag, func(record *adminInboundStore) error {
+	if err = a.requireInboundRevision(tag, expectedRevision); err != nil {
+		writeAdminError(writer, http.StatusConflict, err.Error())
+		return
+	}
+	previous, err := a.mutateInbound(tag, expectedRevision, true, func(record *adminInboundStore) error {
 		for index, user := range record.Users {
 			if user.ID == id {
 				record.Users = append(record.Users[:index], record.Users[index+1:]...)
@@ -1052,64 +1462,112 @@ func (a *adminAPI) deleteUser(writer http.ResponseWriter, request *http.Request)
 		return os.ErrNotExist
 	})
 	if err != nil {
-		writeAdminError(writer, http.StatusNotFound, "找不到用戶")
+		if errors.Is(err, os.ErrNotExist) {
+			writeAdminError(writer, http.StatusNotFound, "找不到用戶")
+		} else {
+			writeAdminError(writer, http.StatusConflict, err.Error())
+		}
 		return
 	}
 	if err = a.commitMutation(tag, previous); err != nil {
 		writeAdminError(writer, http.StatusInternalServerError, err.Error())
 		return
 	}
+	a.trafficAccess.Lock()
+	a.baselineUserTrafficForIdentityLocked(tag, current.Name, current.ID, current.TrafficGeneration, false)
+	a.trafficAccess.Unlock()
 	writer.WriteHeader(http.StatusNoContent)
 }
 
 func (a *adminAPI) resetUserTraffic(writer http.ResponseWriter, request *http.Request) {
 	id := chi.URLParam(request, "id")
 	a.mutation.Lock()
-	defer a.mutation.Unlock()
+	defer a.unlockMutation()
 	tag, current := a.findUser(id)
 	if current == nil {
 		writeAdminError(writer, http.StatusNotFound, "找不到用戶")
 		return
 	}
-	a.trafficAccess.Lock()
-	previous, err := a.mutateInbound(tag, func(record *adminInboundStore) error {
+	previous, err := a.mutateInbound(tag, 0, false, func(record *adminInboundStore) error {
 		for _, user := range record.Users {
 			if user.ID == id {
 				user.UploadBytes = 0
 				user.DownloadBytes = 0
+				user.TrafficGeneration++
 				user.UpdatedAt = time.Now().UnixMilli()
 				return nil
 			}
 		}
 		return os.ErrNotExist
 	})
-	if err == nil {
-		a.baselineUserTrafficLocked(tag, current.Name, false)
-	}
-	a.trafficAccess.Unlock()
 	if err != nil {
 		writeAdminError(writer, http.StatusNotFound, "找不到用戶")
 		return
 	}
-	if err = a.commitMutation(tag, previous); err != nil {
-		writeAdminError(writer, http.StatusInternalServerError, err.Error())
+	if err = a.saveStore(); err != nil {
+		a.storeAccess.Lock()
+		a.store.Inbounds[tag] = previous
+		a.storeAccess.Unlock()
+		restoreErr := a.saveStore()
+		writeAdminError(writer, http.StatusInternalServerError, errors.Join(E.Cause(err, "儲存流量資料失敗"), restoreErr).Error())
 		return
 	}
+	a.trafficAccess.Lock()
+	a.baselineUserTrafficLocked(tag, current.Name, false)
+	a.trafficAccess.Unlock()
 	writer.WriteHeader(http.StatusNoContent)
 }
 
-func (a *adminAPI) mutateInbound(tag string, mutate func(record *adminInboundStore) error) (*adminInboundStore, error) {
+func (a *adminAPI) mutateInbound(tag string, expectedRevision int64, advanceRevision bool, mutate func(record *adminInboundStore) error) (*adminInboundStore, error) {
 	a.storeAccess.Lock()
 	defer a.storeAccess.Unlock()
 	record := a.store.Inbounds[tag]
 	if record == nil {
 		return nil, os.ErrNotExist
 	}
+	if advanceRevision {
+		if expectedRevision <= 0 {
+			return nil, E.New("缺少資料 revision，請重新整理後再試")
+		}
+		if record.Revision != expectedRevision {
+			return nil, E.New("資料已被其他操作更新，請重新整理後再試")
+		}
+	}
 	previous := cloneInboundStore(record)
-	if err := mutate(record); err != nil {
+	updated := cloneInboundStore(record)
+	if err := mutate(updated); err != nil {
 		return nil, err
 	}
+	if advanceRevision {
+		updated.Revision = nextAdminRevision(record.Revision, time.Now().UnixMilli())
+	}
+	a.store.Inbounds[tag] = updated
 	return previous, nil
+}
+
+func (a *adminAPI) requireInboundRevision(tag string, expectedRevision int64) error {
+	a.storeAccess.RLock()
+	defer a.storeAccess.RUnlock()
+	record := a.store.Inbounds[tag]
+	if record == nil {
+		return os.ErrNotExist
+	}
+	if expectedRevision <= 0 {
+		return E.New("缺少資料 revision，請重新整理後再試")
+	}
+	if record.Revision != expectedRevision {
+		return E.New("資料已被其他操作更新，請重新整理後再試")
+	}
+	return nil
+}
+
+func requestedAdminRevision(request *http.Request) (int64, error) {
+	value := request.URL.Query().Get("revision")
+	revision, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || revision <= 0 {
+		return 0, E.New("revision 格式不正確")
+	}
+	return revision, nil
 }
 
 func (a *adminAPI) commitMutation(tag string, previous *adminInboundStore) error {
@@ -1137,6 +1595,9 @@ func (a *adminAPI) rollbackMutation(tag string, previous *adminInboundStore, per
 }
 
 func cloneInboundStore(record *adminInboundStore) *adminInboundStore {
+	if record == nil {
+		return nil
+	}
 	copyRecord := *record
 	copyRecord.Users = make([]*adminUser, len(record.Users))
 	for index, user := range record.Users {
@@ -1300,11 +1761,18 @@ func (a *adminAPI) closeAllConnections(writer http.ResponseWriter, request *http
 }
 
 func (a *adminAPI) saveStore() error {
+	if a.validationOnly {
+		return nil
+	}
 	a.saveAccess.Lock()
 	defer a.saveAccess.Unlock()
-	a.storeAccess.RLock()
+	a.storeAccess.Lock()
+	if err := a.scrubAuthoritativeProfileUsersLocked(); err != nil {
+		a.storeAccess.Unlock()
+		return err
+	}
 	content, err := json.MarshalIndent(a.store, "", "  ")
-	a.storeAccess.RUnlock()
+	a.storeAccess.Unlock()
 	if err != nil {
 		return err
 	}

@@ -35,7 +35,8 @@ func isWebSocketGRPCRequest(request *http.Request) bool {
 func (b *webBridge) serveWebSocket(writer http.ResponseWriter, request *http.Request) {
 	conn, err := websocket.Accept(writer, request, &websocket.AcceptOptions{
 		Subprotocols:       []string{webSocketSubprotocol},
-		InsecureSkipVerify: true,
+		OriginPatterns:     b.webSocketOrigins,
+		InsecureSkipVerify: b.insecureWebSocketOrigin,
 	})
 	if err != nil {
 		b.logger.Error("upgrade websocket request: ", err)

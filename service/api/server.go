@@ -4,6 +4,8 @@ import (
 	"context"
 	"net"
 	"net/http"
+	"net/netip"
+	"strings"
 
 	"github.com/Miku0139oao/sidera-core/adapter"
 	boxService "github.com/Miku0139oao/sidera-core/adapter/service"
@@ -43,6 +45,9 @@ type Service struct {
 }
 
 func NewService(ctx context.Context, logger log.ContextLogger, tag string, options option.APIServiceOptions) (adapter.Service, error) {
+	if err := validateDashboardExposure(options); err != nil {
+		return nil, err
+	}
 	ctx, cancel := context.WithCancel(ctx)
 	s := &Service{
 		Adapter: boxService.NewAdapter(C.TypeAPI, tag),
@@ -67,7 +72,7 @@ func NewService(ctx context.Context, logger log.ContextLogger, tag string, optio
 	}
 	if options.Dashboard != nil && options.Dashboard.Enabled {
 		s.dashboard = newDashboard(ctx, logger, *options.Dashboard)
-		admin, err := newAdminAPI(ctx, logger, options.Secret, options.Dashboard.DataPath)
+		admin, err := newAdminAPI(ctx, logger, options.Secret, options.Dashboard.DataPath, options.Dashboard.AppliedServerRevisions, options.Dashboard.ProcessSignalReload)
 		if err != nil {
 			cancel()
 			return nil, E.Cause(err, "initialize dashboard management")
@@ -75,6 +80,23 @@ func NewService(ctx context.Context, logger log.ContextLogger, tag string, optio
 		s.admin = admin
 	}
 	return s, nil
+}
+
+func validateDashboardExposure(options option.APIServiceOptions) error {
+	if options.Dashboard == nil || !options.Dashboard.Enabled {
+		return nil
+	}
+	if strings.TrimSpace(options.Secret) == "" {
+		return E.New("dashboard API requires a secret")
+	}
+	listenAddress := options.Listen.Build(netip.AddrFrom4([4]byte{127, 0, 0, 1}))
+	if listenAddress.IsLoopback() {
+		return nil
+	}
+	if options.TLS == nil || !options.TLS.Enabled {
+		return E.New("dashboard API exposed on a non-loopback address requires TLS")
+	}
+	return nil
 }
 
 func (s *Service) Start(stage adapter.StartStage) error {
@@ -129,15 +151,15 @@ func (s *Service) Start(stage adapter.StartStage) error {
 }
 
 func (s *Service) Close() error {
+	s.cancel()
+	if s.httpServer != nil {
+		s.httpServer.Close()
+	}
 	if s.admin != nil {
 		s.admin.close()
 	}
-	s.cancel()
 	if s.dashboard != nil {
 		s.dashboard.close()
-	}
-	if s.httpServer != nil {
-		s.httpServer.Close()
 	}
 	if s.grpcServer != nil {
 		s.grpcServer.Stop()

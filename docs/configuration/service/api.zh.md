@@ -21,7 +21,7 @@ Sidera API 服务提供 gRPC 远程控制、内置 Material 3 管理界面、节
   
   ... // 监听字段
   
-  "secret": "",
+  "secret": "替换为随机密钥",
   "access_control_allow_origin": [],
   "access_control_allow_private_network": false,
   "dashboard": {
@@ -32,7 +32,7 @@ Sidera API 服务提供 gRPC 远程控制、内置 Material 3 管理界面、节
     "http_client": "", // 或 {}
     "update_interval": ""
   },
-  "tls": {}
+  "tls": { "enabled": true }
 }
 ```
 
@@ -48,11 +48,11 @@ API 密钥。
 
 客户端通过标准的 `authorization: Bearer <secret>` gRPC metadata 头认证。
 
-默认无需认证。
+启用管理界面时必须设置非空密钥，即使仅监听回环地址也是如此。未启用管理界面的纯 API 服务可以留空。
 
 #### access_control_allow_origin
 
-允许的 CORS 来源,默认使用 `*`。
+允许的 CORS 来源。启用管理界面时，留空默认仅允许同源访问；未启用管理界面的纯 API 服务仍默认使用 `*`。
 
 #### access_control_allow_private_network
 
@@ -61,6 +61,8 @@ API 密钥。
 #### dashboard
 
 通过 API 监听器在 `/dashboard/` 提供的 Web 仪表板；其他浏览器请求将被重定向到该路径。`path` 与 `download_url` 均为空时使用内置 Sidera 管理界面。
+
+每个 Core 实例只能启用一个管理界面。管理界面监听非回环地址时还必须启用 TLS。
 
 内置管理界面支持所有远程 Server 协议：SOCKS、HTTP、Mixed、Shadowsocks、Snell、VMess、Trojan、Naive、ShadowTLS、VLESS、AnyTLS、Hysteria、TUIC、Hysteria2 与 OpenVPN Server。结构变更会先持久化，再通过经过完整检查的 Core 重载套用。
 

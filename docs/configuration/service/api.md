@@ -25,7 +25,7 @@ for bidirectional streaming methods.
   
   ... // Listen Fields
   
-  "secret": "",
+  "secret": "replace-with-a-random-secret",
   "access_control_allow_origin": [],
   "access_control_allow_private_network": false,
   "dashboard": {
@@ -36,7 +36,7 @@ for bidirectional streaming methods.
     "http_client": "", // or {}
     "update_interval": ""
   },
-  "tls": {}
+  "tls": { "enabled": true }
 }
 ```
 
@@ -52,11 +52,13 @@ Secret for the API.
 
 Clients authenticate with the standard `authorization: Bearer <secret>` gRPC metadata header.
 
-If empty, authentication is disabled.
+An enabled management dashboard requires a non-empty secret, including on a
+loopback listener. API-only services without the dashboard may leave it empty.
 
 #### access_control_allow_origin
 
-CORS allowed origins, `*` will be used if empty.
+CORS allowed origins. An enabled dashboard defaults to same-origin access when
+this list is empty. API-only services retain the `*` default.
 
 #### access_control_allow_private_network
 
@@ -88,6 +90,9 @@ Enable the dashboard.
 
 Directory containing custom dashboard files. Leave empty to use the built-in
 dashboard unless `download_url` is configured.
+
+Only one dashboard-enabled API service may exist in a Core instance. A
+non-loopback dashboard listener also requires enabled TLS.
 
 When a managed dashboard archive is used, an `.etag` file is stored inside the
 directory to skip unchanged updates. A non-empty directory without an `.etag`

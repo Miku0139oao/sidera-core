@@ -43,6 +43,9 @@ type Manager struct {
 	connections             compatible.Map[uuid.UUID, Tracker]
 	closedConnectionsAccess sync.Mutex
 	closedConnections       list.List[TrackerMetadata]
+	openHooksAccess         sync.RWMutex
+	openHooks               map[uint64]func(*TrackerMetadata)
+	nextOpenHookID          atomic.Uint64
 	closeHooksAccess        sync.RWMutex
 	closeHooks              map[uint64]func(*TrackerMetadata)
 	nextCloseHookID         atomic.Uint64
@@ -56,6 +59,7 @@ func NewManager(outbound adapter.OutboundManager) *Manager {
 	return &Manager{
 		outbound:        outbound,
 		eventSubscriber: observable.NewSubscriber[ConnectionEvent](256),
+		openHooks:       make(map[uint64]func(*TrackerMetadata)),
 		closeHooks:      make(map[uint64]func(*TrackerMetadata)),
 	}
 }
@@ -93,6 +97,11 @@ func (m *Manager) UnSubscribeEvents(subscription observable.Subscription[Connect
 func (m *Manager) join(tracker Tracker) {
 	metadata := tracker.Metadata()
 	m.connections.Store(metadata.ID, tracker)
+	m.openHooksAccess.RLock()
+	for _, openHook := range m.openHooks {
+		openHook(metadata)
+	}
+	m.openHooksAccess.RUnlock()
 	m.eventSubscriber.Emit(ConnectionEvent{
 		Type:     ConnectionEventNew,
 		ID:       metadata.ID,
@@ -126,6 +135,19 @@ func (m *Manager) leave(tracker Tracker) {
 		Metadata: &metadataCopy,
 		ClosedAt: closedAt,
 	})
+}
+
+// AddOpenHook registers synchronous connection identity capture.
+func (m *Manager) AddOpenHook(hook func(*TrackerMetadata)) func() {
+	id := m.nextOpenHookID.Add(1)
+	m.openHooksAccess.Lock()
+	m.openHooks[id] = hook
+	m.openHooksAccess.Unlock()
+	return func() {
+		m.openHooksAccess.Lock()
+		delete(m.openHooks, id)
+		m.openHooksAccess.Unlock()
+	}
 }
 
 // AddCloseHook registers lossless, synchronous connection accounting. Hooks

@@ -58,8 +58,9 @@ func CheckConfig(configContent string) error {
 	defer cancel()
 	ctx = service.ContextWith[adapter.PlatformInterface](ctx, (*platformInterfaceStub)(nil))
 	instance, err := box.New(box.Options{
-		Context: ctx,
-		Options: options,
+		Context:        ctx,
+		Options:        options,
+		ValidationOnly: true,
 	})
 	if err == nil {
 		instance.Close()

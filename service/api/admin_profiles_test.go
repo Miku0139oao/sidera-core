@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"testing"
 
 	"github.com/Miku0139oao/sidera-core/adapter"
@@ -141,8 +142,18 @@ func TestMergeDashboardProfiles(t *testing.T) {
 	require.Equal(t, C.TypeTUIC, options.Inbounds[0].Type)
 	require.Equal(t, "tuic-in", options.Inbounds[0].Tag)
 
-	options.Inbounds = append(options.Inbounds, option.Inbound{Type: C.TypeSOCKS, Tag: "tuic-in", Options: new(option.SocksInboundOptions)})
-	require.ErrorContains(t, MergeDashboardProfiles(ctx, &options), "collides with base configuration")
+	require.NoError(t, MergeDashboardProfiles(ctx, &options))
+	require.Len(t, options.Inbounds, 1)
+	collisionOptions := option.Options{
+		Inbounds: []option.Inbound{{Type: C.TypeSOCKS, Tag: "tuic-in", Options: new(option.SocksInboundOptions)}},
+		Services: []option.Service{{
+			Type: C.TypeAPI,
+			Options: &option.APIServiceOptions{Dashboard: &option.APIDashboardOptions{
+				Enabled: true, DataPath: dataPath,
+			}},
+		}},
+	}
+	require.ErrorContains(t, MergeDashboardProfiles(ctx, &collisionOptions), "collides with base configuration")
 }
 
 func TestAdminServerCRUDPendingLifecycle(t *testing.T) {
@@ -181,7 +192,7 @@ func TestAdminServerCRUDPendingLifecycle(t *testing.T) {
 	require.Equal(t, "pending_create", listed.Servers[0].Status)
 	require.Equal(t, uint16(8446), listed.Servers[0].Advertise.ServerPort)
 
-	response = adminRequest(a, http.MethodDelete, adminRoutePrefix+"/servers/tuic-in", nil)
+	response = adminRequest(a, http.MethodDelete, adminRoutePrefix+"/servers/tuic-in?revision="+strconv.FormatInt(listed.Servers[0].Revision, 10), nil)
 	require.Equal(t, http.StatusOK, response.Code)
 	response = adminRequest(a, http.MethodGet, adminRoutePrefix+"/servers", nil)
 	require.Equal(t, http.StatusOK, response.Code)

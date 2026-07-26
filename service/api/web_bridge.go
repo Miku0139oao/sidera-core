@@ -28,30 +28,53 @@ const (
 // client transports.
 func newHTTPHandler(logger log.ContextLogger, grpcServer *grpc.Server, options option.APIServiceOptions, dashboard *dashboard, admin *adminAPI) http.Handler {
 	allowedOrigins := options.AccessControlAllowOrigin
-	if len(allowedOrigins) == 0 {
+	if len(allowedOrigins) == 0 && dashboard == nil {
 		allowedOrigins = []string{"*"}
 	}
-	corsHandler := cors.New(cors.Options{
+	corsOptions := cors.Options{
 		AllowedOrigins:      allowedOrigins,
 		AllowedMethods:      []string{http.MethodGet, http.MethodPost, http.MethodPut, http.MethodDelete, http.MethodOptions},
 		AllowedHeaders:      []string{"Content-Type", "Authorization", "X-Grpc-Web", "X-User-Agent", "Grpc-Timeout"},
 		ExposedHeaders:      []string{"Grpc-Status", "Grpc-Message", "Grpc-Status-Details-Bin"},
 		AllowPrivateNetwork: options.AccessControlAllowPrivateNetwork,
 		MaxAge:              300,
-	})
+	}
+	if len(allowedOrigins) == 0 {
+		corsOptions.AllowOriginFunc = func(*http.Request, string) bool { return false }
+	}
+	corsHandler := cors.New(corsOptions)
+	webSocketOrigins, insecureWebSocketOrigin := webSocketOriginPolicy(allowedOrigins)
 	return corsHandler.Handler(&webBridge{
-		logger:     logger,
-		grpcServer: grpcServer,
-		dashboard:  dashboard,
-		admin:      admin,
+		logger:                  logger,
+		grpcServer:              grpcServer,
+		dashboard:               dashboard,
+		admin:                   admin,
+		webSocketOrigins:        webSocketOrigins,
+		insecureWebSocketOrigin: insecureWebSocketOrigin,
 	})
 }
 
+func webSocketOriginPolicy(allowedOrigins []string) ([]string, bool) {
+	patterns := make([]string, 0, len(allowedOrigins))
+	for _, origin := range allowedOrigins {
+		origin = strings.TrimSuffix(strings.TrimSpace(origin), "/")
+		if origin == "*" {
+			return nil, true
+		}
+		if origin != "" {
+			patterns = append(patterns, origin)
+		}
+	}
+	return patterns, false
+}
+
 type webBridge struct {
-	logger     log.ContextLogger
-	grpcServer *grpc.Server
-	dashboard  *dashboard
-	admin      *adminAPI
+	logger                  log.ContextLogger
+	grpcServer              *grpc.Server
+	dashboard               *dashboard
+	admin                   *adminAPI
+	webSocketOrigins        []string
+	insecureWebSocketOrigin bool
 }
 
 func (b *webBridge) ServeHTTP(writer http.ResponseWriter, request *http.Request) {

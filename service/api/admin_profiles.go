@@ -5,7 +5,6 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	stdjson "encoding/json"
-	"errors"
 	"net/http"
 	"os"
 	"runtime"
@@ -15,12 +14,12 @@ import (
 	"time"
 
 	"github.com/Miku0139oao/sidera-core/adapter"
+	"github.com/Miku0139oao/sidera-core/common/dashboardstore"
 	C "github.com/Miku0139oao/sidera-core/constant"
 	"github.com/Miku0139oao/sidera-core/option"
 	E "github.com/sagernet/sing/common/exceptions"
 	SJSON "github.com/sagernet/sing/common/json"
 	"github.com/sagernet/sing/service"
-	"github.com/sagernet/sing/service/filemanager"
 
 	"github.com/go-chi/chi/v5"
 )
@@ -78,6 +77,7 @@ type adminServerInput struct {
 	Kind      string               `json:"kind"`
 	Config    stdjson.RawMessage   `json:"config"`
 	Advertise adminServerAdvertise `json:"advertise"`
+	Revision  int64                `json:"revision"`
 }
 
 type adminServerView struct {
@@ -95,6 +95,7 @@ type adminServerView struct {
 	Config          stdjson.RawMessage   `json:"config,omitempty"`
 	Revision        int64                `json:"revision,omitempty"`
 	AppliedRevision int64                `json:"applied_revision,omitempty"`
+	UsersManaged    bool                 `json:"users_managed,omitempty"`
 }
 
 type decodedAdminServer struct {
@@ -109,110 +110,7 @@ type decodedAdminServer struct {
 // Box constructs its runtime managers. Base configuration always wins tag
 // ownership; collisions are rejected rather than silently replaced.
 func MergeDashboardProfiles(ctx context.Context, options *option.Options) error {
-	dataPaths := make(map[string]bool)
-	for _, serviceOptions := range options.Services {
-		if serviceOptions.Type != C.TypeAPI {
-			continue
-		}
-		apiOptions, loaded := serviceOptions.Options.(*option.APIServiceOptions)
-		if !loaded || apiOptions.Dashboard == nil || !apiOptions.Dashboard.Enabled {
-			continue
-		}
-		dataPath := apiOptions.Dashboard.DataPath
-		if dataPath == "" {
-			dataPath = defaultAdminDataPath
-		}
-		dataPaths[filemanager.BasePath(ctx, os.ExpandEnv(dataPath))] = true
-	}
-	if len(dataPaths) == 0 {
-		return nil
-	}
-
-	usedTags := make(map[string]bool, len(options.Inbounds)+len(options.Endpoints))
-	for _, inbound := range options.Inbounds {
-		if inbound.Tag != "" {
-			usedTags[inbound.Tag] = true
-		}
-	}
-	for _, endpoint := range options.Endpoints {
-		if endpoint.Tag != "" {
-			usedTags[endpoint.Tag] = true
-		}
-	}
-
-	paths := make([]string, 0, len(dataPaths))
-	for dataPath := range dataPaths {
-		paths = append(paths, dataPath)
-	}
-	sort.Strings(paths)
-	for _, dataPath := range paths {
-		stored, err := loadAdminStoreForProfiles(ctx, dataPath)
-		if err != nil {
-			return err
-		}
-		serverTags := make([]string, 0, len(stored.Servers))
-		for tag := range stored.Servers {
-			serverTags = append(serverTags, tag)
-		}
-		sort.Strings(serverTags)
-		for _, tag := range serverTags {
-			profile := stored.Servers[tag]
-			if profile == nil {
-				return E.New("invalid null dashboard server: ", tag)
-			}
-			if profile.Deleted {
-				continue
-			}
-			if usedTags[tag] {
-				return E.New("dashboard server tag collides with base configuration: ", tag)
-			}
-			switch profile.Kind {
-			case adminServerKindInbound:
-				var inbound option.Inbound
-				if err = SJSON.UnmarshalContext(ctx, profile.Config, &inbound); err != nil {
-					return E.Cause(err, "decode dashboard inbound ", tag)
-				}
-				if inbound.Tag != tag || inbound.Type != profile.Type {
-					return E.New("dashboard inbound identity mismatch: ", tag)
-				}
-				options.Inbounds = append(options.Inbounds, inbound)
-			case adminServerKindEndpoint:
-				var endpoint option.Endpoint
-				if err = SJSON.UnmarshalContext(ctx, profile.Config, &endpoint); err != nil {
-					return E.Cause(err, "decode dashboard endpoint ", tag)
-				}
-				if endpoint.Tag != tag || endpoint.Type != profile.Type {
-					return E.New("dashboard endpoint identity mismatch: ", tag)
-				}
-				options.Endpoints = append(options.Endpoints, endpoint)
-			default:
-				return E.New("unsupported dashboard server kind: ", profile.Kind)
-			}
-			usedTags[tag] = true
-		}
-	}
-	return nil
-}
-
-func loadAdminStoreForProfiles(ctx context.Context, dataPath string) (adminStore, error) {
-	content, err := filemanager.ReadFile(ctx, dataPath)
-	if errors.Is(err, os.ErrNotExist) {
-		content, err = filemanager.ReadFile(ctx, dataPath+".bak")
-		if errors.Is(err, os.ErrNotExist) {
-			return adminStore{}, nil
-		}
-	}
-	if err != nil {
-		return adminStore{}, E.Cause(err, "read dashboard data")
-	}
-	var stored adminStore
-	if err = stdjson.Unmarshal(content, &stored); err != nil {
-		return adminStore{}, E.Cause(err, "decode dashboard data")
-	}
-	if stored.Version != 1 && stored.Version != adminStoreVersion {
-		return adminStore{}, E.New("unsupported dashboard data version: ", stored.Version)
-	}
-	return stored, nil
+	return dashboardstore.MergeProfiles(ctx, options)
 }
 
 func (a *adminAPI) listProtocols(writer http.ResponseWriter, request *http.Request) {
@@ -394,6 +292,10 @@ func (a *adminAPI) listServers(writer http.ResponseWriter, request *http.Request
 }
 
 func (a *adminAPI) serverListResponse() map[string]any {
+	return a.serverResponse(false)
+}
+
+func (a *adminAPI) serverResponse(includeConfig bool) map[string]any {
 	viewsByTag := make(map[string]adminServerView, len(a.runtimes))
 	for tag, runtimeInbound := range a.runtimes {
 		view := adminServerView{
@@ -422,7 +324,15 @@ func (a *adminAPI) serverListResponse() map[string]any {
 		view.Source = "dashboard"
 		view.Editable = true
 		view.Advertise = profile.Advertise
-		view.Config = append(stdjson.RawMessage(nil), profile.Config...)
+		userStore := a.store.Inbounds[tag]
+		view.UsersManaged = userStore != nil && userStore.Authoritative
+		if includeConfig {
+			if view.UsersManaged {
+				view.Config = removeAdminServerUsers(profile.Config)
+			} else {
+				view.Config = append(stdjson.RawMessage(nil), profile.Config...)
+			}
+		}
 		view.Revision = profile.Revision
 		view.AppliedRevision = profile.AppliedRevision
 		view.Pending = profile.Deleted || profile.Revision != profile.AppliedRevision
@@ -453,6 +363,19 @@ func (a *adminAPI) serverListResponse() map[string]any {
 	return map[string]any{"servers": views, "restart_required": restartRequired}
 }
 
+func (a *adminAPI) getServer(writer http.ResponseWriter, request *http.Request) {
+	tag := chi.URLParam(request, "tag")
+	response := a.serverResponse(true)
+	servers, _ := response["servers"].([]adminServerView)
+	for _, server := range servers {
+		if server.Tag == tag {
+			writeAdminJSON(writer, http.StatusOK, server)
+			return
+		}
+	}
+	writeAdminError(writer, http.StatusNotFound, "找不到節點")
+}
+
 func (a *adminAPI) createServer(writer http.ResponseWriter, request *http.Request) {
 	var input adminServerInput
 	if err := decodeAdminJSON(writer, request, &input); err != nil {
@@ -464,7 +387,7 @@ func (a *adminAPI) createServer(writer http.ResponseWriter, request *http.Reques
 		return
 	}
 	a.mutation.Lock()
-	defer a.mutation.Unlock()
+	defer a.unlockMutation()
 	if a.runtimes[decoded.Tag] != nil {
 		writeAdminError(writer, http.StatusConflict, "入站標籤已被基礎設定使用")
 		return
@@ -499,7 +422,7 @@ func (a *adminAPI) updateServer(writer http.ResponseWriter, request *http.Reques
 		return
 	}
 	a.mutation.Lock()
-	defer a.mutation.Unlock()
+	defer a.unlockMutation()
 	a.storeAccess.RLock()
 	current := cloneAdminServerStore(a.store.Servers[tag])
 	a.storeAccess.RUnlock()
@@ -507,10 +430,29 @@ func (a *adminAPI) updateServer(writer http.ResponseWriter, request *http.Reques
 		writeAdminError(writer, http.StatusNotFound, "找不到可編輯的面板入站")
 		return
 	}
+	if input.Revision <= 0 || input.Revision != current.Revision {
+		writeAdminError(writer, http.StatusConflict, "節點資料已被其他操作更新，請重新整理後再試")
+		return
+	}
+	a.storeAccess.RLock()
+	userStore := cloneInboundStore(a.store.Inbounds[tag])
+	a.storeAccess.RUnlock()
+	usersAuthoritative := userStore != nil && userStore.Authoritative
+	if usersAuthoritative && adminServerHasUsers(input.Config) {
+		writeAdminError(writer, http.StatusBadRequest, "此節點的 users 由用戶管理頁面維護，不可在 Server JSON 中變更")
+		return
+	}
 	decoded, advertise, err := decodeAdminServer(a.ctx, input, tag, current.Kind, current.Type)
 	if err != nil {
 		writeAdminError(writer, http.StatusBadRequest, err.Error())
 		return
+	}
+	if usersAuthoritative {
+		decoded.Config, err = replaceAdminServerUsers(decoded.Config, blockedAdminServerUsers(current.Type, userStore))
+		if err != nil {
+			writeAdminError(writer, http.StatusInternalServerError, err.Error())
+			return
+		}
 	}
 	updated := cloneAdminServerStore(current)
 	updated.Config = decoded.Config
@@ -532,13 +474,23 @@ func (a *adminAPI) updateServer(writer http.ResponseWriter, request *http.Reques
 
 func (a *adminAPI) deleteServer(writer http.ResponseWriter, request *http.Request) {
 	tag := chi.URLParam(request, "tag")
+	expectedRevision, err := requestedAdminRevision(request)
+	if err != nil {
+		writeAdminError(writer, http.StatusBadRequest, err.Error())
+		return
+	}
 	a.mutation.Lock()
-	defer a.mutation.Unlock()
+	defer a.unlockMutation()
 	a.storeAccess.Lock()
 	current := cloneAdminServerStore(a.store.Servers[tag])
 	if current == nil {
 		a.storeAccess.Unlock()
 		writeAdminError(writer, http.StatusNotFound, "只能刪除由面板建立的入站")
+		return
+	}
+	if current.Revision != expectedRevision {
+		a.storeAccess.Unlock()
+		writeAdminError(writer, http.StatusConflict, "節點資料已被其他操作更新，請重新整理後再試")
 		return
 	}
 	if a.runtimes[tag] == nil {
@@ -632,6 +584,79 @@ func decodeAdminServer(ctx context.Context, input adminServerInput, expectedTag 
 	}, input.Advertise, nil
 }
 
+func (a *adminAPI) scrubAuthoritativeProfileUsersLocked() error {
+	for tag, profile := range a.store.Servers {
+		if profile == nil || profile.Deleted {
+			continue
+		}
+		record := a.store.Inbounds[tag]
+		if record == nil || !record.Authoritative {
+			continue
+		}
+		config, err := replaceAdminServerUsers(profile.Config, blockedAdminServerUsers(profile.Type, record))
+		if err != nil {
+			return E.Cause(err, "scrub dashboard server users for ", tag)
+		}
+		profile.Config = config
+	}
+	return nil
+}
+
+func adminServerHasUsers(config stdjson.RawMessage) bool {
+	var object map[string]stdjson.RawMessage
+	if stdjson.Unmarshal(config, &object) != nil {
+		return false
+	}
+	_, exists := object["users"]
+	return exists
+}
+
+func removeAdminServerUsers(config stdjson.RawMessage) stdjson.RawMessage {
+	var object map[string]stdjson.RawMessage
+	if stdjson.Unmarshal(config, &object) != nil {
+		return nil
+	}
+	delete(object, "users")
+	content, err := stdjson.Marshal(object)
+	if err != nil {
+		return nil
+	}
+	return content
+}
+
+func replaceAdminServerUsers(config stdjson.RawMessage, users any) (stdjson.RawMessage, error) {
+	var object map[string]stdjson.RawMessage
+	if err := stdjson.Unmarshal(config, &object); err != nil {
+		return nil, err
+	}
+	content, err := stdjson.Marshal(users)
+	if err != nil {
+		return nil, err
+	}
+	object["users"] = content
+	return stdjson.Marshal(object)
+}
+
+func blockedAdminServerUsers(protocolType string, record *adminInboundStore) any {
+	const name = "__sidera_blocked__"
+	switch protocolType {
+	case C.TypeSOCKS, C.TypeHTTP, C.TypeMixed, C.TypeNaive, C.TypeOpenVPNServer:
+		return []any{map[string]any{"username": name, "password": record.BlockPassword}}
+	case C.TypeSnell:
+		return []any{map[string]any{"name": name, "userkey": record.BlockPassword}}
+	case C.TypeVMess:
+		return []any{map[string]any{"name": name, "uuid": record.BlockUUID}}
+	case C.TypeVLESS:
+		return []any{map[string]any{"name": name, "uuid": record.BlockUUID}}
+	case C.TypeTUIC:
+		return []any{map[string]any{"name": name, "uuid": record.BlockUUID, "password": record.BlockPassword}}
+	case C.TypeHysteria:
+		return []any{map[string]any{"name": name, "auth_str": record.BlockPassword}}
+	default:
+		return []any{map[string]any{"name": name, "password": record.BlockPassword}}
+	}
+}
+
 func cloneAdminServerStore(profile *adminServerStore) *adminServerStore {
 	if profile == nil {
 		return nil
@@ -646,6 +671,10 @@ func (a *adminAPI) reloadCore(writer http.ResponseWriter, request *http.Request)
 	restartRequired, _ := response["restart_required"].(bool)
 	if !restartRequired {
 		writeAdminJSON(writer, http.StatusOK, map[string]any{"reloading": false, "message": "沒有待套用的入站變更"})
+		return
+	}
+	if !a.processSignalReload {
+		writeAdminError(writer, http.StatusNotImplemented, "目前的 Core host 不支援由面板重新載入")
 		return
 	}
 	if runtime.GOOS == "windows" {

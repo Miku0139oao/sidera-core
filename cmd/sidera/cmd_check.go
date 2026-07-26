@@ -5,6 +5,7 @@ import (
 
 	"github.com/Miku0139oao/sidera-core"
 	"github.com/Miku0139oao/sidera-core/log"
+	"github.com/Miku0139oao/sidera-core/option"
 
 	"github.com/spf13/cobra"
 )
@@ -30,10 +31,15 @@ func check() error {
 	if err != nil {
 		return err
 	}
+	return validateConfigOptions(options)
+}
+
+func validateConfigOptions(options option.Options) error {
 	ctx, cancel := context.WithCancel(globalCtx)
 	instance, err := box.New(box.Options{
-		Context: ctx,
-		Options: options,
+		Context:        ctx,
+		Options:        options,
+		ValidationOnly: true,
 	})
 	if err == nil {
 		instance.Close()

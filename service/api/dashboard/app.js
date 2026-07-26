@@ -139,6 +139,7 @@
       serverStatus: "",
     },
     dialog: null,
+    detailRequest: 0,
     pollTimer: 0,
     epoch: 0,
     theme: readTheme(),
@@ -1190,7 +1191,7 @@
           <label class="search-field">
             <span class="sr-only">搜尋用戶</span>
             ${icon("search")}
-            <input type="search" data-filter="user-search" value="${escapeHTML(state.filters.userSearch)}" placeholder="搜尋名稱、入站、UUID…" autocomplete="off">
+            <input type="search" data-filter="user-search" value="${escapeHTML(state.filters.userSearch)}" placeholder="搜尋名稱、入站、協議…" autocomplete="off">
             <button class="icon-button small search-clear" type="button" data-action="clear-user-search" aria-label="清除搜尋" ${state.filters.userSearch ? "" : "hidden"}>${icon("close")}</button>
           </label>
           <label>
@@ -1240,7 +1241,7 @@
       const status = getUserStatus(user);
       if (state.filters.userStatus !== "all" && status.key !== state.filters.userStatus) return false;
       if (!query) return true;
-      const haystack = [user.name, user.inbound, user.type, user.uuid].map((value) => String(value || "").toLocaleLowerCase("zh-Hant")).join("\n");
+      const haystack = [user.name, user.inbound, user.type].map((value) => String(value || "").toLocaleLowerCase("zh-Hant")).join("\n");
       return haystack.includes(query);
     });
   }
@@ -1550,6 +1551,7 @@
   }
 
   function openUserDialog(user = null) {
+    state.detailRequest += 1;
     const managed = managedInbounds();
     if (!user && !managed.length) {
       showToast("目前沒有支援動態用戶管理的入站", "error");
@@ -1712,6 +1714,7 @@
   }
 
   function openServerDialog(server = null) {
+    state.detailRequest += 1;
     if (state.reloading || state.loading.protocols || state.loading.servers) {
       showToast("節點資料同步中，請稍後再試", "error");
       return;
@@ -1841,7 +1844,7 @@
                 </div>
               </div>
 
-              <div class="dialog-section-heading full native-config-heading"><div><h3>原生 Server JSON</h3><p>${editing ? "type 與 tag 必須維持不變。" : "範本包含後端產生的隨機憑證，請在送出前完成必要調整。"}</p></div><span class="chip">完整設定</span></div>
+              <div class="dialog-section-heading full native-config-heading"><div><h3>原生 Server JSON</h3><p>${editing ? model.server?.users_managed ? "type 與 tag 必須維持不變；users 已由用戶管理頁面接管並從此處隱藏。" : "type 與 tag 必須維持不變。" : "範本包含後端產生的隨機憑證，請在送出前完成必要調整。"}</p></div><span class="chip">完整設定</span></div>
               <div class="form-field full">
                 <label class="sr-only" for="server-config">完整原生 Server JSON</label>
                 <textarea class="text-input json-editor" id="server-config" name="config" rows="18" wrap="off" autocomplete="off" autocapitalize="off" spellcheck="false" aria-describedby="config-error">${escapeHTML(draft.config)}</textarea>
@@ -1921,6 +1924,7 @@
       body: config && (protocol || model.server) ? {
         kind: model.server?.kind || protocol.kind,
         config,
+        revision: Number(model.server?.revision) || 0,
         advertise: {
           server,
           server_port: serverPort,
@@ -2044,6 +2048,7 @@
         enabled: draft.enabled,
         quota_bytes: quotaBytes,
         expires_at: expiresAt,
+        revision: Number(state.dialog.user?.revision || inbound.revision) || 0,
       },
     };
   }
@@ -2095,6 +2100,7 @@
   }
 
   function openConfirm({ title, message, confirmLabel, action, successMessage, danger = true }) {
+    state.detailRequest += 1;
     const dialog = document.getElementById("app-dialog");
     if (!dialog) return;
     state.dialog = { type: "confirm", action, successMessage, submitting: false };
@@ -2121,6 +2127,7 @@
   }
 
   function closeDialog() {
+    state.detailRequest += 1;
     const dialog = document.getElementById("app-dialog");
     if (dialog?.open && !state.dialog?.submitting) dialog.close();
     else if (!dialog?.open) state.dialog = null;
@@ -2808,14 +2815,38 @@
 
     if (action === "edit-user") {
       const user = findUser(actionElement.dataset.id);
-      if (user) openUserDialog(user);
-      else showToast("找不到此用戶，請重新整理", "error");
+      if (!user) {
+        showToast("找不到此用戶，請重新整理", "error");
+      } else {
+        const requestID = ++state.detailRequest;
+        const epoch = state.epoch;
+        const route = state.route;
+        try {
+          const detail = await api(`/users/${encodeURIComponent(user.id)}`);
+          if (requestID !== state.detailRequest || epoch !== state.epoch || route !== state.route || !state.authenticated) return;
+          openUserDialog(detail);
+        } catch (error) {
+          if (error.status !== 401) showToast(error.message, "error");
+        }
+      }
     }
 
     if (action === "edit-server") {
       const server = findServerByTag(actionElement.dataset.tag);
-      if (server) openServerDialog(server);
-      else showToast("找不到此節點，請重新整理", "error");
+      if (!server) {
+        showToast("找不到此節點，請重新整理", "error");
+      } else {
+        const requestID = ++state.detailRequest;
+        const epoch = state.epoch;
+        const route = state.route;
+        try {
+          const detail = await api(`/servers/${encodeURIComponent(server.tag)}`);
+          if (requestID !== state.detailRequest || epoch !== state.epoch || route !== state.route || !state.authenticated) return;
+          openServerDialog(detail);
+        } catch (error) {
+          if (error.status !== 401) showToast(error.message, "error");
+        }
+      }
     }
 
     if (action === "delete-server") {
@@ -2827,7 +2858,7 @@
         confirmLabel: "刪除節點",
         successMessage: "節點刪除變更已儲存",
         action: async () => {
-          await api(`/servers/${encodeURIComponent(server.tag)}`, { method: "DELETE" });
+          await api(`/servers/${encodeURIComponent(server.tag)}?revision=${encodeURIComponent(server.revision)}`, { method: "DELETE" });
           await loadServerData({ silent: true, force: true });
         },
       });
@@ -2842,7 +2873,7 @@
         confirmLabel: "刪除用戶",
         successMessage: "用戶已刪除",
         action: async () => {
-          await api(`/users/${encodeURIComponent(user.id)}`, { method: "DELETE" });
+          await api(`/users/${encodeURIComponent(user.id)}?revision=${encodeURIComponent(user.revision)}`, { method: "DELETE" });
           await Promise.all([loadUsers({ silent: true, force: true }), loadOverview({ silent: true, force: true })]);
         },
       });

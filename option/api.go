@@ -24,6 +24,11 @@ type _APIDashboardOptions struct {
 	DataPath       string             `json:"data_path,omitempty"`
 	HTTPClient     *HTTPClientOptions `json:"http_client,omitempty"`
 	UpdateInterval badoption.Duration `json:"update_interval,omitempty"`
+
+	// AppliedServerRevisions records the exact dashboard profile snapshot
+	// merged into this runtime.
+	AppliedServerRevisions map[string]int64 `json:"-"`
+	ProcessSignalReload    bool             `json:"-"`
 }
 
 type APIDashboardOptions _APIDashboardOptions

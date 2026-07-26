@@ -46,8 +46,9 @@ func (s *StartedService) CheckConfig(ctx context.Context, configContent string) 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	instance, err := box.New(box.Options{
-		Context: ctx,
-		Options: options,
+		Context:        ctx,
+		Options:        options,
+		ValidationOnly: true,
 	})
 	if err == nil {
 		instance.Close()
