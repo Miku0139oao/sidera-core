@@ -318,7 +318,7 @@ func TestDecodeXrayVLESSInboundWithRealityEncryption(t *testing.T) {
 	require.Equal(t, "gateway.example", vlessOptions.TLS.ServerName)
 	require.Equal(t, "gateway.example", vlessOptions.TLS.Reality.Handshake.Server)
 	require.Equal(t, uint16(443), vlessOptions.TLS.Reality.Handshake.ServerPort)
-	require.Equal(t, "26.3.27", vlessOptions.TLS.Reality.MinClientVersion)
+	require.Empty(t, vlessOptions.TLS.Reality.MinClientVersion)
 	require.Equal(t, time.Second, time.Duration(vlessOptions.TLS.Reality.MaxTimeDifference))
 }
 

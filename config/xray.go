@@ -949,9 +949,8 @@ func translateXrayInboundReality(source *xrayReality) (map[string]any, error) {
 			"server":      server,
 			"server_port": port,
 		},
-		"private_key":        source.PrivateKey,
-		"short_id":           []string(source.ShortIDs),
-		"min_client_version": "26.3.27",
+		"private_key": source.PrivateKey,
+		"short_id":    []string(source.ShortIDs),
 	}
 	if source.MinClientVer != "" {
 		reality["min_client_version"] = source.MinClientVer

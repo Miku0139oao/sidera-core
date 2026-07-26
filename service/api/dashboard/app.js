@@ -689,7 +689,18 @@
       </article>`;
   }
 
-  function renderOverview({ animate = true } = {}) {
+  function replaceContent(element, html, preserveScroll = false) {
+    const scrollingElement = preserveScroll ? document.scrollingElement : null;
+    const scrollLeft = scrollingElement?.scrollLeft || 0;
+    const scrollTop = scrollingElement?.scrollTop || 0;
+    element.innerHTML = html;
+    if (scrollingElement) {
+      scrollingElement.scrollLeft = scrollLeft;
+      scrollingElement.scrollTop = scrollTop;
+    }
+  }
+
+  function renderOverview({ animate = true, preserveScroll = false } = {}) {
     const main = document.getElementById("main-content");
     if (!main) return;
     const restoreRefreshFocus = main.contains(document.activeElement) && document.activeElement?.dataset.action === "refresh-overview";
@@ -714,7 +725,7 @@
       ? "管理 API 已回應，流量與連線資料持續同步中。"
       : "管理 API 已回應，但 Core 回報了非運行狀態。";
     main.setAttribute("aria-busy", state.loading.overview ? "true" : "false");
-    main.innerHTML = `
+    replaceContent(main, `
       <div class="${animate ? "page-enter" : ""}">
         <div class="page-heading">
           <div>
@@ -793,7 +804,7 @@
           </div>
           ${renderInboundCards(overview.inbounds)}
         </section>
-      </div>`;
+      </div>`, preserveScroll);
     if (restoreRefreshFocus) main.querySelector('[data-action="refresh-overview"]')?.focus();
   }
 
@@ -2145,6 +2156,7 @@
       if (epoch !== state.epoch || !state.authenticated) return;
     }
     const epoch = state.epoch;
+    const preserveScroll = state.route === "overview" && Boolean(state.overview);
     state.loading.overview = true;
     if (state.route === "overview" && !state.overview) renderOverview();
     try {
@@ -2159,7 +2171,7 @@
     } finally {
       if (epoch === state.epoch) {
         state.loading.overview = false;
-        if (state.route === "overview") renderOverview({ animate: false });
+        if (state.route === "overview") renderOverview({ animate: false, preserveScroll });
       }
     }
   }
