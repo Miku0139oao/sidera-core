@@ -38,7 +38,7 @@ import (
 
 const (
 	adminRoutePrefix        = "/api/admin"
-	subscriptionRoutePrefix = "/sub/"
+	subscriptionRoutePrefix = "/sub/sidera/"
 	adminStoreVersion       = dashboardstore.StoreVersion
 )
 
@@ -102,10 +102,11 @@ type adminManagedRuntime struct {
 }
 
 type adminStore struct {
-	Version       int                           `json:"version"`
-	Inbounds      map[string]*adminInboundStore `json:"inbounds"`
-	Servers       map[string]*adminServerStore  `json:"servers,omitempty"`
-	Subscriptions map[string]string             `json:"subscriptions,omitempty"`
+	Version               int                           `json:"version"`
+	Inbounds              map[string]*adminInboundStore `json:"inbounds"`
+	Servers               map[string]*adminServerStore  `json:"servers,omitempty"`
+	Subscriptions         map[string]string             `json:"subscriptions,omitempty"`
+	ExternalSubscriptions map[string]string             `json:"external_subscriptions,omitempty"`
 }
 
 type adminServerStore struct {
@@ -240,10 +241,11 @@ func newAdminAPI(ctx context.Context, logger log.ContextLogger, secret string, d
 		processSignalReload: processSignalReload,
 		trafficBaselines:    make(map[uuid.UUID]adminTrafficBaseline),
 		store: adminStore{
-			Version:       adminStoreVersion,
-			Inbounds:      make(map[string]*adminInboundStore),
-			Servers:       make(map[string]*adminServerStore),
-			Subscriptions: make(map[string]string),
+			Version:               adminStoreVersion,
+			Inbounds:              make(map[string]*adminInboundStore),
+			Servers:               make(map[string]*adminServerStore),
+			Subscriptions:         make(map[string]string),
+			ExternalSubscriptions: make(map[string]string),
 		},
 	}
 	for tag, revision := range serverRevisions {
@@ -386,6 +388,9 @@ func (a *adminAPI) loadStore() error {
 	}
 	if stored.Subscriptions == nil {
 		stored.Subscriptions = make(map[string]string)
+	}
+	if stored.ExternalSubscriptions == nil {
+		stored.ExternalSubscriptions = make(map[string]string)
 	}
 	for tag, record := range stored.Inbounds {
 		if record == nil {
@@ -1268,8 +1273,10 @@ func (a *adminAPI) getUser(writer http.ResponseWriter, request *http.Request) {
 		for _, user := range record.Users {
 			if user.ID == id {
 				view := makeAdminUserView(user, record, active[adminUserKey(tag, user.Name)], true)
-				if token := a.store.Subscriptions[user.Name]; token != "" && a.publicBaseURL != "" && len(a.subscriptionLinksLocked(user.Name, time.Now().UnixMilli(), active)) > 0 {
-					view.SubscriptionURL = a.publicBaseURL + "/sub/" + token
+				if externalID := a.store.ExternalSubscriptions[user.Name]; validExternalSubscriptionID(externalID) && a.publicBaseURL != "" {
+					view.SubscriptionURL = a.publicBaseURL + "/sub/" + url.PathEscape(externalID)
+				} else if token := a.store.Subscriptions[user.Name]; token != "" && a.publicBaseURL != "" && len(a.subscriptionLinksLocked(user.Name, time.Now().UnixMilli(), active)) > 0 {
+					view.SubscriptionURL = a.publicBaseURL + subscriptionRoutePrefix + token
 				}
 				writeAdminJSON(writer, http.StatusOK, view)
 				return

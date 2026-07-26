@@ -125,7 +125,9 @@ regenerates. Dashboard-owned server profiles are then loaded from `data_path`.
 Public HTTPS origin used for user subscription links, for example
 `https://panel.example.com`. It must not contain an explicit port, path, query,
 userinfo, or fragment. When configured, unauthenticated `GET` and `HEAD`
-requests to `/sub/{token}` return a no-store, padded Base64 URI list.
+requests to `/sub/sidera/{token}` return a no-store, padded Base64 URI list.
+Deployments may also preserve externally managed subscriptions in the dashboard
+store; those use `/sub/{external-id}` behind the public reverse proxy.
 
 Subscriptions group active users with the same exact name across applied
 dashboard server profiles. They currently include VLESS with Reality,

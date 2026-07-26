@@ -21,9 +21,10 @@ const (
 )
 
 type storedStore struct {
-	Version       int                      `json:"version"`
-	Servers       map[string]*storedServer `json:"servers"`
-	Subscriptions map[string]string        `json:"subscriptions,omitempty"`
+	Version               int                      `json:"version"`
+	Servers               map[string]*storedServer `json:"servers"`
+	Subscriptions         map[string]string        `json:"subscriptions,omitempty"`
+	ExternalSubscriptions map[string]string        `json:"external_subscriptions,omitempty"`
 }
 
 type storedServer struct {

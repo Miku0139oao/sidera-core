@@ -99,7 +99,7 @@ API 密钥。
 
 ##### public_base_url
 
-用于用户订阅链接的公开 HTTPS origin，例如 `https://panel.example.com`。不得包含显式端口、路径、查询参数、用户信息或 fragment。配置后，未经认证的 `GET` 与 `HEAD /sub/{token}` 会返回禁止缓存、使用标准填充 Base64 编码的 URI 列表。
+用于用户订阅链接的公开 HTTPS origin，例如 `https://panel.example.com`。不得包含显式端口、路径、查询参数、用户信息或 fragment。配置后，未经认证的 `GET` 与 `HEAD /sub/sidera/{token}` 会返回禁止缓存、使用标准填充 Base64 编码的 URI 列表。部署也可在管理存储中保留外部订阅 ID，并由公开反向代理通过 `/sub/{external-id}` 提供。
 
 订阅会按完全相同的用户名合并已套用面板节点中的有效用户。目前支持具有完整公开连接信息的 VLESS + Reality、Hysteria2 与 TUIC。Reality 公钥由私钥推导，私钥绝不会输出。
 

@@ -79,7 +79,7 @@ func TestSubscriptionEndpointGroupsExactNameAndProductionProfiles(t *testing.T) 
 	}
 	a.router = a.buildRouter()
 
-	response := adminRequest(a, http.MethodGet, "/sub/subscription-token", nil)
+	response := adminRequest(a, http.MethodGet, "/sub/sidera/subscription-token", nil)
 	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
 	require.Equal(t, "no-store", response.Header().Get("Cache-Control"))
 	decoded, err := base64.StdEncoding.DecodeString(response.Body.String())
@@ -95,11 +95,11 @@ func TestSubscriptionEndpointGroupsExactNameAndProductionProfiles(t *testing.T) 
 	require.NotContains(t, string(decoded), "wrong-case")
 	require.NotContains(t, string(decoded), "pending.example.com")
 
-	head := adminRequest(a, http.MethodHead, "/sub/subscription-token", nil)
+	head := adminRequest(a, http.MethodHead, "/sub/sidera/subscription-token", nil)
 	require.Equal(t, http.StatusOK, head.Code)
 	require.Empty(t, head.Body.String())
 	require.NotEmpty(t, head.Header().Get("Content-Length"))
-	missing := adminRequest(a, http.MethodGet, "/sub/not-a-token", nil)
+	missing := adminRequest(a, http.MethodGet, "/sub/sidera/not-a-token", nil)
 	require.Equal(t, http.StatusNotFound, missing.Code)
 	require.Equal(t, "404 page not found\n", missing.Body.String())
 }
@@ -116,14 +116,26 @@ func TestSubscriptionURLOnlyInUserDetail(t *testing.T) {
 	list := adminRequest(a, http.MethodGet, adminRoutePrefix+"/users", nil)
 	require.NotContains(t, list.Body.String(), "subscription_url")
 	detail := adminRequest(a, http.MethodGet, adminRoutePrefix+"/users/id", nil)
-	require.Contains(t, detail.Body.String(), `"subscription_url":"https://panel.example.com/sub/token"`)
+	require.Contains(t, detail.Body.String(), `"subscription_url":"https://panel.example.com/sub/sidera/token"`)
+}
+
+func TestExternalSubscriptionURLTakesPriority(t *testing.T) {
+	managed := &adminTestManagedService{tag: "users", type_: C.TypeHysteria2}
+	a := newAdminTestAPI(t, managed, false)
+	a.publicBaseURL = "https://panel.example.com"
+	a.store.ExternalSubscriptions["Alice"] = "legacy_Sub-ID"
+	a.store.Inbounds[managed.tag] = &adminInboundStore{Users: []*adminUser{{ID: "id", Inbound: managed.tag, Type: C.TypeHysteria2, Name: "Alice", Enabled: true}}}
+	a.router = a.buildRouter()
+
+	detail := adminRequest(a, http.MethodGet, adminRoutePrefix+"/users/id", nil)
+	require.Contains(t, detail.Body.String(), `"subscription_url":"https://panel.example.com/sub/legacy_Sub-ID"`)
 }
 
 func TestSubscriptionRejectsNonTCPReality(t *testing.T) {
 	privateKey, err := ecdh.X25519().NewPrivateKey(bytesOf(1, 32))
 	require.NoError(t, err)
 	profile := subscriptionTestProfile(C.TypeVLESS, `{"transport":{"type":"ws"},"tls":{"enabled":true,"reality":{"enabled":true,"private_key":"`+base64.RawURLEncoding.EncodeToString(privateKey.Bytes())+`"}}}`, "vless.example.com", 443)
-	_, ok := subscriptionLink("reality", profile, &adminUser{Name: "Alice", UUID: "11111111-1111-1111-1111-111111111111", Enabled: true})
+	_, ok := subscriptionLink(context.Background(), "reality", profile, &adminUser{Name: "Alice", UUID: "11111111-1111-1111-1111-111111111111", Enabled: true})
 	require.False(t, ok)
 }
 
@@ -131,7 +143,7 @@ func TestWebBridgeDispatchesPublicSubscription(t *testing.T) {
 	a := &adminAPI{publicBaseURL: "https://panel.example.com", runtimes: make(map[string]*adminInboundRuntime), store: adminStore{Subscriptions: map[string]string{"Alice": "token"}, Inbounds: make(map[string]*adminInboundStore), Servers: make(map[string]*adminServerStore)}}
 	a.router = a.buildRouter()
 	bridge := &webBridge{admin: a, dashboard: newDashboard(context.Background(), nil, option.APIDashboardOptions{Enabled: true})}
-	request := httptest.NewRequest(http.MethodGet, "/sub/missing", nil)
+	request := httptest.NewRequest(http.MethodGet, "/sub/sidera/missing", nil)
 	response := httptest.NewRecorder()
 	bridge.ServeHTTP(response, request)
 	require.Equal(t, http.StatusNotFound, response.Code)

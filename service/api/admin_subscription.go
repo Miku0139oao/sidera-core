@@ -1,10 +1,10 @@
 package api
 
 import (
+	"context"
 	"crypto/ecdh"
 	"crypto/subtle"
 	"encoding/base64"
-	"encoding/json"
 	"net"
 	"net/http"
 	"net/url"
@@ -16,11 +16,25 @@ import (
 	C "github.com/Miku0139oao/sidera-core/constant"
 	"github.com/Miku0139oao/sidera-core/option"
 	E "github.com/sagernet/sing/common/exceptions"
+	SJSON "github.com/sagernet/sing/common/json"
 
 	"github.com/go-chi/chi/v5"
 )
 
 const subscriptionTokenBytes = 32
+
+func validExternalSubscriptionID(value string) bool {
+	if len(value) < 8 || len(value) > 128 {
+		return false
+	}
+	for _, character := range value {
+		if character >= 'a' && character <= 'z' || character >= 'A' && character <= 'Z' || character >= '0' && character <= '9' || character == '-' || character == '_' {
+			continue
+		}
+		return false
+	}
+	return true
+}
 
 func validateSubscriptionBaseURL(value string) error {
 	if value == "" {
@@ -169,7 +183,7 @@ func (a *adminAPI) subscriptionLinksLocked(name string, now int64, active map[st
 			if user == nil || user.Name != name || !adminUserEnabled(user, now, active[adminUserKey(tag, name)]) {
 				continue
 			}
-			if link, ok := subscriptionLink(tag, profile, user); ok {
+			if link, ok := subscriptionLink(a.ctx, tag, profile, user); ok {
 				links = append(links, link)
 			}
 		}
@@ -177,7 +191,10 @@ func (a *adminAPI) subscriptionLinksLocked(name string, now int64, active map[st
 	return links
 }
 
-func subscriptionLink(tag string, profile *adminServerStore, user *adminUser) (string, bool) {
+func subscriptionLink(ctx context.Context, tag string, profile *adminServerStore, user *adminUser) (string, bool) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if profile.Advertise.Server == "" || profile.Advertise.ServerPort == 0 {
 		return "", false
 	}
@@ -186,7 +203,7 @@ func subscriptionLink(tag string, profile *adminServerStore, user *adminUser) (s
 	switch profile.Type {
 	case C.TypeVLESS:
 		var config option.VLESSInboundOptions
-		if json.Unmarshal(profile.Config, &config) != nil || config.Transport != nil || config.TLS == nil || !config.TLS.Enabled || config.TLS.Reality == nil || !config.TLS.Reality.Enabled || user.UUID == "" {
+		if SJSON.UnmarshalContext(ctx, profile.Config, &config) != nil || config.Transport != nil || config.TLS == nil || !config.TLS.Enabled || config.TLS.Reality == nil || !config.TLS.Reality.Enabled || user.UUID == "" {
 			return "", false
 		}
 		privateKeyBytes, err := base64.RawURLEncoding.DecodeString(config.TLS.Reality.PrivateKey)
@@ -212,7 +229,7 @@ func subscriptionLink(tag string, profile *adminServerStore, user *adminUser) (s
 		return (&url.URL{Scheme: "vless", User: url.User(user.UUID), Host: authority, RawQuery: query.Encode(), Fragment: label}).String(), true
 	case C.TypeHysteria2:
 		var config option.Hysteria2InboundOptions
-		if json.Unmarshal(profile.Config, &config) != nil || user.Password == "" {
+		if SJSON.UnmarshalContext(ctx, profile.Config, &config) != nil || user.Password == "" {
 			return "", false
 		}
 		query := subscriptionTLSQuery(profile.Advertise, "insecure")
@@ -223,7 +240,7 @@ func subscriptionLink(tag string, profile *adminServerStore, user *adminUser) (s
 		return (&url.URL{Scheme: "hysteria2", User: url.User(user.Password), Host: authority, RawQuery: query.Encode(), Fragment: label}).String(), true
 	case C.TypeTUIC:
 		var config option.TUICInboundOptions
-		if json.Unmarshal(profile.Config, &config) != nil || user.UUID == "" || user.Password == "" {
+		if SJSON.UnmarshalContext(ctx, profile.Config, &config) != nil || user.UUID == "" || user.Password == "" {
 			return "", false
 		}
 		query := subscriptionTLSQuery(profile.Advertise, "allow_insecure")
