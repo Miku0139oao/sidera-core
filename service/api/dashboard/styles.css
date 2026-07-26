@@ -2063,6 +2063,12 @@ svg {
   padding-right: 93px;
 }
 
+.subscription-field {
+  margin-top: 8px;
+  padding-top: 17px;
+  border-top: 1px solid var(--outline-variant);
+}
+
 .input-actions {
   position: absolute;
   top: 5px;

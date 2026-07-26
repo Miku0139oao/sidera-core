@@ -68,6 +68,7 @@
     trash: '<path d="M3 6h18M8 6V4h8v2M19 6l-1 15H6L5 6M10 11v5M14 11v5"/>',
     reset: '<path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/>',
     key: '<circle cx="8" cy="15" r="4"/><path d="m11 12 9-9M16 7l3 3M14 9l2 2"/>',
+    copy: '<rect x="9" y="9" width="11" height="11" rx="2"/><path d="M15 9V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h3"/>',
     eye: '<path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6S2 12 2 12Z"/><circle cx="12" cy="12" r="2.5"/>',
     eyeOff: '<path d="m3 3 18 18M10.6 10.6a2 2 0 0 0 2.8 2.8M9.9 4.2A10.7 10.7 0 0 1 12 4c6.5 0 10 8 10 8a17.3 17.3 0 0 1-2.1 3.2M6.6 6.6C3.6 8.5 2 12 2 12s3.5 8 10 8a10 10 0 0 0 4.1-.9"/>',
     wand: '<path d="m15 4 5 5L8 21l-5-5L15 4Z"/><path d="m13 6 5 5M6 3v3M4.5 4.5h3M20 15v4M18 17h4"/>',
@@ -1668,6 +1669,19 @@
               </div>
 
               <div class="schema-note">${icon("server")}<span><strong>${escapeHTML(inbound.tag)}</strong>（${escapeHTML(inbound.type)}）需要 ${escapeHTML(credentialLabel(inbound.credential))}${inbound.flow ? "、支援 Flow" : ""}${inbound.alter_id ? "、支援 Alter ID" : ""}。</span></div>
+
+              ${editing && model.user.subscription_url ? `
+                <div class="form-field full subscription-field">
+                  <label for="user-subscription-url">訂閱連結</label>
+                  <div class="input-with-actions">
+                    <input class="text-input mono" id="user-subscription-url" type="password" value="${escapeHTML(model.user.subscription_url)}" readonly spellcheck="false">
+                    <div class="input-actions">
+                      <button class="icon-button small" type="button" data-action="toggle-subscription-url" aria-label="顯示訂閱連結" title="顯示訂閱連結">${icon("eye")}</button>
+                      <button class="icon-button small" type="button" data-action="copy-subscription-url" aria-label="複製訂閱連結" title="複製訂閱連結">${icon("copy")}</button>
+                    </div>
+                  </div>
+                  <span class="supporting-text">同名用戶在已套用生產節點上的可用連線會合併至此連結。</span>
+                </div>` : ""}
             </div>
           </div>
         </fieldset>
@@ -2810,6 +2824,28 @@
         actionElement.innerHTML = icon(state.dialog.passwordVisible ? "eyeOff" : "eye");
         actionElement.setAttribute("aria-label", state.dialog.passwordVisible ? "隱藏密碼" : "顯示密碼");
         actionElement.setAttribute("title", state.dialog.passwordVisible ? "隱藏密碼" : "顯示密碼");
+      }
+    }
+
+    if (action === "copy-subscription-url") {
+      const value = document.getElementById("user-subscription-url")?.value;
+      try {
+        if (!value || !navigator.clipboard?.writeText) throw new APIError("此瀏覽器不支援剪貼簿存取");
+        await navigator.clipboard.writeText(value);
+        showToast("已複製訂閱連結", "success");
+      } catch (error) {
+        showToast(error.message || "無法複製訂閱連結", "error");
+      }
+    }
+
+    if (action === "toggle-subscription-url") {
+      const field = document.getElementById("user-subscription-url");
+      if (field) {
+        const visible = field.type === "text";
+        field.type = visible ? "password" : "text";
+        actionElement.innerHTML = icon(visible ? "eye" : "eyeOff");
+        actionElement.setAttribute("aria-label", visible ? "顯示訂閱連結" : "隱藏訂閱連結");
+        actionElement.setAttribute("title", visible ? "顯示訂閱連結" : "隱藏訂閱連結");
       }
     }
 

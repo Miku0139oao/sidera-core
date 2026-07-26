@@ -16,13 +16,14 @@ import (
 )
 
 const (
-	StoreVersion    = 3
+	StoreVersion    = 4
 	DefaultDataPath = "sidera-dashboard.json"
 )
 
 type storedStore struct {
-	Version int                      `json:"version"`
-	Servers map[string]*storedServer `json:"servers"`
+	Version       int                      `json:"version"`
+	Servers       map[string]*storedServer `json:"servers"`
+	Subscriptions map[string]string        `json:"subscriptions,omitempty"`
 }
 
 type storedServer struct {
@@ -152,7 +153,7 @@ func loadStore(ctx context.Context, dataPath string) (storedStore, error) {
 	if err = stdjson.Unmarshal(content, &stored); err != nil {
 		return storedStore{}, E.Cause(err, "decode dashboard data")
 	}
-	if stored.Version != 1 && stored.Version != 2 && stored.Version != StoreVersion {
+	if stored.Version != 1 && stored.Version != 2 && stored.Version != 3 && stored.Version != StoreVersion {
 		return storedStore{}, E.New("unsupported dashboard data version: ", stored.Version)
 	}
 	return stored, nil

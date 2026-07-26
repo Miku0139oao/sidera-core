@@ -37,8 +37,9 @@ import (
 )
 
 const (
-	adminRoutePrefix  = "/api/admin"
-	adminStoreVersion = dashboardstore.StoreVersion
+	adminRoutePrefix        = "/api/admin"
+	subscriptionRoutePrefix = "/sub/"
+	adminStoreVersion       = dashboardstore.StoreVersion
 )
 
 // ContextWithValidation disables runtime and persistent dashboard mutations
@@ -56,6 +57,7 @@ type adminAPI struct {
 	logger         log.ContextLogger
 	secret         string
 	dataPath       string
+	publicBaseURL  string
 	router         http.Handler
 	startedAt      time.Time
 	validationOnly bool
@@ -100,9 +102,10 @@ type adminManagedRuntime struct {
 }
 
 type adminStore struct {
-	Version  int                           `json:"version"`
-	Inbounds map[string]*adminInboundStore `json:"inbounds"`
-	Servers  map[string]*adminServerStore  `json:"servers,omitempty"`
+	Version       int                           `json:"version"`
+	Inbounds      map[string]*adminInboundStore `json:"inbounds"`
+	Servers       map[string]*adminServerStore  `json:"servers,omitempty"`
+	Subscriptions map[string]string             `json:"subscriptions,omitempty"`
 }
 
 type adminServerStore struct {
@@ -155,9 +158,10 @@ type adminUser struct {
 
 type adminUserView struct {
 	adminUser
-	ActiveConnections int   `json:"active_connections"`
-	Revision          int64 `json:"revision"`
-	AppliedRevision   int64 `json:"applied_revision"`
+	ActiveConnections int    `json:"active_connections"`
+	Revision          int64  `json:"revision"`
+	AppliedRevision   int64  `json:"applied_revision"`
+	SubscriptionURL   string `json:"subscription_url,omitempty"`
 }
 
 type adminUserInput struct {
@@ -218,7 +222,7 @@ type adminManagedUserIdentity struct {
 	Generation int64
 }
 
-func newAdminAPI(ctx context.Context, logger log.ContextLogger, secret string, dataPath string, serverRevisions map[string]int64, processSignalReload bool) (*adminAPI, error) {
+func newAdminAPI(ctx context.Context, logger log.ContextLogger, secret string, dataPath string, publicBaseURL string, serverRevisions map[string]int64, processSignalReload bool) (*adminAPI, error) {
 	runCtx, cancel := context.WithCancel(ctx)
 	a := &adminAPI{
 		ctx:                 ctx,
@@ -227,6 +231,7 @@ func newAdminAPI(ctx context.Context, logger log.ContextLogger, secret string, d
 		logger:              logger,
 		secret:              secret,
 		dataPath:            ResolveDashboardDataPath(ctx, dataPath),
+		publicBaseURL:       publicBaseURL,
 		validationOnly:      validation.Only(ctx),
 		traffic:             service.PtrFromContext[trafficcontrol.Manager](ctx),
 		runtimes:            make(map[string]*adminInboundRuntime),
@@ -235,9 +240,10 @@ func newAdminAPI(ctx context.Context, logger log.ContextLogger, secret string, d
 		processSignalReload: processSignalReload,
 		trafficBaselines:    make(map[uuid.UUID]adminTrafficBaseline),
 		store: adminStore{
-			Version:  adminStoreVersion,
-			Inbounds: make(map[string]*adminInboundStore),
-			Servers:  make(map[string]*adminServerStore),
+			Version:       adminStoreVersion,
+			Inbounds:      make(map[string]*adminInboundStore),
+			Servers:       make(map[string]*adminServerStore),
+			Subscriptions: make(map[string]string),
 		},
 	}
 	for tag, revision := range serverRevisions {
@@ -251,6 +257,10 @@ func newAdminAPI(ctx context.Context, logger log.ContextLogger, secret string, d
 	if err := a.synchronizeStore(); err != nil {
 		cancel()
 		return nil, err
+	}
+	if err := a.ensureSubscriptionTokens(); err != nil {
+		cancel()
+		return nil, E.Cause(err, "initialize subscription tokens")
 	}
 	if err := a.applyAll(true); err != nil {
 		cancel()
@@ -363,7 +373,7 @@ func (a *adminAPI) loadStore() error {
 	if err = json.Unmarshal(content, &stored); err != nil {
 		return E.Cause(err, "decode dashboard data")
 	}
-	if stored.Version == 1 || stored.Version == 2 {
+	if stored.Version == 1 || stored.Version == 2 || stored.Version == 3 {
 		stored.Version = adminStoreVersion
 	} else if stored.Version != adminStoreVersion {
 		return E.New("unsupported dashboard data version: ", stored.Version)
@@ -373,6 +383,9 @@ func (a *adminAPI) loadStore() error {
 	}
 	if stored.Servers == nil {
 		stored.Servers = make(map[string]*adminServerStore)
+	}
+	if stored.Subscriptions == nil {
+		stored.Subscriptions = make(map[string]string)
 	}
 	for tag, record := range stored.Inbounds {
 		if record == nil {
@@ -1019,24 +1032,28 @@ func adminUserKey(inbound string, name string) string {
 
 func (a *adminAPI) buildRouter() http.Handler {
 	router := chi.NewRouter()
-	router.Use(a.authenticate)
-	router.Get(adminRoutePrefix+"/overview", a.getOverview)
-	router.Get(adminRoutePrefix+"/protocols", a.listProtocols)
-	router.Get(adminRoutePrefix+"/servers", a.listServers)
-	router.Get(adminRoutePrefix+"/servers/{tag}", a.getServer)
-	router.Post(adminRoutePrefix+"/servers", a.createServer)
-	router.Put(adminRoutePrefix+"/servers/{tag}", a.updateServer)
-	router.Delete(adminRoutePrefix+"/servers/{tag}", a.deleteServer)
-	router.Post(adminRoutePrefix+"/reload", a.reloadCore)
-	router.Get(adminRoutePrefix+"/users", a.listUsers)
-	router.Get(adminRoutePrefix+"/users/{id}", a.getUser)
-	router.Post(adminRoutePrefix+"/users", a.createUser)
-	router.Put(adminRoutePrefix+"/users/{id}", a.updateUser)
-	router.Delete(adminRoutePrefix+"/users/{id}", a.deleteUser)
-	router.Post(adminRoutePrefix+"/users/{id}/reset-traffic", a.resetUserTraffic)
-	router.Get(adminRoutePrefix+"/connections", a.listConnections)
-	router.Delete(adminRoutePrefix+"/connections", a.closeAllConnections)
-	router.Delete(adminRoutePrefix+"/connections/{id}", a.closeConnection)
+	router.MethodFunc(http.MethodGet, subscriptionRoutePrefix+"{token}", a.getSubscription)
+	router.MethodFunc(http.MethodHead, subscriptionRoutePrefix+"{token}", a.getSubscription)
+	router.Group(func(router chi.Router) {
+		router.Use(a.authenticate)
+		router.Get(adminRoutePrefix+"/overview", a.getOverview)
+		router.Get(adminRoutePrefix+"/protocols", a.listProtocols)
+		router.Get(adminRoutePrefix+"/servers", a.listServers)
+		router.Get(adminRoutePrefix+"/servers/{tag}", a.getServer)
+		router.Post(adminRoutePrefix+"/servers", a.createServer)
+		router.Put(adminRoutePrefix+"/servers/{tag}", a.updateServer)
+		router.Delete(adminRoutePrefix+"/servers/{tag}", a.deleteServer)
+		router.Post(adminRoutePrefix+"/reload", a.reloadCore)
+		router.Get(adminRoutePrefix+"/users", a.listUsers)
+		router.Get(adminRoutePrefix+"/users/{id}", a.getUser)
+		router.Post(adminRoutePrefix+"/users", a.createUser)
+		router.Put(adminRoutePrefix+"/users/{id}", a.updateUser)
+		router.Delete(adminRoutePrefix+"/users/{id}", a.deleteUser)
+		router.Post(adminRoutePrefix+"/users/{id}/reset-traffic", a.resetUserTraffic)
+		router.Get(adminRoutePrefix+"/connections", a.listConnections)
+		router.Delete(adminRoutePrefix+"/connections", a.closeAllConnections)
+		router.Delete(adminRoutePrefix+"/connections/{id}", a.closeConnection)
+	})
 	return router
 }
 
@@ -1250,7 +1267,11 @@ func (a *adminAPI) getUser(writer http.ResponseWriter, request *http.Request) {
 		}
 		for _, user := range record.Users {
 			if user.ID == id {
-				writeAdminJSON(writer, http.StatusOK, makeAdminUserView(user, record, active[adminUserKey(tag, user.Name)], true))
+				view := makeAdminUserView(user, record, active[adminUserKey(tag, user.Name)], true)
+				if token := a.store.Subscriptions[user.Name]; token != "" && a.publicBaseURL != "" && len(a.subscriptionLinksLocked(user.Name, time.Now().UnixMilli(), active)) > 0 {
+					view.SubscriptionURL = a.publicBaseURL + "/sub/" + token
+				}
+				writeAdminJSON(writer, http.StatusOK, view)
 				return
 			}
 		}
@@ -1767,6 +1788,10 @@ func (a *adminAPI) saveStore() error {
 	a.saveAccess.Lock()
 	defer a.saveAccess.Unlock()
 	a.storeAccess.Lock()
+	if err := a.ensureSubscriptionTokensLocked(); err != nil {
+		a.storeAccess.Unlock()
+		return err
+	}
 	if err := a.scrubAuthoritativeProfileUsersLocked(); err != nil {
 		a.storeAccess.Unlock()
 		return err

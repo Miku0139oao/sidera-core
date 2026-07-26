@@ -33,6 +33,7 @@ for bidirectional streaming methods.
     "path": "",
     "download_url": "",
     "data_path": "sidera-dashboard.json",
+    "public_base_url": "https://panel.example.com",
     "http_client": "", // or {}
     "update_interval": ""
   },
@@ -109,7 +110,8 @@ Leave empty to use the built-in Sidera dashboard.
 Path to the dashboard management sidecar. It stores dashboard-owned server
 profiles, credentials, quotas, expiry times, and traffic counters. The file is
 written atomically with mode `0600`; its parent directory is created with mode
-`0700`.
+`0700`. It also stores cryptographically random subscription tokens keyed by
+the exact user name.
 
 `sidera-dashboard.json` in the working directory is used by default.
 
@@ -117,6 +119,18 @@ For an Xray/x-ui configuration loaded from `config.json`, an optional native
 bootstrap file named `config.json.sidera.json` may contain only the Sidera API
 service. This keeps the dashboard configuration independent from files x-ui
 regenerates. Dashboard-owned server profiles are then loaded from `data_path`.
+
+##### public_base_url
+
+Public HTTPS origin used for user subscription links, for example
+`https://panel.example.com`. It must not contain an explicit port, path, query,
+userinfo, or fragment. When configured, unauthenticated `GET` and `HEAD`
+requests to `/sub/{token}` return a no-store, padded Base64 URI list.
+
+Subscriptions group active users with the same exact name across applied
+dashboard server profiles. They currently include VLESS with Reality,
+Hysteria2, and TUIC profiles that have complete advertise metadata. Reality
+public keys are derived from private keys and private keys are never emitted.
 
 ##### http_client
 

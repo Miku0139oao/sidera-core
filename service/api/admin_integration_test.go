@@ -240,7 +240,7 @@ func TestAuthoritativeProfilePersistenceScrubsBootstrapUsers(t *testing.T) {
 func TestValidationAdminDoesNotWriteStore(t *testing.T) {
 	dataPath := filepath.Join(t.TempDir(), "dashboard.json")
 	ctx := ContextWithValidation(context.Background())
-	a, err := newAdminAPI(ctx, nil, "", dataPath, nil, false)
+	a, err := newAdminAPI(ctx, nil, "", dataPath, "", nil, false)
 	require.NoError(t, err)
 	a.close()
 	_, err = os.Stat(dataPath)
@@ -361,7 +361,7 @@ func newAdminTestAPI(t *testing.T, managed *adminTestManagedService, dashboardOw
 		serverRevisions: make(map[string]int64),
 		userAliases:     make(map[string]adminManagedUserIdentity),
 		store: adminStore{
-			Version: adminStoreVersion, Inbounds: make(map[string]*adminInboundStore), Servers: make(map[string]*adminServerStore),
+			Version: adminStoreVersion, Inbounds: make(map[string]*adminInboundStore), Servers: make(map[string]*adminServerStore), Subscriptions: make(map[string]string),
 		},
 	}
 	runtimeInbound := adminInboundRuntime{

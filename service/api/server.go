@@ -72,7 +72,7 @@ func NewService(ctx context.Context, logger log.ContextLogger, tag string, optio
 	}
 	if options.Dashboard != nil && options.Dashboard.Enabled {
 		s.dashboard = newDashboard(ctx, logger, *options.Dashboard)
-		admin, err := newAdminAPI(ctx, logger, options.Secret, options.Dashboard.DataPath, options.Dashboard.AppliedServerRevisions, options.Dashboard.ProcessSignalReload)
+		admin, err := newAdminAPI(ctx, logger, options.Secret, options.Dashboard.DataPath, options.Dashboard.PublicBaseURL, options.Dashboard.AppliedServerRevisions, options.Dashboard.ProcessSignalReload)
 		if err != nil {
 			cancel()
 			return nil, E.Cause(err, "initialize dashboard management")
@@ -88,6 +88,9 @@ func validateDashboardExposure(options option.APIServiceOptions) error {
 	}
 	if strings.TrimSpace(options.Secret) == "" {
 		return E.New("dashboard API requires a secret")
+	}
+	if err := validateSubscriptionBaseURL(options.Dashboard.PublicBaseURL); err != nil {
+		return err
 	}
 	listenAddress := options.Listen.Build(netip.AddrFrom4([4]byte{127, 0, 0, 1}))
 	if listenAddress.IsLoopback() {

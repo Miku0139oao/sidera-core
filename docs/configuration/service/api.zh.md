@@ -29,6 +29,7 @@ Sidera API 服务提供 gRPC 远程控制、内置 Material 3 管理界面、节
     "path": "",
     "download_url": "",
     "data_path": "sidera-dashboard.json",
+    "public_base_url": "https://panel.example.com",
     "http_client": "", // 或 {}
     "update_interval": ""
   },
@@ -90,11 +91,17 @@ API 密钥。
 
 ##### data_path
 
-管理数据 sidecar 路径，保存由面板建立的 Server 配置、凭证、额度、到期时间与流量统计。文件以 `0600` 权限原子写入，父目录使用 `0700`。
+管理数据 sidecar 路径，保存由面板建立的 Server 配置、凭证、额度、到期时间、流量统计，以及按精确用户名索引的加密安全随机订阅 Token。文件以 `0600` 权限原子写入，父目录使用 `0700`。
 
 默认使用工作目录下的 `sidera-dashboard.json`。
 
 当 Xray/x-ui 从 `config.json` 启动时，可额外建立原生 `config.json.sidera.json`，其中仅配置 Sidera API 服务。这样 x-ui 重新生成主配置时不会移除管理界面；面板节点则从 `data_path` 载入。
+
+##### public_base_url
+
+用于用户订阅链接的公开 HTTPS origin，例如 `https://panel.example.com`。不得包含显式端口、路径、查询参数、用户信息或 fragment。配置后，未经认证的 `GET` 与 `HEAD /sub/{token}` 会返回禁止缓存、使用标准填充 Base64 编码的 URI 列表。
+
+订阅会按完全相同的用户名合并已套用面板节点中的有效用户。目前支持具有完整公开连接信息的 VLESS + Reality、Hysteria2 与 TUIC。Reality 公钥由私钥推导，私钥绝不会输出。
 
 ##### http_client
 
