@@ -199,6 +199,52 @@ func TestDecodeXrayRoutingCompatibility(t *testing.T) {
 	})
 }
 
+func TestDecodeXrayWireGuardOutboundAsEndpoint(t *testing.T) {
+	options := decodeXrayTestConfig(t, `{
+		"outbounds": [{
+			"protocol": "wireguard",
+			"tag": "warp-discord",
+			"settings": {
+				"secretKey": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+				"address": ["172.16.0.2/32", "2606:4700:110:8765::2/128"],
+				"peers": [{
+					"publicKey": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=",
+					"allowedIPs": ["0.0.0.0/0", "::/0"],
+					"endpoint": "engage.cloudflareclient.com:2408",
+					"keepAlive": 25
+				}],
+				"reserved": [1, 2, 3],
+				"noKernelTun": true,
+				"mtu": 1280,
+				"domainStrategy": "ForceIP"
+			}
+		}]
+	}`)
+	require.Empty(t, options.Outbounds)
+	require.Len(t, options.Endpoints, 1)
+	require.Equal(t, "warp-discord", options.Endpoints[0].Tag)
+	wireGuard := options.Endpoints[0].Options.(*option.WireGuardEndpointOptions)
+	require.EqualValues(t, 1280, wireGuard.MTU)
+	require.Len(t, wireGuard.Peers, 1)
+	require.Equal(t, "engage.cloudflareclient.com", wireGuard.Peers[0].Address)
+	require.EqualValues(t, 2408, wireGuard.Peers[0].Port)
+	require.Equal(t, []uint8{1, 2, 3}, wireGuard.Peers[0].Reserved)
+}
+
+func TestDecodeXrayWireGuardRequiresUserspaceMode(t *testing.T) {
+	requireXrayTestError(t, `{
+		"outbounds": [{
+			"protocol": "wireguard",
+			"tag": "warp",
+			"settings": {
+				"secretKey": "secret",
+				"address": ["172.16.0.2/32"],
+				"peers": [{"publicKey": "public", "allowedIPs": ["0.0.0.0/0"], "endpoint": "127.0.0.1:2408"}]
+			}
+		}]
+	}`, "kernel TUN mode is not supported")
+}
+
 func TestDecodeXrayTransportCompatibility(t *testing.T) {
 	for _, field := range []string{"network", "method"} {
 		t.Run("empty "+field, func(t *testing.T) {

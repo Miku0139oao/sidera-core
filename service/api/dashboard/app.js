@@ -1180,7 +1180,7 @@
         <div class="page-heading">
           <div>
             <h2>用戶管理</h2>
-            <p>依每個入站的能力安全建立憑證、額度與到期規則。</p>
+            <p>按名稱聚合邏輯用戶，集中管理跨節點憑證、額度與到期規則。</p>
           </div>
           <div class="page-actions">
             <button class="icon-button ${state.loading.users ? "spin" : ""}" type="button" data-action="refresh-users" aria-label="刷新用戶" title="刷新用戶" ${state.loading.users ? "disabled" : ""}>${icon("refresh")}</button>
@@ -1235,14 +1235,39 @@
     return { key: "valid", label: "有效", className: "success" };
   }
 
+  function logicalUserGroups() {
+    const groups = new Map();
+    state.users.forEach((user) => {
+      let group = groups.get(user.name);
+      if (!group) {
+        group = { name: user.name, memberships: [], upload_bytes: 0, download_bytes: 0, active_connections: 0 };
+        groups.set(user.name, group);
+      }
+      group.memberships.push(user);
+      group.upload_bytes += asNumber(user.upload_bytes);
+      group.download_bytes += asNumber(user.download_bytes);
+      group.active_connections += asNumber(user.active_connections);
+    });
+    return [...groups.values()].sort((left, right) => left.name.localeCompare(right.name, "zh-Hant"));
+  }
+
+  function getUserGroupStatus(group) {
+    const statuses = group.memberships.map(getUserStatus);
+    return statuses.find((status) => status.key === "disabled")
+      || statuses.find((status) => status.key === "expired")
+      || statuses.find((status) => status.key === "exhausted")
+      || statuses[0]
+      || { key: "disabled", label: "無節點", className: "" };
+  }
+
   function filteredUsers() {
     const query = state.filters.userSearch.trim().toLocaleLowerCase("zh-Hant");
-    return state.users.filter((user) => {
-      if (state.filters.userInbound && user.inbound !== state.filters.userInbound) return false;
-      const status = getUserStatus(user);
+    return logicalUserGroups().filter((group) => {
+      if (state.filters.userInbound && !group.memberships.some((user) => user.inbound === state.filters.userInbound)) return false;
+      const status = getUserGroupStatus(group);
       if (state.filters.userStatus !== "all" && status.key !== state.filters.userStatus) return false;
       if (!query) return true;
-      const haystack = [user.name, user.inbound, user.type].map((value) => String(value || "").toLocaleLowerCase("zh-Hant")).join("\n");
+      const haystack = [group.name, ...group.memberships.flatMap((user) => [user.inbound, user.type])].map((value) => String(value || "").toLocaleLowerCase("zh-Hant")).join("\n");
       return haystack.includes(query);
     });
   }
@@ -1252,8 +1277,9 @@
     if (!container) return;
     const focusKey = focusedActionKey(container);
     const users = filteredUsers();
+    const allGroups = logicalUserGroups();
     const count = document.getElementById("user-result-count");
-    if (count) count.textContent = `顯示 ${integerFormat.format(users.length)} / ${integerFormat.format(state.users.length)} 位`;
+    if (count) count.textContent = `顯示 ${integerFormat.format(users.length)} / ${integerFormat.format(allGroups.length)} 位`;
     container.setAttribute("aria-busy", state.loading.users ? "true" : "false");
 
     if (!users.length) {
@@ -1311,48 +1337,59 @@
       </div>`;
   }
 
-  function renderUserRow(user) {
-    const status = getUserStatus(user);
-    const id = escapeHTML(user.id);
-    const name = escapeHTML(user.name || "未命名");
+  function renderGroupQuota(group) {
+    const trafficMembers = group.memberships.filter((user) => inboundFor(user.inbound)?.traffic !== false);
+    if (!trafficMembers.length) return '<span class="cell-secondary">節點未提供個別流量統計</span>';
+    const used = trafficMembers.reduce((total, user) => total + asNumber(user.upload_bytes) + asNumber(user.download_bytes), 0);
+    const limited = trafficMembers.filter((user) => asNumber(user.quota_bytes) > 0);
+    return `<span class="cell-primary">${escapeHTML(formatBytes(used))}</span><span class="cell-secondary">${limited.length ? `${limited.length} 個節點設有額度` : "所有節點不限額"}</span>`;
+  }
+
+  function renderUserRow(group) {
+    const status = getUserGroupStatus(group);
+    const rawName = group.name || "未命名";
+    const name = escapeHTML(rawName);
+    const encodedName = escapeHTML(rawName);
+    const createdAt = Math.min(...group.memberships.map((user) => Number(user.created_at) || Date.now()));
     return `
       <tr>
-        <td><span class="cell-primary">${name}</span><span class="cell-secondary">建立於 ${escapeHTML(formatTime(user.created_at))}</span></td>
-        <td><span class="cell-primary">${escapeHTML(user.inbound)}</span><span class="cell-secondary">${escapeHTML(user.type)}</span></td>
+        <td><span class="cell-primary">${name}</span><span class="cell-secondary">建立於 ${escapeHTML(formatTime(createdAt))}</span></td>
+        <td><span class="cell-primary">${escapeHTML(formatInteger(group.memberships.length))} 個節點</span><span class="cell-secondary user-node-list">${group.memberships.map((user) => escapeHTML(user.inbound)).join(" · ")}</span></td>
         <td><span class="status-badge ${status.className}">${status.label}</span></td>
-        <td>${renderQuota(user)}</td>
-        <td><span class="cell-primary">${escapeHTML(formatInteger(user.active_connections))} 條</span><span class="cell-secondary">${escapeHTML(formatTime(user.expires_at))}</span></td>
+        <td>${renderGroupQuota(group)}</td>
+        <td><span class="cell-primary">${escapeHTML(formatInteger(group.active_connections))} 條</span><span class="cell-secondary">跨 ${escapeHTML(formatInteger(group.memberships.length))} 個節點</span></td>
         <td>
           <div class="table-actions">
-            <button class="icon-button small" type="button" data-action="edit-user" data-id="${id}" aria-label="編輯 ${name}" title="編輯">${icon("edit")}</button>
-            ${inboundFor(user.inbound)?.traffic === false ? "" : `<button class="icon-button small" type="button" data-action="reset-user-traffic" data-id="${id}" aria-label="將 ${name} 的流量歸零" title="流量歸零">${icon("reset")}</button>`}
-            <button class="icon-button small" type="button" data-action="delete-user" data-id="${id}" aria-label="刪除 ${name}" title="刪除">${icon("trash")}</button>
+            <button class="icon-button small" type="button" data-action="edit-user" data-name="${encodedName}" aria-label="編輯 ${name}" title="編輯">${icon("edit")}</button>
+            ${group.memberships.some((user) => inboundFor(user.inbound)?.traffic !== false) ? `<button class="icon-button small" type="button" data-action="reset-user-traffic" data-name="${encodedName}" aria-label="將 ${name} 的流量歸零" title="流量歸零">${icon("reset")}</button>` : ""}
+            <button class="icon-button small" type="button" data-action="delete-user" data-name="${encodedName}" aria-label="刪除 ${name}" title="刪除">${icon("trash")}</button>
           </div>
         </td>
       </tr>`;
   }
 
-  function renderUserCard(user) {
-    const status = getUserStatus(user);
-    const id = escapeHTML(user.id);
-    const name = escapeHTML(user.name || "未命名");
+  function renderUserCard(group) {
+    const status = getUserGroupStatus(group);
+    const rawName = group.name || "未命名";
+    const name = escapeHTML(rawName);
+    const encodedName = escapeHTML(rawName);
     return `
       <article class="card mobile-data-card">
         <div class="mobile-card-heading">
-          <div><h3>${name}</h3><p>${escapeHTML(user.inbound)} · ${escapeHTML(user.type)}</p></div>
+          <div><h3>${name}</h3><p>${group.memberships.map((user) => escapeHTML(user.inbound)).join(" · ")}</p></div>
           <span class="status-badge ${status.className}">${status.label}</span>
         </div>
         <dl class="mobile-detail-grid">
-          <div class="detail-item"><dt>活躍連線</dt><dd>${escapeHTML(formatInteger(user.active_connections))} 條</dd></div>
-          <div class="detail-item"><dt>到期時間</dt><dd>${escapeHTML(formatTime(user.expires_at))}</dd></div>
-          <div class="detail-item"><dt>上行</dt><dd>${escapeHTML(formatBytes(user.upload_bytes))}</dd></div>
-          <div class="detail-item"><dt>下行</dt><dd>${escapeHTML(formatBytes(user.download_bytes))}</dd></div>
+          <div class="detail-item"><dt>節點</dt><dd>${escapeHTML(formatInteger(group.memberships.length))} 個</dd></div>
+          <div class="detail-item"><dt>活躍連線</dt><dd>${escapeHTML(formatInteger(group.active_connections))} 條</dd></div>
+          <div class="detail-item"><dt>上行</dt><dd>${escapeHTML(formatBytes(group.upload_bytes))}</dd></div>
+          <div class="detail-item"><dt>下行</dt><dd>${escapeHTML(formatBytes(group.download_bytes))}</dd></div>
         </dl>
-        <div class="mobile-card-quota">${renderQuota(user)}</div>
+        <div class="mobile-card-quota">${renderGroupQuota(group)}</div>
         <div class="mobile-card-actions">
-          ${inboundFor(user.inbound)?.traffic === false ? "" : `<button class="button button-quiet" type="button" data-action="reset-user-traffic" data-id="${id}">${icon("reset")}歸零</button>`}
-          <button class="button button-quiet" type="button" data-action="edit-user" data-id="${id}">${icon("edit")}編輯</button>
-          <button class="icon-button small" type="button" data-action="delete-user" data-id="${id}" aria-label="刪除 ${name}">${icon("trash")}</button>
+          ${group.memberships.some((user) => inboundFor(user.inbound)?.traffic !== false) ? `<button class="button button-quiet" type="button" data-action="reset-user-traffic" data-name="${encodedName}">${icon("reset")}歸零</button>` : ""}
+          <button class="button button-quiet" type="button" data-action="edit-user" data-name="${encodedName}">${icon("edit")}編輯</button>
+          <button class="icon-button small" type="button" data-action="delete-user" data-name="${encodedName}" aria-label="刪除 ${name}">${icon("trash")}</button>
         </div>
       </article>`;
   }
@@ -1461,7 +1498,7 @@
   function focusedActionKey(container) {
     const active = document.activeElement;
     if (!active || !container.contains(active) || !active.dataset.action) return null;
-    return { action: active.dataset.action, id: active.dataset.id || "" };
+    return { action: active.dataset.action, id: active.dataset.id || "", name: active.dataset.name || "" };
   }
 
   function restoreActionFocus(container, key) {
@@ -1469,6 +1506,7 @@
     const match = [...container.querySelectorAll("[data-action]")].find((element) => (
       element.dataset.action === key.action
       && (element.dataset.id || "") === key.id
+      && (element.dataset.name || "") === key.name
       && element.getClientRects().length > 0
     ));
     match?.focus();
@@ -1551,18 +1589,7 @@
     return window.btoa(binary);
   }
 
-  function openUserDialog(user = null) {
-    state.detailRequest += 1;
-    const managed = managedInbounds();
-    if (!user && !managed.length) {
-      showToast("目前沒有支援動態用戶管理的入站", "error");
-      return;
-    }
-    const inbound = user ? inboundFor(user.inbound) : inboundFor(state.filters.userInbound) || managed[0];
-    if (!inbound) {
-      showToast("找不到此用戶的入站 schema", "error");
-      return;
-    }
+  function newMembershipDraft(inbound, user = null) {
     let uuid = user?.uuid || "";
     let password = user?.password || "";
     if (!user && (inbound.credential === "uuid" || inbound.credential === "uuid_password")) {
@@ -1571,44 +1598,61 @@
     if (!user && (inbound.credential === "password" || inbound.credential === "uuid_password")) {
       try { password = securePasswordForInbound(inbound); } catch (_) { password = ""; }
     }
+    return {
+      id: user?.id || "",
+      inbound: inbound.tag,
+      uuid,
+      password,
+      flow: user?.flow || "",
+      alter_id: Number(user?.alter_id) || 0,
+      enabled: user ? Boolean(user.enabled) : true,
+      quota_gb: toQuotaGB(user?.quota_bytes),
+      max_ips: Number(user?.max_ips) || 0,
+      expires_at: toDateTimeLocal(user?.expires_at),
+      passwordVisible: false,
+    };
+  }
+
+  function openUserDialog(group = null) {
+    state.detailRequest += 1;
+    const managed = managedInbounds();
+    if (!group && !managed.length) {
+      showToast("目前沒有支援動態用戶管理的入站", "error");
+      return;
+    }
+    const memberships = group
+      ? group.memberships.map((user) => newMembershipDraft(inboundFor(user.inbound), user))
+      : [newMembershipDraft(inboundFor(state.filters.userInbound) || managed[0])];
     state.dialog = {
       type: "user",
-      user,
-      inbound,
-      passwordVisible: false,
+      group,
       submitting: false,
       draft: {
-        inbound: inbound.tag,
-        name: user?.name || "",
-        uuid,
-        password,
-        flow: user?.flow || "",
-        alter_id: Number(user?.alter_id) || 0,
-        enabled: user ? Boolean(user.enabled) : true,
-        quota_gb: toQuotaGB(user?.quota_bytes),
-        expires_at: toDateTimeLocal(user?.expires_at),
+        name: group?.name || "",
+        memberships,
       },
     };
     renderUserDialog();
     const dialog = document.getElementById("app-dialog");
     if (dialog && !dialog.open) dialog.showModal();
-    window.setTimeout(() => document.getElementById(user ? "user-name" : "user-inbound")?.focus(), 0);
+    window.setTimeout(() => document.getElementById("user-name")?.focus(), 0);
   }
 
   function renderUserDialog() {
     const dialog = document.getElementById("app-dialog");
     const model = state.dialog;
     if (!dialog || model?.type !== "user") return;
-    const editing = Boolean(model.user);
-    const inbound = model.inbound;
+    const editing = Boolean(model.group);
     const draft = model.draft;
-    dialog.className = "app-dialog";
+    const selected = new Set(draft.memberships.map((membership) => membership.inbound));
+    const available = managedInbounds().filter((inbound) => !selected.has(inbound.tag));
+    dialog.className = "app-dialog user-dialog";
     dialog.setAttribute("aria-labelledby", "user-dialog-title");
     dialog.removeAttribute("aria-describedby");
     dialog.innerHTML = `
       <form class="dialog-form" data-form="user" novalidate>
         <header class="dialog-header">
-          <div><h2 id="user-dialog-title">${editing ? "編輯用戶" : "新增用戶"}</h2><p>${editing ? "更新憑證、狀態與使用限制。" : "依入站能力建立新的存取身分。"}</p></div>
+          <div><h2 id="user-dialog-title">${editing ? "編輯邏輯用戶" : "新增邏輯用戶"}</h2><p>在同一處管理此名稱於所有節點的憑證與限制。</p></div>
           <button class="icon-button" type="button" data-action="dialog-cancel" aria-label="關閉對話框">${icon("close")}</button>
         </header>
         <fieldset class="dialog-fieldset" ${model.submitting ? "disabled" : ""}>
@@ -1616,65 +1660,19 @@
             <div class="form-error" id="form-error" role="alert" hidden></div>
             <div class="form-grid">
               <div class="form-field full">
-                <label for="user-inbound">入站 <span class="required-mark" aria-hidden="true">*</span></label>
-                <select class="form-select" id="user-inbound" name="inbound" aria-describedby="inbound-error" ${editing ? "disabled" : ""}>
-                  ${managedInbounds().map((item) => `<option value="${escapeHTML(item.tag)}" ${item.tag === inbound.tag ? "selected" : ""}>${escapeHTML(item.tag)} · ${escapeHTML(item.type)}</option>`).join("")}
-                </select>
-                <span class="supporting-text field-message" id="inbound-error" data-help="${editing ? "建立後不可變更所屬入站。" : "只能選擇支援動態用戶管理的入站。"}">${editing ? "建立後不可變更所屬入站。" : "只能選擇支援動態用戶管理的入站。"}</span>
-              </div>
-
-              <div class="form-field full">
                 <label for="user-name">用戶名稱 <span class="required-mark" aria-hidden="true">*</span></label>
                 <input class="text-input" id="user-name" name="name" value="${escapeHTML(draft.name)}" maxlength="128" autocomplete="off" aria-describedby="name-error">
                 <span class="supporting-text field-message" id="name-error" data-help="用於識別流量與連線，最多 128 個字元。">用於識別流量與連線，最多 128 個字元。</span>
               </div>
+              <div class="dialog-section-heading full"><div><h3>節點 membership</h3><p>每個節點保有自己的協議憑證與使用限制。</p></div><span class="chip primary">${escapeHTML(formatInteger(draft.memberships.length))} 個節點</span></div>
+              <div class="user-memberships full">${draft.memberships.map(renderUserMembership).join("")}</div>
+              ${available.length ? `<div class="add-membership full"><select class="form-select" id="add-user-inbound" aria-label="選擇要新增的節點">${available.map((inbound) => `<option value="${escapeHTML(inbound.tag)}">${escapeHTML(inbound.tag)} · ${escapeHTML(inbound.type)}</option>`).join("")}</select><button class="button button-tonal" type="button" data-action="add-user-membership">${icon("plus")}加入節點</button></div>` : ""}
 
-              ${credentialFields(inbound, draft, model.passwordVisible)}
-
-              ${inbound.flow ? `
-                <div class="form-field full">
-                  <label for="user-flow">Flow</label>
-                  <input class="text-input" id="user-flow" name="flow" value="${escapeHTML(draft.flow)}" autocomplete="off" spellcheck="false" aria-describedby="flow-error">
-                  <span class="supporting-text field-message" id="flow-error" data-help="留空表示不指定 Flow。">留空表示不指定 Flow。</span>
-                </div>` : ""}
-
-              ${inbound.alter_id ? `
-                <div class="form-field">
-                  <label for="user-alter-id">Alter ID</label>
-                  <input class="text-input" id="user-alter-id" name="alter_id" type="number" value="${escapeHTML(draft.alter_id)}" min="0" max="2147483647" step="1" inputmode="numeric" aria-describedby="alter_id-error">
-                  <span class="supporting-text field-message" id="alter_id-error" data-help="必須是 0 或正整數。">必須是 0 或正整數。</span>
-                </div>` : ""}
-
-              ${inbound.traffic === false ? '<div class="schema-note">此協議目前只支援憑證、啟用狀態與到期管理，不提供個別流量額度。</div>' : `<div class="form-field">
-                <label for="user-quota">流量額度（GB）</label>
-                <input class="text-input" id="user-quota" name="quota_gb" type="number" value="${escapeHTML(draft.quota_gb)}" min="0" step="0.01" inputmode="decimal" placeholder="0" aria-describedby="quota_gb-error">
-                <span class="supporting-text field-message" id="quota_gb-error" data-help="0 或留空表示不限額。">0 或留空表示不限額。</span>
-              </div>`}
-
-              <div class="form-field full">
-                <label for="user-expires">到期時間</label>
-                <input class="text-input" id="user-expires" name="expires_at" type="datetime-local" value="${escapeHTML(draft.expires_at)}" aria-describedby="expires_at-error">
-                <span class="supporting-text field-message" id="expires_at-error" data-help="留空表示永不到期，時間依目前裝置時區。">留空表示永不到期，時間依目前裝置時區。</span>
-              </div>
-
-              <div class="form-field full">
-                <div class="switch-row">
-                  <span class="switch-copy"><strong>啟用用戶</strong><span>停用後 Core 將拒絕此用戶的新連線。</span></span>
-                  <label class="switch-control">
-                    <span class="sr-only">啟用用戶</span>
-                    <input name="enabled" type="checkbox" role="switch" ${draft.enabled ? "checked" : ""}>
-                    <span class="switch-track"></span>
-                  </label>
-                </div>
-              </div>
-
-              <div class="schema-note">${icon("server")}<span><strong>${escapeHTML(inbound.tag)}</strong>（${escapeHTML(inbound.type)}）需要 ${escapeHTML(credentialLabel(inbound.credential))}${inbound.flow ? "、支援 Flow" : ""}${inbound.alter_id ? "、支援 Alter ID" : ""}。</span></div>
-
-              ${editing && model.user.subscription_url ? `
+              ${editing && model.group.subscription_url ? `
                 <div class="form-field full subscription-field">
                   <label for="user-subscription-url">訂閱連結</label>
                   <div class="input-with-actions">
-                    <input class="text-input mono" id="user-subscription-url" type="password" value="${escapeHTML(model.user.subscription_url)}" readonly spellcheck="false">
+                    <input class="text-input mono" id="user-subscription-url" type="password" value="${escapeHTML(model.group.subscription_url)}" readonly spellcheck="false">
                     <div class="input-actions">
                       <button class="icon-button small" type="button" data-action="toggle-subscription-url" aria-label="顯示訂閱連結" title="顯示訂閱連結">${icon("eye")}</button>
                       <button class="icon-button small" type="button" data-action="copy-subscription-url" aria-label="複製訂閱連結" title="複製訂閱連結">${icon("copy")}</button>
@@ -1692,30 +1690,49 @@
       </form>`;
   }
 
-  function credentialFields(inbound, draft, passwordVisible) {
+  function renderUserMembership(draft, index) {
+    const inbound = inboundFor(draft.inbound);
+    if (!inbound) return "";
+    const suffix = String(index);
+    return `<section class="membership-card" data-membership-index="${suffix}">
+      <div class="membership-heading"><div><strong>${escapeHTML(inbound.tag)}</strong><span>${escapeHTML(inbound.type)} · ${escapeHTML(credentialLabel(inbound.credential))}</span></div><button class="icon-button small" type="button" data-action="remove-user-membership" data-index="${suffix}" aria-label="移除 ${escapeHTML(inbound.tag)}" ${state.dialog.draft.memberships.length === 1 ? "disabled" : ""}>${icon("trash")}</button></div>
+      <input type="hidden" name="id_${suffix}" value="${escapeHTML(draft.id)}"><input type="hidden" name="inbound_${suffix}" value="${escapeHTML(inbound.tag)}">
+      <div class="form-grid membership-fields">
+        ${credentialFields(inbound, draft, suffix)}
+        ${inbound.flow ? `<div class="form-field full"><label for="flow_${suffix}">Flow</label><input class="text-input" id="flow_${suffix}" name="flow_${suffix}" value="${escapeHTML(draft.flow)}" autocomplete="off" spellcheck="false" aria-describedby="flow_${suffix}-error"><span class="supporting-text field-message" id="flow_${suffix}-error" data-help="留空表示不指定 Flow。">留空表示不指定 Flow。</span></div>` : ""}
+        ${inbound.alter_id ? `<div class="form-field"><label for="alter_id_${suffix}">Alter ID</label><input class="text-input" id="alter_id_${suffix}" name="alter_id_${suffix}" type="number" value="${escapeHTML(draft.alter_id)}" min="0" max="2147483647" step="1" inputmode="numeric" aria-describedby="alter_id_${suffix}-error"><span class="supporting-text field-message" id="alter_id_${suffix}-error" data-help="必須是 0 或正整數。">必須是 0 或正整數。</span></div>` : ""}
+        ${inbound.traffic === false ? '<div class="schema-note">此協議不提供個別流量額度。</div>' : `<div class="form-field"><label for="quota_gb_${suffix}">流量額度（GB）</label><input class="text-input" id="quota_gb_${suffix}" name="quota_gb_${suffix}" type="number" value="${escapeHTML(draft.quota_gb)}" min="0" step="0.01" inputmode="decimal" placeholder="0" aria-describedby="quota_gb_${suffix}-error"><span class="supporting-text field-message" id="quota_gb_${suffix}-error" data-help="0 或留空表示不限額。">0 或留空表示不限額。</span></div>`}
+        <div class="form-field"><label for="expires_at_${suffix}">到期時間</label><input class="text-input" id="expires_at_${suffix}" name="expires_at_${suffix}" type="datetime-local" value="${escapeHTML(draft.expires_at)}" aria-describedby="expires_at_${suffix}-error"><span class="supporting-text field-message" id="expires_at_${suffix}-error" data-help="留空表示永不到期。">留空表示永不到期。</span></div>
+        <div class="form-field"><label for="max_ips_${suffix}">來源 IP 上限</label><input class="text-input" id="max_ips_${suffix}" name="max_ips_${suffix}" type="number" value="${escapeHTML(draft.max_ips)}" min="0" max="65535" step="1" inputmode="numeric" aria-describedby="max_ips_${suffix}-error"><span class="supporting-text field-message" id="max_ips_${suffix}-error" data-help="0 表示不限。">0 表示不限。</span></div>
+        <div class="form-field full"><div class="switch-row"><span class="switch-copy"><strong>啟用此節點</strong><span>停用後拒絕此 membership 的新連線。</span></span><label class="switch-control"><span class="sr-only">啟用此節點</span><input name="enabled_${suffix}" type="checkbox" role="switch" ${draft.enabled ? "checked" : ""}><span class="switch-track"></span></label></div></div>
+      </div>
+    </section>`;
+  }
+
+  function credentialFields(inbound, draft, suffix) {
     const needsUUID = inbound.credential === "uuid" || inbound.credential === "uuid_password";
     const needsPassword = inbound.credential === "password" || inbound.credential === "uuid_password";
     return `
       ${needsUUID ? `
         <div class="form-field full">
-          <label for="user-uuid">UUID <span class="required-mark" aria-hidden="true">*</span></label>
+          <label for="uuid_${suffix}">UUID <span class="required-mark" aria-hidden="true">*</span></label>
           <div class="input-with-actions">
-            <input class="text-input mono" id="user-uuid" name="uuid" value="${escapeHTML(draft.uuid)}" autocomplete="off" spellcheck="false" aria-describedby="uuid-error">
-            <div class="input-actions"><button class="icon-button small" type="button" data-action="generate-uuid" aria-label="產生安全 UUID" title="產生 UUID">${icon("wand")}</button></div>
+            <input class="text-input mono" id="uuid_${suffix}" name="uuid_${suffix}" value="${escapeHTML(draft.uuid)}" autocomplete="off" spellcheck="false" aria-describedby="uuid_${suffix}-error">
+            <div class="input-actions"><button class="icon-button small" type="button" data-action="generate-uuid" data-index="${suffix}" aria-label="產生安全 UUID" title="產生 UUID">${icon("wand")}</button></div>
           </div>
-          <span class="supporting-text field-message" id="uuid-error" data-help="使用 crypto.randomUUID 產生或輸入有效 UUID。">使用 crypto.randomUUID 產生或輸入有效 UUID。</span>
+          <span class="supporting-text field-message" id="uuid_${suffix}-error" data-help="使用 crypto.randomUUID 產生或輸入有效 UUID。">使用 crypto.randomUUID 產生或輸入有效 UUID。</span>
         </div>` : ""}
       ${needsPassword ? `
         <div class="form-field full">
-          <label for="user-password">密碼 <span class="required-mark" aria-hidden="true">*</span></label>
+          <label for="password_${suffix}">密碼 <span class="required-mark" aria-hidden="true">*</span></label>
           <div class="input-with-actions">
-            <input class="text-input mono" id="user-password" name="password" type="${passwordVisible ? "text" : "password"}" value="${escapeHTML(draft.password)}" maxlength="1024" autocomplete="new-password" spellcheck="false" aria-describedby="password-error">
+            <input class="text-input mono" id="password_${suffix}" name="password_${suffix}" type="${draft.passwordVisible ? "text" : "password"}" value="${escapeHTML(draft.password)}" maxlength="1024" autocomplete="new-password" spellcheck="false" aria-describedby="password_${suffix}-error">
             <div class="input-actions">
-              <button class="icon-button small" type="button" data-action="toggle-user-password" aria-label="${passwordVisible ? "隱藏" : "顯示"}密碼" title="${passwordVisible ? "隱藏" : "顯示"}密碼">${icon(passwordVisible ? "eyeOff" : "eye")}</button>
-              <button class="icon-button small" type="button" data-action="generate-password" aria-label="產生安全隨機密碼" title="產生密碼">${icon("wand")}</button>
+              <button class="icon-button small" type="button" data-action="toggle-user-password" data-index="${suffix}" aria-label="${draft.passwordVisible ? "隱藏" : "顯示"}密碼" title="${draft.passwordVisible ? "隱藏" : "顯示"}密碼">${icon(draft.passwordVisible ? "eyeOff" : "eye")}</button>
+              <button class="icon-button small" type="button" data-action="generate-password" data-index="${suffix}" aria-label="產生安全隨機密碼" title="產生密碼">${icon("wand")}</button>
             </div>
           </div>
-          <span class="supporting-text field-message" id="password-error" data-help="${inbound.password_encoding === "base64" ? `此協議需要 ${escapeHTML(inbound.password_bytes)} bytes 標準 Base64 金鑰。` : "可使用安全亂數產生 24 字元密碼。"}">${inbound.password_encoding === "base64" ? `此協議需要 ${escapeHTML(inbound.password_bytes)} bytes 標準 Base64 金鑰。` : "可使用安全亂數產生 24 字元密碼。"}</span>
+          <span class="supporting-text field-message" id="password_${suffix}-error" data-help="${inbound.password_encoding === "base64" ? `此協議需要 ${escapeHTML(inbound.password_bytes)} bytes 標準 Base64 金鑰。` : "可使用安全亂數產生 24 字元密碼。"}">${inbound.password_encoding === "base64" ? `此協議需要 ${escapeHTML(inbound.password_bytes)} bytes 標準 Base64 金鑰。` : "可使用安全亂數產生 24 字元密碼。"}</span>
         </div>` : ""}`;
   }
 
@@ -1992,77 +2009,96 @@
 
   function captureUserDraft(form) {
     const value = (name) => form.elements.namedItem(name)?.value || "";
+    const memberships = state.dialog.draft.memberships.map((membership, index) => ({
+      id: membership.id,
+      inbound: membership.inbound,
+      uuid: value(`uuid_${index}`),
+      password: value(`password_${index}`),
+      flow: value(`flow_${index}`),
+      alter_id: value(`alter_id_${index}`),
+      enabled: Boolean(form.elements.namedItem(`enabled_${index}`)?.checked),
+      quota_gb: value(`quota_gb_${index}`),
+      max_ips: value(`max_ips_${index}`),
+      expires_at: value(`expires_at_${index}`),
+      passwordVisible: membership.passwordVisible,
+    }));
     return {
-      inbound: value("inbound") || state.dialog?.inbound?.tag || "",
       name: value("name"),
-      uuid: value("uuid"),
-      password: value("password"),
-      flow: value("flow"),
-      alter_id: value("alter_id"),
-      enabled: Boolean(form.elements.namedItem("enabled")?.checked),
-      quota_gb: value("quota_gb"),
-      expires_at: value("expires_at"),
+      memberships,
     };
   }
 
   function validateUserForm(form) {
-    const inbound = state.dialog.inbound;
     const draft = captureUserDraft(form);
+    state.dialog.draft = draft;
     const errors = {};
     const name = draft.name.trim();
     if (!name) errors.name = "請輸入用戶名稱。";
     else if (name.length > 128) errors.name = "用戶名稱不可超過 128 個字元。";
-
-    const needsUUID = inbound.credential === "uuid" || inbound.credential === "uuid_password";
-    const needsPassword = inbound.credential === "password" || inbound.credential === "uuid_password";
     const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-    if (needsUUID && !uuidPattern.test(draft.uuid.trim())) errors.uuid = "請輸入有效的 UUID 格式。";
-    if (needsPassword && !draft.password) errors.password = "密碼不能留空。";
-    else if (needsPassword && draft.password.length > 1024) errors.password = "密碼不可超過 1024 個字元。";
-    else if (needsPassword && inbound.password_encoding === "base64" && Number(inbound.password_bytes) > 0) {
-      try {
-        const decoded = window.atob(draft.password);
-        if (decoded.length !== Number(inbound.password_bytes)) errors.password = `密碼必須是 ${inbound.password_bytes} bytes 的標準 Base64。`;
-      } catch (_) {
-        errors.password = `密碼必須是 ${inbound.password_bytes} bytes 的標準 Base64。`;
+
+    const memberships = draft.memberships.map((membership, index) => {
+      const inbound = inboundFor(membership.inbound);
+      const needsUUID = inbound.credential === "uuid" || inbound.credential === "uuid_password";
+      const needsPassword = inbound.credential === "password" || inbound.credential === "uuid_password";
+      if (needsUUID && !uuidPattern.test(membership.uuid.trim())) errors[`uuid_${index}`] = "請輸入有效的 UUID 格式。";
+      if (needsPassword && !membership.password) errors[`password_${index}`] = "密碼不能留空。";
+      else if (needsPassword && membership.password.length > 1024) errors[`password_${index}`] = "密碼不可超過 1024 個字元。";
+      else if (needsPassword && inbound.password_encoding === "base64" && Number(inbound.password_bytes) > 0) {
+        try {
+          const decoded = window.atob(membership.password);
+          if (decoded.length !== Number(inbound.password_bytes)) errors[`password_${index}`] = `密碼必須是 ${inbound.password_bytes} bytes 的標準 Base64。`;
+        } catch (_) {
+          errors[`password_${index}`] = `密碼必須是 ${inbound.password_bytes} bytes 的標準 Base64。`;
+        }
       }
-    }
-
-    let quotaBytes = 0;
-    if (inbound.traffic !== false && draft.quota_gb !== "") {
-      const quotaGB = Number(draft.quota_gb);
-      if (!Number.isFinite(quotaGB) || quotaGB < 0) errors.quota_gb = "額度必須是 0 或正數。";
-      else {
-        quotaBytes = Math.round(quotaGB * GIB);
-        if (!Number.isSafeInteger(quotaBytes)) errors.quota_gb = "額度過大，請輸入較小的數值。";
+      let quotaBytes = 0;
+      if (inbound.traffic !== false && membership.quota_gb !== "") {
+        const quotaGB = Number(membership.quota_gb);
+        if (!Number.isFinite(quotaGB) || quotaGB < 0) errors[`quota_gb_${index}`] = "額度必須是 0 或正數。";
+        else {
+          quotaBytes = Math.round(quotaGB * GIB);
+          if (!Number.isSafeInteger(quotaBytes)) errors[`quota_gb_${index}`] = "額度過大，請輸入較小的數值。";
+        }
       }
-    }
+      let expiresAt = 0;
+      if (membership.expires_at) {
+        expiresAt = new Date(membership.expires_at).getTime();
+        if (!Number.isFinite(expiresAt) || expiresAt < 0) errors[`expires_at_${index}`] = "到期時間格式不正確。";
+      }
+      let alterID = 0;
+      if (inbound.alter_id) {
+        alterID = Number(membership.alter_id || 0);
+        if (!Number.isSafeInteger(alterID) || alterID < 0 || alterID > 2147483647) errors[`alter_id_${index}`] = "Alter ID 必須是 0 至 2,147,483,647 的整數。";
+      }
+      const maxIPs = Number(membership.max_ips || 0);
+      if (!Number.isSafeInteger(maxIPs) || maxIPs < 0 || maxIPs > 65535) errors[`max_ips_${index}`] = "來源 IP 上限必須是 0 至 65,535 的整數。";
+      return {
+        id: membership.id,
+        inbound: inbound.tag,
+        uuid: needsUUID ? membership.uuid.trim() : "",
+        password: needsPassword ? membership.password : "",
+        flow: inbound.flow ? membership.flow.trim() : "",
+        alter_id: alterID,
+        enabled: membership.enabled,
+        quota_bytes: quotaBytes,
+        expires_at: expiresAt,
+        max_ips: maxIPs,
+      };
+    });
 
-    let expiresAt = 0;
-    if (draft.expires_at) {
-      expiresAt = new Date(draft.expires_at).getTime();
-      if (!Number.isFinite(expiresAt) || expiresAt < 0) errors.expires_at = "到期時間格式不正確。";
-    }
-
-    let alterID = 0;
-    if (inbound.alter_id) {
-      alterID = Number(draft.alter_id || 0);
-      if (!Number.isSafeInteger(alterID) || alterID < 0 || alterID > 2147483647) errors.alter_id = "Alter ID 必須是 0 至 2,147,483,647 的整數。";
-    }
+    const affected = new Set([...(state.dialog.group?.memberships || []).map((membership) => membership.inbound), ...memberships.map((membership) => membership.inbound)]);
+    const revisions = {};
+    affected.forEach((tag) => {
+      revisions[tag] = Number(state.dialog.group?.revisions?.[tag] || inboundFor(tag)?.revision) || 0;
+    });
 
     return {
       errors,
       body: {
-        inbound: inbound.tag,
         name,
-        uuid: needsUUID ? draft.uuid.trim() : "",
-        password: needsPassword ? draft.password : "",
-        flow: inbound.flow ? draft.flow.trim() : "",
-        alter_id: alterID,
-        enabled: draft.enabled,
-        quota_bytes: quotaBytes,
-        expires_at: expiresAt,
-        revision: Number(state.dialog.user?.revision || inbound.revision) || 0,
+        memberships,
+        revisions,
       },
     };
   }
@@ -2108,7 +2144,7 @@
     if (submit) {
       submit.disabled = busy;
       submit.classList.toggle("is-loading", busy);
-      submit.innerHTML = `${icon(busy ? "refresh" : state.dialog.user ? "check" : "plus")}<span>${busy ? "處理中…" : state.dialog.user ? "儲存變更" : "建立用戶"}</span>`;
+      submit.innerHTML = `${icon(busy ? "refresh" : state.dialog.group ? "check" : "plus")}<span>${busy ? "處理中…" : state.dialog.group ? "儲存變更" : "建立用戶"}</span>`;
     }
     cancelButtons.forEach((button) => { button.disabled = busy; });
   }
@@ -2537,10 +2573,10 @@
     if (formError) formError.hidden = true;
     if (Object.keys(errors).length) return;
     const model = state.dialog;
-    const editing = Boolean(model.user);
+    const editing = Boolean(model.group);
     setUserDialogBusy(true);
     try {
-      const path = editing ? `/users/${encodeURIComponent(model.user.id)}` : "/users";
+      const path = editing ? `/user-groups/${encodeURIComponent(model.group.name)}` : "/user-groups";
       await api(path, { method: editing ? "PUT" : "POST", body: JSON.stringify(body) });
       state.dialog.submitting = false;
       closeDialog();
@@ -2593,8 +2629,8 @@
     }
   }
 
-  function findUser(id) {
-    return state.users.find((user) => String(user.id) === String(id));
+  function findUserGroup(name) {
+    return logicalUserGroups().find((group) => group.name === name) || null;
   }
 
   function findConnection(id) {
@@ -2671,22 +2707,6 @@
       state.dialog.draft = draft;
       renderServerDialog();
       window.setTimeout(() => document.getElementById("server-protocol")?.focus(), 0);
-    }
-    if (target.name === "inbound" && state.dialog?.type === "user" && !state.dialog.user) {
-      const form = target.closest("form");
-      const draft = captureUserDraft(form);
-      const inbound = inboundFor(target.value);
-      if (!inbound?.managed) return;
-      if ((inbound.credential === "uuid" || inbound.credential === "uuid_password") && !draft.uuid) {
-        try { draft.uuid = secureUUID(); } catch (_) { draft.uuid = ""; }
-      }
-      if ((inbound.credential === "password" || inbound.credential === "uuid_password") && !draft.password) {
-        try { draft.password = securePasswordForInbound(inbound); } catch (_) { draft.password = ""; }
-      }
-      state.dialog.inbound = inbound;
-      state.dialog.draft = draft;
-      renderUserDialog();
-      window.setTimeout(() => document.getElementById("user-inbound")?.focus(), 0);
     }
   });
 
@@ -2789,7 +2809,7 @@
 
     if (action === "generate-uuid") {
       try {
-        const field = document.getElementById("user-uuid");
+        const field = document.getElementById(`uuid_${actionElement.dataset.index}`);
         if (field) {
           field.value = secureUUID();
           clearFieldError(field);
@@ -2803,9 +2823,10 @@
 
     if (action === "generate-password") {
       try {
-        const field = document.getElementById("user-password");
+        const index = Number(actionElement.dataset.index);
+        const field = document.getElementById(`password_${index}`);
         if (field) {
-          field.value = securePasswordForInbound(state.dialog?.inbound);
+          field.value = securePasswordForInbound(inboundFor(state.dialog?.draft.memberships[index]?.inbound));
           clearFieldError(field);
           field.focus();
           field.select();
@@ -2817,14 +2838,33 @@
     }
 
     if (action === "toggle-user-password") {
-      const field = document.getElementById("user-password");
+      const index = Number(actionElement.dataset.index);
+      const field = document.getElementById(`password_${index}`);
       if (field && state.dialog?.type === "user") {
-        state.dialog.passwordVisible = field.type === "password";
-        field.type = state.dialog.passwordVisible ? "text" : "password";
-        actionElement.innerHTML = icon(state.dialog.passwordVisible ? "eyeOff" : "eye");
-        actionElement.setAttribute("aria-label", state.dialog.passwordVisible ? "隱藏密碼" : "顯示密碼");
-        actionElement.setAttribute("title", state.dialog.passwordVisible ? "隱藏密碼" : "顯示密碼");
+        const visible = field.type === "password";
+        state.dialog.draft.memberships[index].passwordVisible = visible;
+        field.type = visible ? "text" : "password";
+        actionElement.innerHTML = icon(visible ? "eyeOff" : "eye");
+        actionElement.setAttribute("aria-label", visible ? "隱藏密碼" : "顯示密碼");
+        actionElement.setAttribute("title", visible ? "隱藏密碼" : "顯示密碼");
       }
+    }
+
+    if (action === "add-user-membership" && state.dialog?.type === "user") {
+      const form = actionElement.closest("form");
+      state.dialog.draft = captureUserDraft(form);
+      const inbound = inboundFor(document.getElementById("add-user-inbound")?.value);
+      if (inbound?.managed) state.dialog.draft.memberships.push(newMembershipDraft(inbound));
+      renderUserDialog();
+      window.setTimeout(() => document.querySelector(".membership-card:last-child input:not([type=hidden])")?.focus(), 0);
+    }
+
+    if (action === "remove-user-membership" && state.dialog?.type === "user") {
+      const form = actionElement.closest("form");
+      state.dialog.draft = captureUserDraft(form);
+      state.dialog.draft.memberships.splice(Number(actionElement.dataset.index), 1);
+      renderUserDialog();
+      window.setTimeout(() => document.getElementById("add-user-inbound")?.focus(), 0);
     }
 
     if (action === "copy-subscription-url") {
@@ -2850,15 +2890,15 @@
     }
 
     if (action === "edit-user") {
-      const user = findUser(actionElement.dataset.id);
-      if (!user) {
+      const group = findUserGroup(actionElement.dataset.name);
+      if (!group) {
         showToast("找不到此用戶，請重新整理", "error");
       } else {
         const requestID = ++state.detailRequest;
         const epoch = state.epoch;
         const route = state.route;
         try {
-          const detail = await api(`/users/${encodeURIComponent(user.id)}`);
+          const detail = await api(`/user-groups/${encodeURIComponent(group.name)}`);
           if (requestID !== state.detailRequest || epoch !== state.epoch || route !== state.route || !state.authenticated) return;
           openUserDialog(detail);
         } catch (error) {
@@ -2901,31 +2941,32 @@
     }
 
     if (action === "delete-user") {
-      const user = findUser(actionElement.dataset.id);
-      if (!user) return;
+      const group = findUserGroup(actionElement.dataset.name);
+      if (!group) return;
+      const revisions = Object.fromEntries(group.memberships.map((membership) => [membership.inbound, membership.revision]));
       openConfirm({
         title: "刪除此用戶？",
-        message: `「${user.name}」將立即無法建立新連線；這項操作無法復原。`,
+        message: `「${group.name}」在 ${group.memberships.length} 個節點上的 membership 將全部刪除，並立即無法建立新連線。`,
         confirmLabel: "刪除用戶",
         successMessage: "用戶已刪除",
         action: async () => {
-          await api(`/users/${encodeURIComponent(user.id)}?revision=${encodeURIComponent(user.revision)}`, { method: "DELETE" });
+          await api(`/user-groups/${encodeURIComponent(group.name)}`, { method: "DELETE", body: JSON.stringify({ revisions }) });
           await Promise.all([loadUsers({ silent: true, force: true }), loadOverview({ silent: true, force: true })]);
         },
       });
     }
 
     if (action === "reset-user-traffic") {
-      const user = findUser(actionElement.dataset.id);
-      if (!user) return;
+      const group = findUserGroup(actionElement.dataset.name);
+      if (!group) return;
       openConfirm({
         title: "將流量統計歸零？",
-        message: `「${user.name}」目前累積 ${formatBytes(asNumber(user.upload_bytes) + asNumber(user.download_bytes))}。歸零後，額度將從零重新計算。`,
+        message: `「${group.name}」目前跨節點累積 ${formatBytes(group.upload_bytes + group.download_bytes)}。所有 membership 歸零後，額度將從零重新計算。`,
         confirmLabel: "確認歸零",
         successMessage: "用戶流量已歸零",
         danger: false,
         action: async () => {
-          await api(`/users/${encodeURIComponent(user.id)}/reset-traffic`, { method: "POST" });
+          await api(`/user-groups/${encodeURIComponent(group.name)}/reset-traffic`, { method: "POST" });
           await loadUsers({ silent: true, force: true });
         },
       });

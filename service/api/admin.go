@@ -150,6 +150,7 @@ type adminUser struct {
 	Enabled           bool   `json:"enabled"`
 	QuotaBytes        int64  `json:"quota_bytes"`
 	ExpiresAt         int64  `json:"expires_at"`
+	MaxIPs            int    `json:"max_ips,omitempty"`
 	UploadBytes       int64  `json:"upload_bytes"`
 	DownloadBytes     int64  `json:"download_bytes"`
 	TrafficGeneration int64  `json:"traffic_generation,omitempty"`
@@ -175,6 +176,7 @@ type adminUserInput struct {
 	Enabled    *bool  `json:"enabled"`
 	QuotaBytes int64  `json:"quota_bytes"`
 	ExpiresAt  int64  `json:"expires_at"`
+	MaxIPs     *int   `json:"max_ips"`
 	Revision   int64  `json:"revision"`
 }
 
@@ -199,6 +201,7 @@ type adminUsage struct {
 	Upload      int64
 	Download    int64
 	Connections int
+	SourceSince map[string]int64
 }
 
 type adminTrafficBaseline struct {
@@ -761,7 +764,11 @@ func (a *adminAPI) reconcile() error {
 		baseline := a.trafficBaselines[metadata.ID]
 		a.trafficAccess.Unlock()
 		a.storeAccess.RLock()
-		allowed := a.userConnectionAllowedLocked(metadata.Metadata.Inbound, metadata.Metadata.User, baseline.UserID, now, usage)
+		sourceIP := ""
+		if metadata.Metadata.Source.Addr.IsValid() {
+			sourceIP = metadata.Metadata.Source.Addr.String()
+		}
+		allowed := a.userConnectionAllowedLocked(metadata.Metadata.Inbound, metadata.Metadata.User, baseline.UserID, sourceIP, now, usage)
 		a.storeAccess.RUnlock()
 		if !allowed {
 			if connection := a.traffic.Connection(metadata.ID); connection != nil {
@@ -772,7 +779,7 @@ func (a *adminAPI) reconcile() error {
 	return nil
 }
 
-func (a *adminAPI) userConnectionAllowedLocked(inboundTag string, userName string, userID string, now int64, usage map[string]adminUsage) bool {
+func (a *adminAPI) userConnectionAllowedLocked(inboundTag string, userName string, userID string, sourceIP string, now int64, usage map[string]adminUsage) bool {
 	record := a.store.Inbounds[inboundTag]
 	if record == nil || !record.Authoritative {
 		return true
@@ -780,25 +787,45 @@ func (a *adminAPI) userConnectionAllowedLocked(inboundTag string, userName strin
 	if userID != "" {
 		for _, user := range record.Users {
 			if user.ID == userID {
-				return adminUserEnabled(user, now, usage[adminUserKey(inboundTag, user.Name)])
+				return adminUserConnectionAllowed(user, sourceIP, now, usage[adminUserKey(inboundTag, user.Name)])
 			}
 		}
 		return false
 	}
-	return a.userAllowedLocked(inboundTag, userName, now, usage[adminUserKey(inboundTag, userName)])
+	return a.userAllowedLocked(inboundTag, userName, sourceIP, now, usage[adminUserKey(inboundTag, userName)])
 }
 
-func (a *adminAPI) userAllowedLocked(inboundTag string, userName string, now int64, usage adminUsage) bool {
+func (a *adminAPI) userAllowedLocked(inboundTag string, userName string, sourceIP string, now int64, usage adminUsage) bool {
 	record := a.store.Inbounds[inboundTag]
 	if record == nil || !record.Authoritative {
 		return true
 	}
 	for _, user := range record.Users {
 		if user.Name == userName {
-			return adminUserEnabled(user, now, usage)
+			return adminUserConnectionAllowed(user, sourceIP, now, usage)
 		}
 	}
 	return false
+}
+
+func adminUserConnectionAllowed(user *adminUser, sourceIP string, now int64, usage adminUsage) bool {
+	if !adminUserEnabled(user, now, usage) {
+		return false
+	}
+	if user.MaxIPs <= 0 || len(usage.SourceSince) <= user.MaxIPs {
+		return true
+	}
+	connectedAt, exists := usage.SourceSince[sourceIP]
+	if !exists {
+		return false
+	}
+	rank := 0
+	for otherIP, otherConnectedAt := range usage.SourceSince {
+		if otherConnectedAt < connectedAt || otherConnectedAt == connectedAt && otherIP < sourceIP {
+			rank++
+		}
+	}
+	return rank < user.MaxIPs
 }
 
 func adminUserEnabled(user *adminUser, now int64, active adminUsage) bool {
@@ -916,6 +943,19 @@ func (a *adminAPI) activeUsage() map[string]adminUsage {
 		usage.Upload += max(metadata.Upload.Load()-baseline.Upload, 0)
 		usage.Download += max(metadata.Download.Load()-baseline.Download, 0)
 		usage.Connections++
+		sourceIP := ""
+		if metadata.Metadata.Source.Addr.IsValid() {
+			sourceIP = metadata.Metadata.Source.Addr.String()
+		}
+		if sourceIP != "" {
+			if usage.SourceSince == nil {
+				usage.SourceSince = make(map[string]int64)
+			}
+			createdAt := metadata.CreatedAt.UnixMilli()
+			if previous, exists := usage.SourceSince[sourceIP]; !exists || createdAt < previous {
+				usage.SourceSince[sourceIP] = createdAt
+			}
+		}
 		result[key] = usage
 	}
 	return result
@@ -1050,6 +1090,11 @@ func (a *adminAPI) buildRouter() http.Handler {
 		router.Delete(adminRoutePrefix+"/servers/{tag}", a.deleteServer)
 		router.Post(adminRoutePrefix+"/reload", a.reloadCore)
 		router.Get(adminRoutePrefix+"/users", a.listUsers)
+		router.Get(adminRoutePrefix+"/user-groups/{name}", a.getUserGroup)
+		router.Post(adminRoutePrefix+"/user-groups", a.createUserGroup)
+		router.Put(adminRoutePrefix+"/user-groups/{name}", a.updateUserGroup)
+		router.Delete(adminRoutePrefix+"/user-groups/{name}", a.deleteUserGroup)
+		router.Post(adminRoutePrefix+"/user-groups/{name}/reset-traffic", a.resetUserGroupTraffic)
 		router.Get(adminRoutePrefix+"/users/{id}", a.getUser)
 		router.Post(adminRoutePrefix+"/users", a.createUser)
 		router.Put(adminRoutePrefix+"/users/{id}", a.updateUser)
@@ -1342,6 +1387,9 @@ func (a *adminAPI) createUser(writer http.ResponseWriter, request *http.Request)
 		CreatedAt:  now,
 		UpdatedAt:  now,
 	}
+	if normalized.MaxIPs != nil {
+		newUser.MaxIPs = *normalized.MaxIPs
+	}
 	previous, err := a.mutateInbound(input.Inbound, normalized.Revision, true, func(record *adminInboundStore) error {
 		if err := validateUniqueUser(record, newUser, ""); err != nil {
 			return err
@@ -1401,6 +1449,9 @@ func (a *adminAPI) updateUser(writer http.ResponseWriter, request *http.Request)
 	candidate.Password = normalized.Password
 	candidate.Flow = normalized.Flow
 	candidate.AlterID = normalized.AlterID
+	if normalized.MaxIPs != nil {
+		candidate.MaxIPs = *normalized.MaxIPs
+	}
 	a.storeAccess.RLock()
 	err = validateUniqueUser(a.store.Inbounds[tag], &candidate, id)
 	a.storeAccess.RUnlock()
@@ -1434,6 +1485,9 @@ func (a *adminAPI) updateUser(writer http.ResponseWriter, request *http.Request)
 				updated.AlterID = normalized.AlterID
 				updated.QuotaBytes = normalized.QuotaBytes
 				updated.ExpiresAt = normalized.ExpiresAt
+				if normalized.MaxIPs != nil {
+					updated.MaxIPs = *normalized.MaxIPs
+				}
 				updated.UpdatedAt = time.Now().UnixMilli()
 				if normalized.Enabled != nil {
 					updated.Enabled = *normalized.Enabled
@@ -1661,8 +1715,8 @@ func normalizeAdminInput(input adminUserInput, schema adapter.ManagedUserSchema)
 	if len(input.Name) > 128 {
 		return input, E.New("用戶名稱過長")
 	}
-	if input.QuotaBytes < 0 || input.ExpiresAt < 0 || input.AlterID < 0 {
-		return input, E.New("額度、到期時間與 Alter ID 不可為負數")
+	if input.QuotaBytes < 0 || input.ExpiresAt < 0 || input.AlterID < 0 || input.MaxIPs != nil && *input.MaxIPs < 0 {
+		return input, E.New("額度、到期時間、Alter ID 與 IP 限制不可為負數")
 	}
 	switch schema.Credential {
 	case adapter.ManagedUserCredentialUUID, adapter.ManagedUserCredentialUUIDPassword:

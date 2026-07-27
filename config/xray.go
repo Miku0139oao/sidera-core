@@ -65,6 +65,24 @@ type xrayOutbound struct {
 	TargetStrategy string             `json:"targetStrategy"`
 }
 
+type xrayWireGuardSettings struct {
+	SecretKey      string              `json:"secretKey"`
+	Address        xrayStringList      `json:"address"`
+	Peers          []xrayWireGuardPeer `json:"peers"`
+	Reserved       []uint8             `json:"reserved"`
+	NoKernelTun    bool                `json:"noKernelTun"`
+	MTU            uint32              `json:"mtu"`
+	DomainStrategy string              `json:"domainStrategy"`
+}
+
+type xrayWireGuardPeer struct {
+	PublicKey  string         `json:"publicKey"`
+	PreShared  string         `json:"preSharedKey"`
+	AllowedIPs xrayStringList `json:"allowedIPs"`
+	Endpoint   string         `json:"endpoint"`
+	KeepAlive  uint16         `json:"keepAlive"`
+}
+
 type xraySniffing struct {
 	Enabled         bool           `json:"enabled"`
 	DestOverride    xrayStringList `json:"destOverride"`
@@ -382,7 +400,16 @@ func translateXray(ctx context.Context, content []byte) (option.Options, error) 
 	}
 	if len(source.Outbounds) > 0 {
 		outbounds := make([]map[string]any, 0, len(source.Outbounds))
+		endpoints := make([]map[string]any, 0)
 		for index, outbound := range source.Outbounds {
+			if strings.EqualFold(outbound.Protocol, "wireguard") {
+				converted, convertErr := translateXrayWireGuardEndpoint(ctx, outbound)
+				if convertErr != nil {
+					return option.Options{}, E.Cause(convertErr, "outbounds[", index, "]")
+				}
+				endpoints = append(endpoints, converted)
+				continue
+			}
 			converted, convertErr := translateXrayOutbound(ctx, outbound)
 			if convertErr != nil {
 				return option.Options{}, E.Cause(convertErr, "outbounds[", index, "]")
@@ -390,6 +417,9 @@ func translateXray(ctx context.Context, content []byte) (option.Options, error) 
 			outbounds = append(outbounds, converted)
 		}
 		canonical["outbounds"] = outbounds
+		if len(endpoints) > 0 {
+			canonical["endpoints"] = endpoints
+		}
 	}
 	convertedRoute, convertErr := translateXrayRouting(ctx, source.Routing, exclusions.routingRules)
 	if convertErr != nil {
@@ -409,14 +439,20 @@ func translateXray(ctx context.Context, content []byte) (option.Options, error) 
 	if err != nil {
 		return option.Options{}, E.Cause(err, "decode canonical config")
 	}
-	for index, outbound := range source.Outbounds {
-		if !strings.EqualFold(outbound.Protocol, "vless") {
+	nativeOutboundIndex := 0
+	for _, outbound := range source.Outbounds {
+		if strings.EqualFold(outbound.Protocol, "wireguard") {
 			continue
 		}
-		vlessOptions, loaded := options.Outbounds[index].Options.(*option.VLESSOutboundOptions)
+		if !strings.EqualFold(outbound.Protocol, "vless") {
+			nativeOutboundIndex++
+			continue
+		}
+		vlessOptions, loaded := options.Outbounds[nativeOutboundIndex].Options.(*option.VLESSOutboundOptions)
 		if loaded && vlessOptions.Flow == "" {
 			vlessOptions.XrayPacketEncoding = true
 		}
+		nativeOutboundIndex++
 	}
 	return options, nil
 }
@@ -770,6 +806,67 @@ func translateXrayOutbound(ctx context.Context, source xrayOutbound) (map[string
 		return nil, E.New("unsupported Xray outbound protocol: ", source.Protocol)
 	}
 	return result, nil
+}
+
+func translateXrayWireGuardEndpoint(ctx context.Context, source xrayOutbound) (map[string]any, error) {
+	if source.Tag == "" {
+		return nil, E.New("WireGuard outbound requires a tag")
+	}
+	if source.SendThrough != "" || hasJSONValue(source.ProxySettings) || source.StreamSettings != nil || source.Mux != nil {
+		return nil, E.New("unsupported Xray WireGuard outbound options")
+	}
+	settings, err := decodeXrayObject[xrayWireGuardSettings](ctx, source.Settings, "settings")
+	if err != nil {
+		return nil, err
+	}
+	if !settings.NoKernelTun {
+		return nil, E.New("Xray WireGuard kernel TUN mode is not supported")
+	}
+	if settings.SecretKey == "" || len(settings.Address) == 0 || len(settings.Peers) == 0 {
+		return nil, E.New("incomplete Xray WireGuard settings")
+	}
+	switch strings.ToLower(settings.DomainStrategy) {
+	case "", "forceip", "forceipv4", "forceipv6":
+	default:
+		return nil, unsupportedXrayField("settings.domainStrategy=" + settings.DomainStrategy)
+	}
+	peers := make([]map[string]any, 0, len(settings.Peers))
+	for index, peer := range settings.Peers {
+		host, portText, splitErr := net.SplitHostPort(peer.Endpoint)
+		if splitErr != nil || host == "" {
+			return nil, E.New("settings.peers[", index, "].endpoint must be host:port")
+		}
+		port, parseErr := strconv.ParseUint(portText, 10, 16)
+		if parseErr != nil || port == 0 || peer.PublicKey == "" || len(peer.AllowedIPs) == 0 {
+			return nil, E.New("incomplete settings.peers[", index, "]")
+		}
+		convertedPeer := map[string]any{
+			"address": peerAddress(host), "port": port, "public_key": peer.PublicKey,
+			"allowed_ips": peer.AllowedIPs,
+		}
+		if peer.PreShared != "" {
+			convertedPeer["pre_shared_key"] = peer.PreShared
+		}
+		if peer.KeepAlive > 0 {
+			convertedPeer["persistent_keepalive_interval"] = peer.KeepAlive
+		}
+		if len(settings.Reserved) > 0 {
+			convertedPeer["reserved"] = settings.Reserved
+		}
+		peers = append(peers, convertedPeer)
+	}
+	result := map[string]any{
+		"type": "wireguard", "tag": source.Tag, "address": settings.Address,
+		"private_key": settings.SecretKey, "peers": peers,
+	}
+	if settings.MTU > 0 {
+		result["mtu"] = settings.MTU
+	}
+	return result, nil
+}
+
+func peerAddress(host string) string {
+	return strings.TrimSuffix(strings.TrimPrefix(host, "["), "]")
 }
 
 func translateXrayVLESS(source xrayVLESSSettings) (map[string]any, error) {

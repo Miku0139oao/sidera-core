@@ -23,9 +23,10 @@ import (
 type adminTestOptionsRegistry map[string]func() any
 
 type adminTestManagedService struct {
-	tag   string
-	type_ string
-	users []adapter.ManagedUser
+	tag       string
+	type_     string
+	users     []adapter.ManagedUser
+	updateErr error
 }
 
 func (s *adminTestManagedService) Tag() string { return s.tag }
@@ -41,6 +42,9 @@ func (s *adminTestManagedService) ManagedUsers() []adapter.ManagedUser {
 }
 
 func (s *adminTestManagedService) UpdateManagedUsers(users []adapter.ManagedUser) error {
+	if s.updateErr != nil {
+		return s.updateErr
+	}
 	s.users = append([]adapter.ManagedUser(nil), users...)
 	return nil
 }

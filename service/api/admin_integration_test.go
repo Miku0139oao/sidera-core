@@ -145,8 +145,16 @@ func TestTrafficEventsUseStableIdentityAndResetGeneration(t *testing.T) {
 	user := a.store.Inbounds[managed.tag].Users[0]
 	require.Zero(t, user.UploadBytes)
 	require.EqualValues(t, 20, user.DownloadBytes)
-	require.False(t, a.userConnectionAllowedLocked(managed.tag, "alice-new", "deleted-id", time.Now().UnixMilli(), nil))
-	require.True(t, a.userConnectionAllowedLocked(managed.tag, "alice-new", "alice-id", time.Now().UnixMilli(), nil))
+	require.False(t, a.userConnectionAllowedLocked(managed.tag, "alice-new", "deleted-id", "", time.Now().UnixMilli(), nil))
+	require.True(t, a.userConnectionAllowedLocked(managed.tag, "alice-new", "alice-id", "", time.Now().UnixMilli(), nil))
+}
+
+func TestAdminUserConnectionLimitKeepsEarliestSources(t *testing.T) {
+	user := &adminUser{Enabled: true, MaxIPs: 1}
+	usage := adminUsage{SourceSince: map[string]int64{"203.0.113.2": 20, "203.0.113.1": 10}}
+	require.True(t, adminUserConnectionAllowed(user, "203.0.113.1", time.Now().UnixMilli(), usage))
+	require.False(t, adminUserConnectionAllowed(user, "203.0.113.2", time.Now().UnixMilli(), usage))
+	require.Equal(t, 1, user.MaxIPs)
 }
 
 func TestMutateInboundFailureDoesNotChangeOwnership(t *testing.T) {
@@ -178,6 +186,142 @@ func TestDeleteUserWithoutTrafficManager(t *testing.T) {
 	a.router = a.buildRouter()
 	response := adminRequest(a, "DELETE", adminRoutePrefix+"/users/alice-id?revision=1", nil)
 	require.Equal(t, 204, response.Code, response.Body.String())
+}
+
+func TestUpdateUserPreservesOmittedIPLimit(t *testing.T) {
+	managed := &adminTestManagedService{
+		tag: "owned", type_: C.TypeSOCKS,
+		users: []adapter.ManagedUser{{Name: "alice", Password: "password"}},
+	}
+	a := newAdminTestAPI(t, managed, false)
+	a.store.Inbounds[managed.tag] = &adminInboundStore{
+		Type: C.TypeSOCKS, Authoritative: true, Revision: 1, AppliedRevision: 1,
+		Users: []*adminUser{{
+			ID: "alice-id", Inbound: managed.tag, Type: C.TypeSOCKS,
+			Name: "alice", Password: "password", Enabled: true, MaxIPs: 1,
+		}},
+	}
+	a.router = a.buildRouter()
+	body, err := stdjson.Marshal(map[string]any{
+		"inbound": managed.tag, "name": "alice", "password": "password",
+		"enabled": true, "revision": 1,
+	})
+	require.NoError(t, err)
+	response := adminRequest(a, "PUT", adminRoutePrefix+"/users/alice-id", body)
+	require.Equal(t, 200, response.Code, response.Body.String())
+	require.Equal(t, 1, a.store.Inbounds[managed.tag].Users[0].MaxIPs)
+
+	body, err = stdjson.Marshal(map[string]any{
+		"inbound": managed.tag, "name": "alice", "password": "password",
+		"enabled": true, "revision": a.store.Inbounds[managed.tag].Revision, "max_ips": 2,
+	})
+	require.NoError(t, err)
+	response = adminRequest(a, "PUT", adminRoutePrefix+"/users/alice-id", body)
+	require.Equal(t, 200, response.Code, response.Body.String())
+	require.Equal(t, 2, a.store.Inbounds[managed.tag].Users[0].MaxIPs)
+}
+
+func TestUserGroupMutationsAreRevisionSafeAcrossInbounds(t *testing.T) {
+	first := &adminTestManagedService{tag: "first", type_: C.TypeSOCKS}
+	second := &adminTestManagedService{tag: "second", type_: C.TypeSOCKS}
+	a := newAdminTestAPI(t, first, false)
+	a.inbounds = append(a.inbounds, adminInboundRuntime{
+		Tag: second.Tag(), Type: second.Type(), Kind: adminServerKindInbound,
+		Manager: &adminManagedRuntime{service: second},
+	})
+	for index := range a.inbounds {
+		a.runtimes[a.inbounds[index].Tag] = &a.inbounds[index]
+	}
+	a.store.Inbounds[first.Tag()] = &adminInboundStore{Type: first.Type(), Authoritative: true, Revision: 1}
+	a.store.Inbounds[second.Tag()] = &adminInboundStore{Type: second.Type(), Authoritative: true, Revision: 1}
+	a.router = a.buildRouter()
+
+	createBody, err := stdjson.Marshal(map[string]any{
+		"name": "alice",
+		"memberships": []map[string]any{
+			{"inbound": first.Tag(), "password": "first-password", "enabled": true, "max_ips": 1},
+			{"inbound": second.Tag(), "password": "second-password", "enabled": true, "quota_bytes": 1024},
+		},
+		"revisions": map[string]int64{first.Tag(): 1, second.Tag(): 1},
+	})
+	require.NoError(t, err)
+	response := adminRequest(a, "POST", adminRoutePrefix+"/user-groups", createBody)
+	require.Equal(t, 201, response.Code, response.Body.String())
+	require.Len(t, a.store.Inbounds[first.Tag()].Users, 1)
+	require.Len(t, a.store.Inbounds[second.Tag()].Users, 1)
+	require.Equal(t, "first-password", first.users[0].Password)
+	require.Equal(t, "second-password", second.users[0].Password)
+
+	rollbackBody, err := stdjson.Marshal(map[string]any{
+		"name": "alice",
+		"memberships": []map[string]any{
+			{"id": a.store.Inbounds[first.Tag()].Users[0].ID, "inbound": first.Tag(), "password": "changed-first", "enabled": true},
+			{"id": a.store.Inbounds[second.Tag()].Users[0].ID, "inbound": second.Tag(), "password": "changed-second", "enabled": true},
+		},
+		"revisions": map[string]int64{
+			first.Tag():  a.store.Inbounds[first.Tag()].Revision,
+			second.Tag(): a.store.Inbounds[second.Tag()].Revision,
+		},
+	})
+	require.NoError(t, err)
+	second.updateErr = os.ErrInvalid
+	response = adminRequest(a, "PUT", adminRoutePrefix+"/user-groups/alice", rollbackBody)
+	require.Equal(t, 500, response.Code, response.Body.String())
+	second.updateErr = nil
+	require.Equal(t, "first-password", a.store.Inbounds[first.Tag()].Users[0].Password)
+	require.Equal(t, "second-password", a.store.Inbounds[second.Tag()].Users[0].Password)
+	require.Equal(t, "first-password", first.users[0].Password)
+	require.Equal(t, "second-password", second.users[0].Password)
+
+	staleBody, err := stdjson.Marshal(map[string]any{
+		"name": "renamed",
+		"memberships": []map[string]any{
+			{"id": a.store.Inbounds[first.Tag()].Users[0].ID, "inbound": first.Tag(), "password": "changed", "enabled": true},
+		},
+		"revisions": map[string]int64{
+			first.Tag():  a.store.Inbounds[first.Tag()].Revision,
+			second.Tag(): 1,
+		},
+	})
+	require.NoError(t, err)
+	response = adminRequest(a, "PUT", adminRoutePrefix+"/user-groups/alice", staleBody)
+	require.Equal(t, 409, response.Code, response.Body.String())
+	require.Equal(t, "alice", a.store.Inbounds[first.Tag()].Users[0].Name)
+	require.Equal(t, "first-password", first.users[0].Password)
+	require.Equal(t, "alice", a.store.Inbounds[second.Tag()].Users[0].Name)
+	require.Equal(t, "second-password", second.users[0].Password)
+
+	subscriptionToken := a.store.Subscriptions["alice"]
+	require.NotEmpty(t, subscriptionToken)
+	renameBody, err := stdjson.Marshal(map[string]any{
+		"name": "renamed",
+		"memberships": []map[string]any{
+			{"id": a.store.Inbounds[first.Tag()].Users[0].ID, "inbound": first.Tag(), "password": "first-password", "enabled": true},
+			{"id": a.store.Inbounds[second.Tag()].Users[0].ID, "inbound": second.Tag(), "password": "second-password", "enabled": true},
+		},
+		"revisions": map[string]int64{
+			first.Tag():  a.store.Inbounds[first.Tag()].Revision,
+			second.Tag(): a.store.Inbounds[second.Tag()].Revision,
+		},
+	})
+	require.NoError(t, err)
+	response = adminRequest(a, "PUT", adminRoutePrefix+"/user-groups/alice", renameBody)
+	require.Equal(t, 200, response.Code, response.Body.String())
+	require.Equal(t, "renamed", a.store.Inbounds[first.Tag()].Users[0].Name)
+	require.Equal(t, "renamed", a.store.Inbounds[second.Tag()].Users[0].Name)
+	require.NotContains(t, a.store.Subscriptions, "alice")
+	require.Equal(t, subscriptionToken, a.store.Subscriptions["renamed"])
+
+	revisions := map[string]int64{
+		first.Tag():  a.store.Inbounds[first.Tag()].Revision,
+		second.Tag(): a.store.Inbounds[second.Tag()].Revision,
+	}
+	deleteBody, err := stdjson.Marshal(map[string]any{"revisions": revisions})
+	require.NoError(t, err)
+	response = adminRequest(a, "DELETE", adminRoutePrefix+"/user-groups/renamed", deleteBody)
+	require.Equal(t, 204, response.Code, response.Body.String())
+	require.Empty(t, a.store.Inbounds[first.Tag()].Users)
+	require.Empty(t, a.store.Inbounds[second.Tag()].Users)
 }
 
 func TestAdminCollectionResponsesRedactCredentials(t *testing.T) {
