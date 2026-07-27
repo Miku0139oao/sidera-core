@@ -1713,23 +1713,210 @@ svg {
 }
 
 .app-dialog.user-dialog {
-  width: min(850px, calc(100% - 32px));
-  max-height: min(92vh, 960px);
+  width: min(920px, calc(100% - 32px));
+  max-height: min(92dvh, 900px);
 }
 
 .user-dialog .dialog-form {
-  max-height: min(92vh, 960px);
+  height: min(780px, 92dvh);
+  max-height: min(92dvh, 900px);
 }
 
-.user-memberships {
+.user-dialog-tabs {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 4px;
+  padding: 0 24px;
+  border-bottom: 1px solid var(--outline-variant);
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.user-dialog-tab {
+  position: relative;
+  display: inline-flex;
+  min-width: max-content;
+  min-height: 48px;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 0 14px;
+  border: 0;
+  background: transparent;
+  color: var(--on-surface-variant);
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.user-dialog-tab::after {
+  position: absolute;
+  right: 12px;
+  bottom: 0;
+  left: 12px;
+  height: 3px;
+  border-radius: 3px 3px 0 0;
+  background: var(--primary);
+  content: "";
+  opacity: 0;
+  transform: scaleX(0.4);
+  transition: opacity 160ms, transform 160ms var(--ease-standard);
+}
+
+.user-dialog-tab[aria-selected="true"] {
+  color: var(--primary);
+}
+
+.user-dialog-tab[aria-selected="true"]::after {
+  opacity: 1;
+  transform: scaleX(1);
+}
+
+.user-dialog-tab .icon {
+  width: 18px;
+  height: 18px;
+}
+
+.user-dialog .dialog-body {
+  height: 100%;
+  padding-top: 20px;
+}
+
+.user-tab-panel[hidden],
+.membership-card[hidden] {
+  display: none;
+}
+
+.user-basics-summary,
+.subscription-panel,
+.subscription-empty {
   display: grid;
-  gap: 14px;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 16px;
+  align-items: center;
+  padding: 18px;
+  border-radius: 22px;
+  background: var(--surface-container-low);
+}
+
+.summary-symbol {
+  display: grid;
+  width: 48px;
+  height: 48px;
+  place-items: center;
+  border-radius: 17px;
+  background: var(--primary-container);
+  color: var(--on-primary-container);
+}
+
+.user-basics-summary strong,
+.subscription-panel h3,
+.subscription-empty h3 {
+  margin: 0;
+  font-size: 15px;
+}
+
+.user-basics-summary p,
+.subscription-panel p,
+.subscription-empty p {
+  margin: 4px 0 0;
+  overflow: hidden;
+  color: var(--on-surface-variant);
+  font-size: 11px;
+  line-height: 1.5;
+  text-overflow: ellipsis;
+}
+
+.user-node-workspace {
+  display: grid;
+  grid-template-columns: 235px minmax(0, 1fr);
+  gap: 18px;
+  align-items: start;
+}
+
+.user-node-rail {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+}
+
+.user-node-listbox {
+  display: grid;
+  gap: 5px;
+}
+
+.user-node-option {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 11px;
+  min-width: 0;
+  min-height: 60px;
+  align-items: center;
+  padding: 9px 11px;
+  border: 0;
+  border-radius: 17px;
+  background: transparent;
+  color: var(--on-surface);
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+}
+
+.user-node-option:hover {
+  background: var(--surface-container-low);
+}
+
+.user-node-option[aria-pressed="true"] {
+  background: var(--secondary-container);
+  color: var(--on-secondary-container);
+}
+
+.user-node-option .status-dot {
+  width: 7px;
+  height: 7px;
+  box-shadow: none;
+}
+
+.user-node-option .status-dot::after {
+  display: none;
+}
+
+.user-node-option .status-dot.offline {
+  background: var(--outline);
+}
+
+.user-node-option strong,
+.user-node-option small {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.user-node-option strong {
+  font-size: 12px;
+}
+
+.user-node-option small {
+  margin-top: 3px;
+  color: var(--on-surface-variant);
+  font-size: 9px;
+}
+
+.user-node-option > .icon {
+  width: 17px;
+  opacity: 0;
+}
+
+.user-node-option[aria-pressed="true"] > .icon {
+  opacity: 1;
 }
 
 .membership-card {
-  padding: 17px;
+  padding: 19px;
   border: 1px solid color-mix(in srgb, var(--outline-variant) 72%, transparent);
-  border-radius: 22px;
+  border-radius: 24px;
   background: var(--surface-container-low);
 }
 
@@ -1758,9 +1945,48 @@ svg {
 
 .add-membership {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: 10px;
-  align-items: center;
+  gap: 7px;
+}
+
+.add-membership .form-select {
+  height: 46px;
+  border-radius: 14px;
+  font-size: 11px;
+}
+
+.add-membership .button {
+  width: 100%;
+}
+
+.all-nodes-added {
+  margin: 0;
+  padding: 10px;
+  color: var(--on-surface-variant);
+  font-size: 10px;
+  text-align: center;
+}
+
+.subscription-panel {
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+}
+
+.subscription-panel .form-field {
+  grid-column: 1 / -1;
+  width: 100%;
+  margin-top: 4px;
+}
+
+.subscription-empty {
+  display: flex;
+  min-height: 260px;
+  flex-direction: column;
+  justify-content: center;
+  text-align: center;
+}
+
+.subscription-empty p {
+  max-width: 420px;
 }
 
 .user-node-list {
@@ -2731,6 +2957,38 @@ svg {
   .dialog-actions {
     padding: 13px 18px 17px;
   }
+
+  .user-node-workspace {
+    grid-template-columns: 1fr;
+    gap: 14px;
+  }
+
+  .user-node-rail {
+    gap: 9px;
+  }
+
+  .user-node-listbox {
+    display: flex;
+    margin: 0 -22px;
+    padding: 0 22px 3px;
+    overflow-x: auto;
+    scroll-padding: 22px;
+    scrollbar-width: none;
+  }
+
+  .user-node-option {
+    min-width: 176px;
+    min-height: 56px;
+    flex: 0 0 auto;
+  }
+
+  .add-membership {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .add-membership .button {
+    width: auto;
+  }
 }
 
 @media (max-width: 480px) {
@@ -2831,15 +3089,64 @@ svg {
 
   .app-dialog,
   .app-dialog.server-dialog,
+  .app-dialog.user-dialog,
   .confirm-dialog {
     width: calc(100% - 18px);
-    max-height: calc(100vh - 18px);
+    max-height: calc(100dvh - 18px);
     border-radius: 28px;
   }
 
   .dialog-form,
-  .server-dialog .dialog-form {
-    max-height: calc(100vh - 18px);
+  .server-dialog .dialog-form,
+  .user-dialog .dialog-form {
+    max-height: calc(100dvh - 18px);
+  }
+
+  .user-dialog .dialog-form {
+    height: calc(100dvh - 18px);
+  }
+
+  .user-dialog-tabs {
+    padding: 0 10px;
+  }
+
+  .user-dialog-tab {
+    min-height: 45px;
+    padding: 0 11px;
+  }
+
+  .user-dialog-tab .icon {
+    display: none;
+  }
+
+  .user-dialog .dialog-body {
+    padding-right: 18px;
+    padding-left: 18px;
+  }
+
+  .user-node-listbox {
+    margin-right: -18px;
+    margin-left: -18px;
+    padding-right: 18px;
+    padding-left: 18px;
+    scroll-padding: 18px;
+  }
+
+  .membership-card {
+    padding: 15px;
+    border-radius: 21px;
+  }
+
+  .add-membership {
+    grid-template-columns: 1fr;
+  }
+
+  .add-membership .button {
+    width: 100%;
+  }
+
+  .dialog-actions {
+    padding-bottom: max(17px, env(safe-area-inset-bottom));
   }
 
   .dialog-actions .button {

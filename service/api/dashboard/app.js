@@ -1627,6 +1627,8 @@
       type: "user",
       group,
       submitting: false,
+      activeTab: "basics",
+      activeMembership: 0,
       draft: {
         name: group?.name || "",
         memberships,
@@ -1644,6 +1646,9 @@
     if (!dialog || model?.type !== "user") return;
     const editing = Boolean(model.group);
     const draft = model.draft;
+    const activeTab = model.activeTab || "basics";
+    const activeMembership = Math.min(model.activeMembership || 0, Math.max(0, draft.memberships.length - 1));
+    model.activeMembership = activeMembership;
     const selected = new Set(draft.memberships.map((membership) => membership.inbound));
     const available = managedInbounds().filter((inbound) => !selected.has(inbound.tag));
     dialog.className = "app-dialog user-dialog";
@@ -1655,32 +1660,53 @@
           <div><h2 id="user-dialog-title">${editing ? "編輯邏輯用戶" : "新增邏輯用戶"}</h2><p>在同一處管理此名稱於所有節點的憑證與限制。</p></div>
           <button class="icon-button" type="button" data-action="dialog-cancel" aria-label="關閉對話框">${icon("close")}</button>
         </header>
+        <nav class="user-dialog-tabs" role="tablist" aria-label="用戶設定區段">
+          ${userDialogTab("basics", "基本資料", "users", activeTab)}
+          ${userDialogTab("nodes", `節點與憑證 · ${formatInteger(draft.memberships.length)}`, "server", activeTab)}
+          ${userDialogTab("links", "訂閱", "link", activeTab)}
+        </nav>
         <fieldset class="dialog-fieldset" ${model.submitting ? "disabled" : ""}>
           <div class="dialog-body">
             <div class="form-error" id="form-error" role="alert" hidden></div>
-            <div class="form-grid">
-              <div class="form-field full">
-                <label for="user-name">用戶名稱 <span class="required-mark" aria-hidden="true">*</span></label>
-                <input class="text-input" id="user-name" name="name" value="${escapeHTML(draft.name)}" maxlength="128" autocomplete="off" aria-describedby="name-error">
-                <span class="supporting-text field-message" id="name-error" data-help="用於識別流量與連線，最多 128 個字元。">用於識別流量與連線，最多 128 個字元。</span>
+            <section class="user-tab-panel" id="user-panel-basics" role="tabpanel" aria-labelledby="user-tab-basics" data-user-panel="basics" ${activeTab === "basics" ? "" : "hidden"}>
+              <div class="form-grid">
+                <div class="form-field full">
+                  <label for="user-name">用戶名稱 <span class="required-mark" aria-hidden="true">*</span></label>
+                  <input class="text-input" id="user-name" name="name" value="${escapeHTML(draft.name)}" maxlength="128" autocomplete="off" aria-describedby="name-error">
+                  <span class="supporting-text field-message" id="name-error" data-help="用於識別流量、連線與訂閱，最多 128 個字元。">用於識別流量、連線與訂閱，最多 128 個字元。</span>
+                </div>
+                <div class="user-basics-summary full">
+                  <span class="summary-symbol">${icon("server")}</span>
+                  <div><strong>${formatInteger(draft.memberships.length)} 個節點</strong><p>${draft.memberships.map((membership) => escapeHTML(membership.inbound)).join(" · ")}</p></div>
+                </div>
               </div>
-              <div class="dialog-section-heading full"><div><h3>節點 membership</h3><p>每個節點保有自己的協議憑證與使用限制。</p></div><span class="chip primary">${escapeHTML(formatInteger(draft.memberships.length))} 個節點</span></div>
-              <div class="user-memberships full">${draft.memberships.map(renderUserMembership).join("")}</div>
-              ${available.length ? `<div class="add-membership full"><select class="form-select" id="add-user-inbound" aria-label="選擇要新增的節點">${available.map((inbound) => `<option value="${escapeHTML(inbound.tag)}">${escapeHTML(inbound.tag)} · ${escapeHTML(inbound.type)}</option>`).join("")}</select><button class="button button-tonal" type="button" data-action="add-user-membership">${icon("plus")}加入節點</button></div>` : ""}
-
+            </section>
+            <section class="user-tab-panel" id="user-panel-nodes" role="tabpanel" aria-labelledby="user-tab-nodes" data-user-panel="nodes" ${activeTab === "nodes" ? "" : "hidden"}>
+              <div class="user-node-workspace">
+                <aside class="user-node-rail" aria-label="已加入的節點">
+                  <div class="user-node-listbox">${draft.memberships.map((membership, index) => renderUserNodeOption(membership, index, activeMembership)).join("")}</div>
+                  ${available.length ? `<div class="add-membership"><select class="form-select" id="add-user-inbound" aria-label="選擇要新增的節點">${available.map((inbound) => `<option value="${escapeHTML(inbound.tag)}">${escapeHTML(inbound.tag)} · ${escapeHTML(inbound.type)}</option>`).join("")}</select><button class="button button-tonal" type="button" data-action="add-user-membership">${icon("plus")}<span>加入節點</span></button></div>` : `<p class="all-nodes-added">所有可管理節點均已加入</p>`}
+                </aside>
+                <div class="user-node-editor">${draft.memberships.map((membership, index) => renderUserMembership(membership, index, index === activeMembership)).join("")}</div>
+              </div>
+            </section>
+            <section class="user-tab-panel" id="user-panel-links" role="tabpanel" aria-labelledby="user-tab-links" data-user-panel="links" ${activeTab === "links" ? "" : "hidden"}>
               ${editing && model.group.subscription_url ? `
-                <div class="form-field full subscription-field">
-                  <label for="user-subscription-url">訂閱連結</label>
-                  <div class="input-with-actions">
-                    <input class="text-input mono" id="user-subscription-url" type="password" value="${escapeHTML(model.group.subscription_url)}" readonly spellcheck="false">
-                    <div class="input-actions">
-                      <button class="icon-button small" type="button" data-action="toggle-subscription-url" aria-label="顯示訂閱連結" title="顯示訂閱連結">${icon("eye")}</button>
-                      <button class="icon-button small" type="button" data-action="copy-subscription-url" aria-label="複製訂閱連結" title="複製訂閱連結">${icon("copy")}</button>
+                <div class="subscription-panel">
+                  <span class="summary-symbol">${icon("link")}</span>
+                  <div><h3>統一訂閱連結</h3><p>同名用戶在已套用節點上的可用連線會合併至此連結。</p></div>
+                  <div class="form-field full">
+                    <label for="user-subscription-url">訂閱 URL</label>
+                    <div class="input-with-actions">
+                      <input class="text-input mono" id="user-subscription-url" type="password" value="${escapeHTML(model.group.subscription_url)}" readonly spellcheck="false">
+                      <div class="input-actions">
+                        <button class="icon-button small" type="button" data-action="toggle-subscription-url" aria-label="顯示訂閱連結" title="顯示訂閱連結">${icon("eye")}</button>
+                        <button class="icon-button small" type="button" data-action="copy-subscription-url" aria-label="複製訂閱連結" title="複製訂閱連結">${icon("copy")}</button>
+                      </div>
                     </div>
                   </div>
-                  <span class="supporting-text">同名用戶在已套用生產節點上的可用連線會合併至此連結。</span>
-                </div>` : ""}
-            </div>
+                </div>` : `<div class="subscription-empty"><span class="summary-symbol">${icon("link")}</span><h3>建立後產生訂閱</h3><p>儲存用戶後，系統會產生整合所有可用節點的統一訂閱連結。</p></div>`}
+            </section>
           </div>
         </fieldset>
         <footer class="dialog-actions">
@@ -1690,11 +1716,22 @@
       </form>`;
   }
 
-  function renderUserMembership(draft, index) {
+  function userDialogTab(tab, label, iconName, activeTab) {
+    const active = tab === activeTab;
+    return `<button class="user-dialog-tab" id="user-tab-${tab}" type="button" role="tab" data-action="select-user-tab" data-tab="${tab}" aria-controls="user-panel-${tab}" aria-selected="${active}" tabindex="${active ? "0" : "-1"}">${icon(iconName)}<span>${escapeHTML(label)}</span></button>`;
+  }
+
+  function renderUserNodeOption(draft, index, activeIndex) {
+    const inbound = inboundFor(draft.inbound);
+    if (!inbound) return "";
+    return `<button class="user-node-option" type="button" data-action="select-user-membership" data-index="${index}" aria-pressed="${index === activeIndex}"><span class="status-dot ${draft.enabled ? "online" : "offline"}"></span><span><strong>${escapeHTML(inbound.tag)}</strong><small>${escapeHTML(inbound.type)} · ${escapeHTML(credentialLabel(inbound.credential))}</small></span>${icon("check")}</button>`;
+  }
+
+  function renderUserMembership(draft, index, active) {
     const inbound = inboundFor(draft.inbound);
     if (!inbound) return "";
     const suffix = String(index);
-    return `<section class="membership-card" data-membership-index="${suffix}">
+    return `<section class="membership-card" data-membership-index="${suffix}" ${active ? "" : "hidden"}>
       <div class="membership-heading"><div><strong>${escapeHTML(inbound.tag)}</strong><span>${escapeHTML(inbound.type)} · ${escapeHTML(credentialLabel(inbound.credential))}</span></div><button class="icon-button small" type="button" data-action="remove-user-membership" data-index="${suffix}" aria-label="移除 ${escapeHTML(inbound.tag)}" ${state.dialog.draft.memberships.length === 1 ? "disabled" : ""}>${icon("trash")}</button></div>
       <input type="hidden" name="id_${suffix}" value="${escapeHTML(draft.id)}"><input type="hidden" name="inbound_${suffix}" value="${escapeHTML(inbound.tag)}">
       <div class="form-grid membership-fields">
@@ -2008,22 +2045,23 @@
   }
 
   function captureUserDraft(form) {
-    const value = (name) => form.elements.namedItem(name)?.value || "";
+    const current = state.dialog.draft;
+    const value = (name, fallback = "") => form.elements.namedItem(name)?.value ?? fallback;
     const memberships = state.dialog.draft.memberships.map((membership, index) => ({
       id: membership.id,
       inbound: membership.inbound,
-      uuid: value(`uuid_${index}`),
-      password: value(`password_${index}`),
-      flow: value(`flow_${index}`),
-      alter_id: value(`alter_id_${index}`),
-      enabled: Boolean(form.elements.namedItem(`enabled_${index}`)?.checked),
-      quota_gb: value(`quota_gb_${index}`),
-      max_ips: value(`max_ips_${index}`),
-      expires_at: value(`expires_at_${index}`),
+      uuid: value(`uuid_${index}`, membership.uuid),
+      password: value(`password_${index}`, membership.password),
+      flow: value(`flow_${index}`, membership.flow),
+      alter_id: value(`alter_id_${index}`, membership.alter_id),
+      enabled: form.elements.namedItem(`enabled_${index}`)?.checked ?? membership.enabled,
+      quota_gb: value(`quota_gb_${index}`, membership.quota_gb),
+      max_ips: value(`max_ips_${index}`, membership.max_ips),
+      expires_at: value(`expires_at_${index}`, membership.expires_at),
       passwordVisible: membership.passwordVisible,
     }));
     return {
-      name: value("name"),
+      name: value("name", current.name),
       memberships,
     };
   }
@@ -2568,6 +2606,18 @@
 
   async function submitUser(form) {
     const { errors, body } = validateUserForm(form);
+    const firstError = Object.keys(errors)[0] || "";
+    if (firstError) {
+      const membershipMatch = firstError.match(/_(\d+)$/);
+      const nextTab = firstError === "name" ? "basics" : membershipMatch ? "nodes" : state.dialog.activeTab;
+      const nextMembership = membershipMatch ? Number(membershipMatch[1]) : state.dialog.activeMembership;
+      if (nextTab !== state.dialog.activeTab || nextMembership !== state.dialog.activeMembership) {
+        state.dialog.activeTab = nextTab;
+        state.dialog.activeMembership = nextMembership;
+        renderUserDialog();
+        form = document.querySelector('[data-form="user"]');
+      }
+    }
     applyFieldErrors(form, errors);
     const formError = document.getElementById("form-error");
     if (formError) formError.hidden = true;
@@ -2710,6 +2760,16 @@
     }
   });
 
+  app.addEventListener("keydown", (event) => {
+    const tab = event.target.closest?.('.user-dialog-tab[role="tab"]');
+    if (!tab || !["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+    const tabs = [...tab.parentElement.querySelectorAll('.user-dialog-tab[role="tab"]')];
+    const current = tabs.indexOf(tab);
+    const next = event.key === "Home" ? 0 : event.key === "End" ? tabs.length - 1 : (current + (event.key === "ArrowRight" ? 1 : -1) + tabs.length) % tabs.length;
+    event.preventDefault();
+    tabs[next]?.click();
+  });
+
   app.addEventListener("click", async (event) => {
     const actionElement = event.target.closest("[data-action], [data-user-status]");
     if (!actionElement) {
@@ -2821,6 +2881,22 @@
       }
     }
 
+    if (action === "select-user-tab" && state.dialog?.type === "user") {
+      const form = actionElement.closest("form");
+      state.dialog.draft = captureUserDraft(form);
+      state.dialog.activeTab = actionElement.dataset.tab;
+      renderUserDialog();
+      window.setTimeout(() => document.getElementById(`user-tab-${state.dialog.activeTab}`)?.focus(), 0);
+    }
+
+    if (action === "select-user-membership" && state.dialog?.type === "user") {
+      const form = actionElement.closest("form");
+      state.dialog.draft = captureUserDraft(form);
+      state.dialog.activeMembership = Number(actionElement.dataset.index);
+      renderUserDialog();
+      window.setTimeout(() => document.querySelector(`.membership-card[data-membership-index="${state.dialog.activeMembership}"] input:not([type=hidden])`)?.focus(), 0);
+    }
+
     if (action === "generate-password") {
       try {
         const index = Number(actionElement.dataset.index);
@@ -2855,16 +2931,18 @@
       state.dialog.draft = captureUserDraft(form);
       const inbound = inboundFor(document.getElementById("add-user-inbound")?.value);
       if (inbound?.managed) state.dialog.draft.memberships.push(newMembershipDraft(inbound));
+      state.dialog.activeMembership = state.dialog.draft.memberships.length - 1;
       renderUserDialog();
-      window.setTimeout(() => document.querySelector(".membership-card:last-child input:not([type=hidden])")?.focus(), 0);
+      window.setTimeout(() => document.querySelector(".membership-card:not([hidden]) input:not([type=hidden])")?.focus(), 0);
     }
 
     if (action === "remove-user-membership" && state.dialog?.type === "user") {
       const form = actionElement.closest("form");
       state.dialog.draft = captureUserDraft(form);
       state.dialog.draft.memberships.splice(Number(actionElement.dataset.index), 1);
+      state.dialog.activeMembership = Math.min(state.dialog.activeMembership, state.dialog.draft.memberships.length - 1);
       renderUserDialog();
-      window.setTimeout(() => document.getElementById("add-user-inbound")?.focus(), 0);
+      window.setTimeout(() => document.querySelector(".user-node-option[aria-pressed=true]")?.focus(), 0);
     }
 
     if (action === "copy-subscription-url") {

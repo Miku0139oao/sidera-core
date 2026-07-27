@@ -58,6 +58,7 @@ type adminAPI struct {
 	secret         string
 	dataPath       string
 	publicBaseURL  string
+	secure         bool
 	router         http.Handler
 	startedAt      time.Time
 	validationOnly bool
@@ -1127,7 +1128,7 @@ func (a *adminAPI) ServeHTTP(writer http.ResponseWriter, request *http.Request) 
 
 func (a *adminAPI) authenticate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		if !sameOriginAdminRequest(request) {
+		if !sameOriginAdminRequest(request, a.secure) {
 			writeAdminError(writer, http.StatusForbidden, "管理 API 只允許同源瀏覽器請求")
 			return
 		}
@@ -1146,7 +1147,7 @@ func (a *adminAPI) authenticate(next http.Handler) http.Handler {
 	})
 }
 
-func sameOriginAdminRequest(request *http.Request) bool {
+func sameOriginAdminRequest(request *http.Request, secure bool) bool {
 	if request.Header.Get("Sec-Fetch-Site") == "cross-site" {
 		return false
 	}
@@ -1159,7 +1160,7 @@ func sameOriginAdminRequest(request *http.Request) bool {
 		return false
 	}
 	expectedScheme := "http"
-	if request.TLS != nil {
+	if secure || request.TLS != nil {
 		expectedScheme = "https"
 	} else if forwardedScheme := trustedForwardedScheme(request); forwardedScheme != "" {
 		expectedScheme = forwardedScheme
@@ -1168,12 +1169,7 @@ func sameOriginAdminRequest(request *http.Request) bool {
 }
 
 func trustedForwardedScheme(request *http.Request) string {
-	host, _, err := net.SplitHostPort(request.RemoteAddr)
-	if err != nil {
-		host = request.RemoteAddr
-	}
-	address := net.ParseIP(strings.Trim(host, "[]"))
-	if address == nil || !address.IsLoopback() {
+	if !requestFromLoopback(request) {
 		return ""
 	}
 	forwarded := strings.TrimSpace(strings.Split(request.Header.Get("X-Forwarded-Proto"), ",")[0])
@@ -1181,6 +1177,15 @@ func trustedForwardedScheme(request *http.Request) string {
 		return forwarded
 	}
 	return ""
+}
+
+func requestFromLoopback(request *http.Request) bool {
+	host, _, err := net.SplitHostPort(request.RemoteAddr)
+	if err != nil {
+		host = request.RemoteAddr
+	}
+	address := net.ParseIP(strings.Trim(host, "[]"))
+	return address != nil && address.IsLoopback()
 }
 
 func (a *adminAPI) getOverview(writer http.ResponseWriter, request *http.Request) {

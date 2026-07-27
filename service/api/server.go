@@ -77,6 +77,7 @@ func NewService(ctx context.Context, logger log.ContextLogger, tag string, optio
 			cancel()
 			return nil, E.Cause(err, "initialize dashboard management")
 		}
+		admin.secure = options.TLS != nil && options.TLS.Enabled
 		s.admin = admin
 	}
 	return s, nil

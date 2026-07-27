@@ -427,9 +427,19 @@ func TestSameOriginAcceptsTrustedLoopbackProxyScheme(t *testing.T) {
 	request.RemoteAddr = "127.0.0.1:12345"
 	request.Header.Set("Origin", "https://admin.example.com")
 	request.Header.Set("X-Forwarded-Proto", "https")
-	require.True(t, sameOriginAdminRequest(request))
+	require.True(t, sameOriginAdminRequest(request, false))
 	request.RemoteAddr = "192.0.2.10:12345"
-	require.False(t, sameOriginAdminRequest(request))
+	require.False(t, sameOriginAdminRequest(request, false))
+}
+
+func TestSameOriginUsesConfiguredTLSTransport(t *testing.T) {
+	request := httptest.NewRequest("GET", "http://admin.example.com:62790/api/admin/overview", nil)
+	request.Host = "admin.example.com:62790"
+	request.RemoteAddr = "192.0.2.10:12345"
+	request.Header.Set("Origin", "https://admin.example.com:62790")
+	require.Nil(t, request.TLS)
+	require.True(t, sameOriginAdminRequest(request, true))
+	require.False(t, sameOriginAdminRequest(request, false))
 }
 
 func TestWebSocketOriginPolicyDefaultsToSameOrigin(t *testing.T) {
