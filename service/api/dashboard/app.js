@@ -2576,7 +2576,7 @@
     const editing = Boolean(model.group);
     setUserDialogBusy(true);
     try {
-      const path = editing ? `/user-groups/${encodeURIComponent(model.group.name)}` : "/user-groups";
+      const path = editing ? `/user-groups?name=${encodeURIComponent(model.group.name)}` : "/user-groups";
       await api(path, { method: editing ? "PUT" : "POST", body: JSON.stringify(body) });
       state.dialog.submitting = false;
       closeDialog();
@@ -2898,7 +2898,7 @@
         const epoch = state.epoch;
         const route = state.route;
         try {
-          const detail = await api(`/user-groups/${encodeURIComponent(group.name)}`);
+          const detail = await api(`/user-groups?name=${encodeURIComponent(group.name)}`);
           if (requestID !== state.detailRequest || epoch !== state.epoch || route !== state.route || !state.authenticated) return;
           openUserDialog(detail);
         } catch (error) {
@@ -2950,7 +2950,7 @@
         confirmLabel: "刪除用戶",
         successMessage: "用戶已刪除",
         action: async () => {
-          await api(`/user-groups/${encodeURIComponent(group.name)}`, { method: "DELETE", body: JSON.stringify({ revisions }) });
+          await api(`/user-groups?name=${encodeURIComponent(group.name)}`, { method: "DELETE", body: JSON.stringify({ revisions }) });
           await Promise.all([loadUsers({ silent: true, force: true }), loadOverview({ silent: true, force: true })]);
         },
       });
@@ -2966,7 +2966,7 @@
         successMessage: "用戶流量已歸零",
         danger: false,
         action: async () => {
-          await api(`/user-groups/${encodeURIComponent(group.name)}/reset-traffic`, { method: "POST" });
+          await api(`/user-groups/reset-traffic?name=${encodeURIComponent(group.name)}`, { method: "POST" });
           await loadUsers({ silent: true, force: true });
         },
       });

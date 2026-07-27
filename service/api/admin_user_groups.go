@@ -52,7 +52,7 @@ func (input adminUserGroupMembershipInput) userInput(name string, revision int64
 }
 
 func (a *adminAPI) getUserGroup(writer http.ResponseWriter, request *http.Request) {
-	name := chi.URLParam(request, "name")
+	name := requestedUserGroupName(request)
 	active := a.activeUsage()
 	a.storeAccess.RLock()
 	view, loaded := a.userGroupViewLocked(name, active)
@@ -77,7 +77,7 @@ func (a *adminAPI) updateUserGroup(writer http.ResponseWriter, request *http.Req
 	if err := decodeAdminJSON(writer, request, &input); err != nil {
 		return
 	}
-	a.mutateUserGroup(writer, chi.URLParam(request, "name"), input, false)
+	a.mutateUserGroup(writer, requestedUserGroupName(request), input, false)
 }
 
 func (a *adminAPI) mutateUserGroup(writer http.ResponseWriter, oldName string, input adminUserGroupInput, creating bool) {
@@ -290,7 +290,7 @@ func (a *adminAPI) deleteUserGroup(writer http.ResponseWriter, request *http.Req
 	if err := decodeAdminJSON(writer, request, &input); err != nil {
 		return
 	}
-	name := chi.URLParam(request, "name")
+	name := requestedUserGroupName(request)
 	a.mutation.Lock()
 	defer a.unlockMutation()
 	current := a.userGroupMembers(name)
@@ -339,7 +339,7 @@ func (a *adminAPI) deleteUserGroup(writer http.ResponseWriter, request *http.Req
 }
 
 func (a *adminAPI) resetUserGroupTraffic(writer http.ResponseWriter, request *http.Request) {
-	name := chi.URLParam(request, "name")
+	name := requestedUserGroupName(request)
 	a.mutation.Lock()
 	defer a.unlockMutation()
 	current := a.userGroupMembers(name)
@@ -459,4 +459,11 @@ func restoreStringMapEntry(values map[string]string, key string, value string, l
 	} else {
 		delete(values, key)
 	}
+}
+
+func requestedUserGroupName(request *http.Request) string {
+	if name := request.URL.Query().Get("name"); name != "" {
+		return name
+	}
+	return chi.URLParam(request, "name")
 }

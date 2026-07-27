@@ -274,7 +274,7 @@ func TestUserGroupMutationsAreRevisionSafeAcrossInbounds(t *testing.T) {
 	require.Equal(t, "second-password", second.users[0].Password)
 
 	staleBody, err := stdjson.Marshal(map[string]any{
-		"name": "renamed",
+		"name": "renamed/user",
 		"memberships": []map[string]any{
 			{"id": a.store.Inbounds[first.Tag()].Users[0].ID, "inbound": first.Tag(), "password": "changed", "enabled": true},
 		},
@@ -294,7 +294,7 @@ func TestUserGroupMutationsAreRevisionSafeAcrossInbounds(t *testing.T) {
 	subscriptionToken := a.store.Subscriptions["alice"]
 	require.NotEmpty(t, subscriptionToken)
 	renameBody, err := stdjson.Marshal(map[string]any{
-		"name": "renamed",
+		"name": "renamed/user",
 		"memberships": []map[string]any{
 			{"id": a.store.Inbounds[first.Tag()].Users[0].ID, "inbound": first.Tag(), "password": "first-password", "enabled": true},
 			{"id": a.store.Inbounds[second.Tag()].Users[0].ID, "inbound": second.Tag(), "password": "second-password", "enabled": true},
@@ -305,12 +305,14 @@ func TestUserGroupMutationsAreRevisionSafeAcrossInbounds(t *testing.T) {
 		},
 	})
 	require.NoError(t, err)
-	response = adminRequest(a, "PUT", adminRoutePrefix+"/user-groups/alice", renameBody)
+	response = adminRequest(a, "PUT", adminRoutePrefix+"/user-groups?name=alice", renameBody)
 	require.Equal(t, 200, response.Code, response.Body.String())
-	require.Equal(t, "renamed", a.store.Inbounds[first.Tag()].Users[0].Name)
-	require.Equal(t, "renamed", a.store.Inbounds[second.Tag()].Users[0].Name)
+	require.Equal(t, "renamed/user", a.store.Inbounds[first.Tag()].Users[0].Name)
+	require.Equal(t, "renamed/user", a.store.Inbounds[second.Tag()].Users[0].Name)
 	require.NotContains(t, a.store.Subscriptions, "alice")
-	require.Equal(t, subscriptionToken, a.store.Subscriptions["renamed"])
+	require.Equal(t, subscriptionToken, a.store.Subscriptions["renamed/user"])
+	response = adminRequest(a, "GET", adminRoutePrefix+"/user-groups?name=renamed%2Fuser", nil)
+	require.Equal(t, 200, response.Code, response.Body.String())
 
 	revisions := map[string]int64{
 		first.Tag():  a.store.Inbounds[first.Tag()].Revision,
@@ -318,7 +320,7 @@ func TestUserGroupMutationsAreRevisionSafeAcrossInbounds(t *testing.T) {
 	}
 	deleteBody, err := stdjson.Marshal(map[string]any{"revisions": revisions})
 	require.NoError(t, err)
-	response = adminRequest(a, "DELETE", adminRoutePrefix+"/user-groups/renamed", deleteBody)
+	response = adminRequest(a, "DELETE", adminRoutePrefix+"/user-groups?name=renamed%2Fuser", deleteBody)
 	require.Equal(t, 204, response.Code, response.Body.String())
 	require.Empty(t, a.store.Inbounds[first.Tag()].Users)
 	require.Empty(t, a.store.Inbounds[second.Tag()].Users)
