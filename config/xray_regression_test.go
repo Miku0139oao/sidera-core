@@ -3,6 +3,7 @@ package config_test
 import (
 	"context"
 	"math"
+	"net/netip"
 	"strings"
 	"testing"
 	"time"
@@ -10,6 +11,7 @@ import (
 	"github.com/Miku0139oao/sidera-core/config"
 	"github.com/Miku0139oao/sidera-core/include"
 	"github.com/Miku0139oao/sidera-core/option"
+	"github.com/sagernet/sing/common/json/badoption"
 	"github.com/stretchr/testify/require"
 )
 
@@ -340,6 +342,7 @@ func TestDecodeXrayVLESSInboundWithRealityEncryption(t *testing.T) {
 			},
 			"streamSettings": {
 				"network": "raw",
+				"rawSettings": {"acceptProxyProtocol": true},
 				"security": "reality",
 				"realitySettings": {
 					"show": true,
@@ -356,6 +359,11 @@ func TestDecodeXrayVLESSInboundWithRealityEncryption(t *testing.T) {
 	require.Len(t, options.Inbounds, 1)
 	require.Equal(t, "vless", options.Inbounds[0].Type)
 	vlessOptions := options.Inbounds[0].Options.(*option.VLESSInboundOptions)
+	require.True(t, vlessOptions.ProxyProtocol)
+	require.Equal(t, &[]badoption.Prefix{
+		badoption.Prefix(netip.MustParsePrefix("0.0.0.0/0")),
+		badoption.Prefix(netip.MustParsePrefix("::/0")),
+	}, vlessOptions.ProxyProtocolTrustedUpstream)
 	require.Equal(t, decryption, vlessOptions.Decryption)
 	require.Len(t, vlessOptions.Users, 1)
 	require.Equal(t, "alice", vlessOptions.Users[0].Name)

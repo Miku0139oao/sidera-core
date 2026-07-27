@@ -956,15 +956,16 @@ func translateXrayVLESSInboundStream(source *xrayStream) (map[string]any, error)
 	if source.RawSettings != nil {
 		tcpSettings = source.RawSettings
 	}
+	result := make(map[string]any)
 	if tcpSettings != nil {
 		if tcpSettings.AcceptProxyProtocol {
-			return nil, unsupportedXrayField("streamSettings.rawSettings.acceptProxyProtocol")
+			result["proxy_protocol"] = true
+			result["proxy_protocol_trusted_upstream"] = []string{"0.0.0.0/0", "::/0"}
 		}
 		if err = validateXrayTCPHeader(tcpSettings.Header); err != nil {
 			return nil, err
 		}
 	}
-	result := make(map[string]any)
 	switch strings.ToLower(source.Security) {
 	case "", "none":
 	case "reality":

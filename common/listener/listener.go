@@ -22,18 +22,19 @@ import (
 )
 
 type Listener struct {
-	ctx                      context.Context
-	logger                   logger.ContextLogger
-	network                  []string
-	listenOptions            option.ListenOptions
-	connHandler              adapter.ConnectionHandler
-	packetHandler            adapter.PacketHandler
-	oobPacketHandler         adapter.OOBPacketHandler
-	threadUnsafePacketWriter bool
-	disablePacketOutput      bool
-	setSystemProxy           bool
-	systemProxySOCKS         bool
-	tproxy                   bool
+	ctx                          context.Context
+	logger                       logger.ContextLogger
+	network                      []string
+	listenOptions                option.ListenOptions
+	connHandler                  adapter.ConnectionHandler
+	packetHandler                adapter.PacketHandler
+	oobPacketHandler             adapter.OOBPacketHandler
+	threadUnsafePacketWriter     bool
+	disablePacketOutput          bool
+	setSystemProxy               bool
+	systemProxySOCKS             bool
+	tproxy                       bool
+	proxyProtocolTrustedUpstream []netip.Prefix
 
 	tcpListener          net.Listener
 	systemProxy          settings.SystemProxy
@@ -79,6 +80,9 @@ func New(
 }
 
 func (l *Listener) Start() error {
+	if l.listenOptions.ProxyProtocol && !common.Contains(l.network, N.NetworkTCP) {
+		return E.New("proxy_protocol requires a TCP listener")
+	}
 	if common.Contains(l.network, N.NetworkTCP) {
 		_, err := l.ListenTCP()
 		if err != nil {
