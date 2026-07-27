@@ -80,7 +80,7 @@ type webBridge struct {
 func (b *webBridge) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	contentType := request.Header.Get("Content-Type")
 	switch {
-	case b.admin != nil && (request.URL.Path == adminRoutePrefix || strings.HasPrefix(request.URL.Path, adminRoutePrefix+"/") || strings.HasPrefix(request.URL.Path, subscriptionRoutePrefix) || strings.HasPrefix(request.URL.Path, profilePageRoutePrefix)):
+	case b.admin != nil && (request.URL.Path == adminRoutePrefix || strings.HasPrefix(request.URL.Path, adminRoutePrefix+"/") || b.admin.matchesPublicRoute(request.URL.Path)):
 		b.admin.ServeHTTP(writer, request)
 	case isWebSocketGRPCRequest(request):
 		b.serveWebSocket(writer, request)

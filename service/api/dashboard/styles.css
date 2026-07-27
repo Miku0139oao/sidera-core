@@ -654,6 +654,210 @@ svg {
   box-shadow: 0 1px 2px var(--shadow);
 }
 
+.settings-security-banner {
+  position: relative;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 20px;
+  align-items: center;
+  margin-bottom: 18px;
+  padding: 26px 28px;
+  overflow: hidden;
+  border-radius: 28px;
+  background:
+    radial-gradient(circle at 92% 10%, color-mix(in srgb, var(--success) 18%, transparent) 0, transparent 15rem),
+    linear-gradient(125deg, var(--primary-container), color-mix(in srgb, var(--secondary-container) 72%, var(--surface)));
+  color: var(--on-primary-container);
+}
+
+.settings-security-banner::after {
+  position: absolute;
+  right: -42px;
+  bottom: -92px;
+  width: 220px;
+  height: 220px;
+  border: 1px solid color-mix(in srgb, var(--primary) 20%, transparent);
+  border-radius: 50%;
+  content: "";
+}
+
+.settings-security-mark {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  width: 58px;
+  height: 58px;
+  place-items: center;
+  border-radius: 20px;
+  background: color-mix(in srgb, var(--surface) 68%, transparent);
+  box-shadow: 0 10px 26px color-mix(in srgb, var(--primary) 14%, transparent);
+}
+
+.settings-security-banner > div {
+  position: relative;
+  z-index: 1;
+}
+
+.settings-security-banner .eyebrow {
+  margin-bottom: 7px;
+}
+
+.settings-security-banner h3 {
+  margin: 0;
+  font-size: clamp(20px, 3vw, 29px);
+  letter-spacing: -0.03em;
+}
+
+.settings-security-banner p {
+  max-width: 760px;
+  margin: 7px 0 0;
+  color: color-mix(in srgb, var(--on-primary-container) 78%, transparent);
+  font-size: 13px;
+}
+
+.settings-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1.35fr) minmax(310px, 0.65fr);
+  gap: 18px;
+  align-items: start;
+}
+
+.settings-form-card,
+.settings-preview-card {
+  padding: clamp(21px, 3vw, 30px);
+}
+
+.settings-card-heading {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin-bottom: 23px;
+}
+
+.settings-card-heading.compact {
+  align-items: flex-start;
+}
+
+.settings-card-heading h3 {
+  margin: 0;
+  font-size: 18px;
+  letter-spacing: -0.02em;
+}
+
+.settings-card-heading p {
+  margin: 3px 0 0;
+  color: var(--on-surface-variant);
+  font-size: 11px;
+}
+
+.settings-card-icon {
+  display: grid;
+  width: 46px;
+  height: 46px;
+  flex: 0 0 auto;
+  place-items: center;
+  border-radius: 16px;
+  background: var(--primary-container);
+  color: var(--on-primary-container);
+}
+
+.settings-card-icon.preview {
+  background: var(--success-container);
+  color: var(--on-success-container);
+}
+
+.settings-fieldset {
+  padding: 0;
+  border: 0;
+  margin: 0;
+}
+
+.settings-form-grid {
+  display: grid;
+  gap: 20px;
+}
+
+.settings-scope-note {
+  margin-bottom: 20px;
+}
+
+.settings-legacy-switch {
+  margin-top: 2px;
+}
+
+.settings-form-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 9px;
+  margin-top: 24px;
+  padding-top: 20px;
+  border-top: 1px solid var(--outline-variant);
+}
+
+.settings-preview-card {
+  position: sticky;
+  top: calc(var(--topbar-height) + 18px);
+  overflow: hidden;
+}
+
+.settings-preview-list {
+  display: grid;
+  gap: 12px;
+  margin: 0;
+}
+
+.settings-preview-list > div {
+  padding: 14px;
+  border-radius: 18px;
+  background: var(--surface-container-low);
+}
+
+.settings-preview-list dt {
+  margin-bottom: 5px;
+  color: var(--on-surface-variant);
+  font-size: 10px;
+  font-weight: 750;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.settings-preview-list dd {
+  margin: 0;
+}
+
+.settings-preview-list code {
+  display: block;
+  color: var(--on-surface);
+  font-family: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.settings-route-state {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  margin-top: 16px;
+  padding: 13px 14px;
+  border-radius: 17px;
+  font-size: 11px;
+}
+
+.settings-route-state .icon {
+  width: 18px;
+  height: 18px;
+}
+
+.settings-route-state.warning {
+  background: var(--warning-container);
+  color: color-mix(in srgb, var(--on-surface) 82%, #5a3900);
+}
+
+.settings-route-state.success {
+  background: var(--success-container);
+  color: var(--on-success-container);
+}
+
 .hero-card {
   position: relative;
   display: grid;
@@ -2789,7 +2993,7 @@ svg {
     left: 12px;
     display: grid;
     min-height: 70px;
-    grid-template-columns: repeat(4, minmax(0, 1fr));
+    grid-template-columns: repeat(5, minmax(0, 1fr));
     padding: 7px;
     border: 1px solid color-mix(in srgb, var(--outline-variant) 64%, transparent);
     border-radius: 24px;
@@ -2824,6 +3028,14 @@ svg {
 }
 
 @media (max-width: 820px) {
+  .settings-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .settings-preview-card {
+    position: static;
+  }
+
   .hero-card {
     grid-template-columns: 1fr;
     min-height: auto;
@@ -2863,6 +3075,18 @@ svg {
   .page-heading {
     align-items: flex-start;
     flex-direction: column;
+  }
+
+  .settings-page .page-heading {
+    position: relative;
+    padding-right: 52px;
+  }
+
+  .settings-page .page-actions {
+    position: absolute;
+    top: 0;
+    right: 0;
+    width: auto;
   }
 
   .page-actions {
@@ -2992,6 +3216,32 @@ svg {
 }
 
 @media (max-width: 480px) {
+  .settings-security-banner {
+    align-items: start;
+    padding: 22px 19px;
+  }
+
+  .settings-security-mark {
+    width: 48px;
+    height: 48px;
+    border-radius: 16px;
+  }
+
+  .settings-form-card,
+  .settings-preview-card {
+    padding: 20px 16px;
+    border-radius: 25px;
+  }
+
+  .settings-form-actions {
+    align-items: stretch;
+    flex-direction: column-reverse;
+  }
+
+  .settings-form-actions .button {
+    width: 100%;
+  }
+
   .topbar {
     padding-right: 12px;
     padding-left: 12px;

@@ -123,7 +123,10 @@ func (a *adminAPI) getSubscription(writer http.ResponseWriter, request *http.Req
 		http.NotFound(writer, request)
 		return
 	}
-	token := chi.URLParam(request, "token")
+	token := request.PathValue("token")
+	if token == "" {
+		token = chi.URLParam(request, "token")
+	}
 	a.storeAccess.RLock()
 	name, found := a.subscriptionNameLocked(token)
 	a.storeAccess.RUnlock()
@@ -142,6 +145,7 @@ func (a *adminAPI) getSubscription(writer http.ResponseWriter, request *http.Req
 		return
 	}
 	links := a.subscriptionLinksLocked(name, now, active)
+	profilePagePath := a.profilePagePathLocked()
 	a.storeAccess.RUnlock()
 	if len(links) == 0 {
 		http.NotFound(writer, request)
@@ -152,7 +156,7 @@ func (a *adminAPI) getSubscription(writer http.ResponseWriter, request *http.Req
 	writer.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	writer.Header().Set("Content-Length", strconv.Itoa(len(body)))
 	writer.Header().Set("Profile-Update-Interval", "12")
-	writer.Header().Set("Profile-Web-Page-Url", a.publicBaseURL+profilePageRoutePrefix+url.PathEscape(token))
+	writer.Header().Set("Profile-Web-Page-Url", a.publicBaseURL+profilePagePath+url.PathEscape(token))
 	upload, download, total, expire := a.subscriptionUsageLocked(name, active)
 	writer.Header().Set("Subscription-Userinfo", "upload="+strconv.FormatInt(upload, 10)+"; download="+strconv.FormatInt(download, 10)+"; total="+strconv.FormatInt(total, 10)+"; expire="+strconv.FormatInt(expire, 10))
 	if request.Method == http.MethodGet {

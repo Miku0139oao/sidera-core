@@ -28,7 +28,15 @@ type subscriptionProfileNode struct {
 }
 
 func (a *adminAPI) getSubscriptionProfile(writer http.ResponseWriter, request *http.Request) {
-	identifier := chi.URLParam(request, "identifier")
+	if request.Method != http.MethodGet {
+		writer.Header().Set("Allow", http.MethodGet)
+		writer.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	identifier := request.PathValue("identifier")
+	if identifier == "" {
+		identifier = chi.URLParam(request, "identifier")
+	}
 	a.storeAccess.RLock()
 	name, subscriptionPath, found := a.subscriptionProfileIdentityLocked(identifier)
 	a.storeAccess.RUnlock()
@@ -68,7 +76,7 @@ func (a *adminAPI) getSubscriptionProfile(writer http.ResponseWriter, request *h
 
 func (a *adminAPI) subscriptionProfileIdentityLocked(identifier string) (name string, path string, found bool) {
 	if name, found = a.subscriptionNameLocked(identifier); found {
-		return name, subscriptionRoutePrefix + url.PathEscape(identifier), true
+		return name, a.subscriptionPathLocked() + url.PathEscape(identifier), true
 	}
 	for candidateName, externalID := range a.store.ExternalSubscriptions {
 		if externalID == identifier && validExternalSubscriptionID(externalID) {

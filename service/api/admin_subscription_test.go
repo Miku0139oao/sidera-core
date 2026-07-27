@@ -31,7 +31,7 @@ func TestValidateSubscriptionBaseURL(t *testing.T) {
 	}
 }
 
-func TestSubscriptionTokenMigrationPersistsV4(t *testing.T) {
+func TestSubscriptionTokenMigrationPersistsCurrentVersion(t *testing.T) {
 	dataPath := filepath.Join(t.TempDir(), "dashboard.json")
 	require.NoError(t, os.WriteFile(dataPath, []byte(`{"version":3,"inbounds":{"legacy":{"type":"hysteria2","users":[{"id":"id","name":"Alice","enabled":true}]}},"servers":{}}`), 0o600))
 	a, err := newAdminAPI(context.Background(), nil, "", dataPath, "https://panel.example.com", nil, false)
@@ -42,7 +42,8 @@ func TestSubscriptionTokenMigrationPersistsV4(t *testing.T) {
 	require.NoError(t, err)
 	var stored adminStore
 	require.NoError(t, json.Unmarshal(content, &stored))
-	require.Equal(t, 4, stored.Version)
+	require.Equal(t, adminStoreVersion, stored.Version)
+	require.Equal(t, defaultAdminSettings(), stored.Settings)
 	token := stored.Subscriptions["Alice"]
 	require.Len(t, token, 43)
 	_, err = base64.RawURLEncoding.DecodeString(token)

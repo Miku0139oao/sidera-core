@@ -420,7 +420,7 @@ func (a *adminAPI) userGroupViewLocked(name string, active map[string]adminUsage
 	if externalID := a.store.ExternalSubscriptions[name]; validExternalSubscriptionID(externalID) && a.publicBaseURL != "" {
 		view.SubscriptionURL = a.publicBaseURL + "/sub/" + url.PathEscape(externalID)
 	} else if token := a.store.Subscriptions[name]; token != "" && a.publicBaseURL != "" && len(a.subscriptionLinksLocked(name, time.Now().UnixMilli(), active)) > 0 {
-		view.SubscriptionURL = a.publicBaseURL + subscriptionRoutePrefix + token
+		view.SubscriptionURL = a.publicBaseURL + a.subscriptionPathLocked() + token
 	}
 	return view, true
 }

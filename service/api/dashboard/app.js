@@ -7,6 +7,8 @@
   const POLL_INTERVAL = 3000;
   const REQUEST_TIMEOUT = 12000;
   const GIB = 1024 ** 3;
+  const DEFAULT_SUBSCRIPTION_PATH = "/sub/sidera/";
+  const DEFAULT_PROFILE_PATH = "/api/list/nodes/";
 
   const app = document.getElementById("app");
   const toastRegion = document.getElementById("toast-region");
@@ -39,6 +41,13 @@
       title: "即時連線",
       kicker: "網路活動",
       icon: "activity",
+    },
+    settings: {
+      hash: "#/settings",
+      label: "設定",
+      title: "訂閱安全",
+      kicker: "公開路徑",
+      icon: "shield",
     },
   };
 
@@ -104,8 +113,10 @@
     protocolSchemaVersion: null,
     protocols: [],
     servers: [],
+    settings: null,
     restartRequired: false,
     reloading: false,
+    savingSettings: false,
     offline: !navigator.onLine,
     lastUpdated: 0,
     loading: {
@@ -114,12 +125,14 @@
       servers: false,
       users: false,
       connections: false,
+      settings: false,
     },
     loaded: {
       protocols: false,
       servers: false,
       users: false,
       connections: false,
+      settings: false,
     },
     errors: {
       overview: "",
@@ -127,6 +140,7 @@
       servers: "",
       users: "",
       connections: "",
+      settings: "",
     },
     filters: {
       userSearch: "",
@@ -530,6 +544,7 @@
             ${navItem("servers")}
             ${navItem("users")}
             ${navItem("connections")}
+            ${navItem("settings")}
           </nav>
           <div class="drawer-footer">
             <p class="nav-label">帳戶與安全性</p>
@@ -579,6 +594,7 @@
           ${navItem("servers", true)}
           ${navItem("users", true)}
           ${navItem("connections", true)}
+          ${navItem("settings", true)}
         </nav>
         <dialog class="app-dialog" id="app-dialog"></dialog>
       </div>`;
@@ -645,6 +661,7 @@
     if (state.route === "servers") renderServers();
     if (state.route === "users") renderUsers();
     if (state.route === "connections") renderConnections();
+    if (state.route === "settings") renderSettings();
   }
 
   function loadingPage(type) {
@@ -1445,6 +1462,164 @@
         <div id="connection-results"></div>
       </div>`;
     renderConnectionResults();
+  }
+
+  function publicSettingsURL(path) {
+    const base = String(state.settings?.public_base_url || "").replace(/\/$/, "");
+    return `${base}${path || "/"}user-token`;
+  }
+
+  function settingsRouteState(subscriptionPath, profilePath, legacyEnabled) {
+    if (legacyEnabled) {
+      return { tone: "warning", iconName: "alert", message: "Core 舊版入口仍會保留。確認所有原生用戶完成遷移後再關閉。" };
+    }
+    if (subscriptionPath === DEFAULT_SUBSCRIPTION_PATH || profilePath === DEFAULT_PROFILE_PATH) {
+      return { tone: "warning", iconName: "alert", message: "雖未保留舊版別名，目前仍有路徑使用預設值；改為自訂路徑才能撤銷該入口。" };
+    }
+    return { tone: "success", iconName: "check", message: "不保留 Core 舊版入口；仍使用舊連結的客戶端將無法更新。" };
+  }
+
+  function renderSettings() {
+    const main = document.getElementById("main-content");
+    if (!main) return;
+    if (!state.loaded.settings && !state.errors.settings) {
+      main.innerHTML = loadingPage("settings");
+      main.setAttribute("aria-busy", "true");
+      return;
+    }
+    if (!state.loaded.settings && state.errors.settings) {
+      main.innerHTML = errorState("無法載入安全設定", state.errors.settings, "refresh-settings");
+      main.setAttribute("aria-busy", "false");
+      return;
+    }
+
+    const settings = state.settings || {};
+    const subscriptionPath = settings.subscription_path || DEFAULT_SUBSCRIPTION_PATH;
+    const profilePath = settings.profile_page_path || DEFAULT_PROFILE_PATH;
+    const legacyEnabled = Boolean(settings.legacy_routes_enabled);
+    const routeState = settingsRouteState(subscriptionPath, profilePath, legacyEnabled);
+    const busy = state.loading.settings || state.savingSettings;
+    main.setAttribute("aria-busy", busy ? "true" : "false");
+    main.innerHTML = `
+      <div class="page-enter settings-page">
+        <div class="page-heading">
+          <div>
+            <h2>訂閱安全</h2>
+            <p>輪替 Core 原生訂閱入口並撤銷舊路徑，不需重新載入 Core。</p>
+          </div>
+          <div class="page-actions">
+            <button class="icon-button ${state.loading.settings ? "spin" : ""}" type="button" data-action="refresh-settings" aria-label="重新載入設定" title="重新載入設定" ${busy ? "disabled" : ""}>${icon("refresh")}</button>
+          </div>
+        </div>
+
+        <section class="settings-security-banner" aria-label="路徑安全提醒">
+          <span class="settings-security-mark">${icon("shield", "icon-lg")}</span>
+          <div>
+            <span class="eyebrow">公開入口防護</span>
+            <h3>讓可猜測的預設路徑退出服務</h3>
+            <p>自訂 Core 原生路徑可降低自動掃描，但不會取代每位用戶的訂閱 Token。懷疑連結外洩時，仍應更換該用戶的訂閱識別碼。</p>
+          </div>
+        </section>
+
+        <div class="settings-layout">
+          <form class="card settings-form-card" data-form="settings" novalidate>
+            <div class="settings-card-heading">
+              <span class="settings-card-icon">${icon("link")}</span>
+              <div><h3>公開路徑</h3><p>路徑儲存後立即生效；所有值都必須以斜線開頭及結尾。</p></div>
+            </div>
+            <div class="schema-note settings-scope-note">${icon("alert")}<span>此頁只控制 Core 原生入口。外部 x-ui 的 /sub/{id} 與 Caddy 代理不會被這個開關撤銷。</span></div>
+            <div class="form-error" id="settings-form-error" role="alert" hidden></div>
+            <fieldset class="settings-fieldset" ${busy ? "disabled" : ""}>
+              <div class="settings-form-grid">
+                <div class="form-field">
+                  <label for="subscription-path">訂閱內容路徑 <span class="required-mark" aria-hidden="true">*</span></label>
+                  <input class="text-input" id="subscription-path" name="subscription_path" value="${escapeHTML(subscriptionPath)}" maxlength="128" autocomplete="off" spellcheck="false" aria-describedby="subscription_path-error">
+                  <span class="supporting-text field-message" id="subscription_path-error" data-help="只可使用英數字、-、_ 與路徑分隔符。">只可使用英數字、-、_ 與路徑分隔符。</span>
+                </div>
+                <div class="form-field">
+                  <label for="profile-page-path">資訊頁路徑 <span class="required-mark" aria-hidden="true">*</span></label>
+                  <input class="text-input" id="profile-page-path" name="profile_page_path" value="${escapeHTML(profilePath)}" maxlength="128" autocomplete="off" spellcheck="false" aria-describedby="profile_page_path-error">
+                  <span class="supporting-text field-message" id="profile_page_path-error" data-help="不可與訂閱路徑、管理 API 或 dashboard 重疊。">不可與訂閱路徑、管理 API 或 dashboard 重疊。</span>
+                </div>
+                <label class="switch-row settings-legacy-switch">
+                  <span class="switch-copy"><strong>保留 Core 舊版入口</strong><span>變更路徑後，繼續接受預設的原生訂閱與資訊頁入口。</span></span>
+                  <span class="switch-control"><input name="legacy_routes_enabled" type="checkbox" ${legacyEnabled ? "checked" : ""}><span class="switch-track" aria-hidden="true"></span></span>
+                </label>
+              </div>
+            </fieldset>
+            <div class="settings-form-actions">
+              <button class="button button-outline" type="button" data-action="reset-settings-paths" ${busy ? "disabled" : ""}>${icon("reset")}預設值</button>
+              <button class="button button-primary ${state.savingSettings ? "is-loading" : ""}" type="submit" data-settings-submit ${busy ? "disabled" : ""}>${icon(state.savingSettings ? "refresh" : "check")}<span>${state.savingSettings ? "儲存中…" : "儲存設定"}</span></button>
+            </div>
+          </form>
+
+          <aside class="card settings-preview-card" aria-labelledby="settings-preview-title">
+            <div class="settings-card-heading compact">
+              <span class="settings-card-icon preview">${icon("network")}</span>
+              <div><h3 id="settings-preview-title">生效後入口</h3><p>${settings.public_base_url ? `公開來源：${escapeHTML(settings.public_base_url)}` : "尚未設定公開 Base URL，以下僅顯示路徑。"}</p></div>
+            </div>
+            <dl class="settings-preview-list">
+              <div><dt>訂閱內容</dt><dd><code id="settings-subscription-preview">${escapeHTML(publicSettingsURL(subscriptionPath))}</code></dd></div>
+              <div><dt>用戶資訊頁</dt><dd><code id="settings-profile-preview">${escapeHTML(publicSettingsURL(profilePath))}</code></dd></div>
+            </dl>
+            <div class="settings-route-state ${routeState.tone}" id="settings-route-state">
+              ${icon(routeState.iconName)}
+              <span>${routeState.message}</span>
+            </div>
+          </aside>
+        </div>
+      </div>`;
+  }
+
+  function updateSettingsPreview(form) {
+    const subscriptionPath = form.elements.subscription_path.value.trim();
+    const profilePath = form.elements.profile_page_path.value.trim();
+    const subscriptionPreview = document.getElementById("settings-subscription-preview");
+    const profilePreview = document.getElementById("settings-profile-preview");
+    if (subscriptionPreview) subscriptionPreview.textContent = publicSettingsURL(subscriptionPath);
+    if (profilePreview) profilePreview.textContent = publicSettingsURL(profilePath);
+    const legacyEnabled = form.elements.legacy_routes_enabled.checked;
+    const stateView = settingsRouteState(subscriptionPath, profilePath, legacyEnabled);
+    const routeState = document.getElementById("settings-route-state");
+    if (routeState) {
+      routeState.className = `settings-route-state ${stateView.tone}`;
+      routeState.innerHTML = `${icon(stateView.iconName)}<span>${stateView.message}</span>`;
+    }
+  }
+
+  function validateSettingsForm(form) {
+    const subscriptionPath = form.elements.subscription_path.value.trim();
+    const profilePath = form.elements.profile_page_path.value.trim();
+    const errors = {};
+    const safePath = /^\/[A-Za-z0-9_-]+(?:\/[A-Za-z0-9_-]+)*\/$/;
+    if (!safePath.test(subscriptionPath)) errors.subscription_path = "訂閱路徑必須以 / 開頭與結尾，且只能包含英數字、-、_ 與路徑分隔符。";
+    if (!safePath.test(profilePath)) errors.profile_page_path = "資訊頁路徑必須以 / 開頭與結尾，且只能包含英數字、-、_ 與路徑分隔符。";
+    if (subscriptionPath.length > 128) errors.subscription_path = "訂閱路徑不可超過 128 個字元。";
+    if (profilePath.length > 128) errors.profile_page_path = "資訊頁路徑不可超過 128 個字元。";
+    const overlaps = (left, right) => left.startsWith(right) || right.startsWith(left);
+    if (!errors.subscription_path && !errors.profile_page_path && overlaps(subscriptionPath, profilePath)) {
+      errors.profile_page_path = "訂閱路徑與資訊頁路徑不可重疊。";
+    }
+    for (const reserved of ["/api/admin/", "/dashboard/"]) {
+      if (!errors.subscription_path && overlaps(subscriptionPath, reserved)) errors.subscription_path = "訂閱路徑不可與管理 API 或 dashboard 重疊。";
+      if (!errors.profile_page_path && overlaps(profilePath, reserved)) errors.profile_page_path = "資訊頁路徑不可與管理 API 或 dashboard 重疊。";
+    }
+    if (form.elements.legacy_routes_enabled.checked) {
+      if (!errors.subscription_path && subscriptionPath !== DEFAULT_SUBSCRIPTION_PATH && overlaps(subscriptionPath, DEFAULT_PROFILE_PATH)) {
+        errors.subscription_path = "訂閱路徑不可與舊版資訊頁路徑重疊；請更換路徑或停用舊版入口。";
+      }
+      if (!errors.profile_page_path && profilePath !== DEFAULT_PROFILE_PATH && overlaps(profilePath, DEFAULT_SUBSCRIPTION_PATH)) {
+        errors.profile_page_path = "資訊頁路徑不可與舊版訂閱路徑重疊；請更換路徑或停用舊版入口。";
+      }
+    }
+    return {
+      errors,
+      body: {
+        subscription_path: subscriptionPath,
+        profile_page_path: profilePath,
+        legacy_routes_enabled: form.elements.legacy_routes_enabled.checked,
+      },
+    };
   }
 
   function filteredConnections() {
@@ -2479,6 +2654,82 @@
     }
   }
 
+  async function loadSettings({ silent = false, force = false } = {}) {
+    if (!state.authenticated) return;
+    if (state.loading.settings) {
+      if (!force) return;
+      const epoch = state.epoch;
+      while (state.loading.settings && epoch === state.epoch) await new Promise((resolve) => window.setTimeout(resolve, 25));
+      if (epoch !== state.epoch || !state.authenticated) return;
+    }
+    const epoch = state.epoch;
+    state.loading.settings = true;
+    if (!state.loaded.settings && state.route === "settings") renderSettings();
+    try {
+      const data = await api("/settings");
+      if (epoch !== state.epoch) return;
+      state.settings = data || {};
+      state.loaded.settings = true;
+      state.errors.settings = "";
+      state.lastUpdated = Date.now();
+      updateShell();
+    } catch (error) {
+      if (epoch !== state.epoch || error.status === 401) return;
+      state.errors.settings = error.message;
+      if (!silent && state.loaded.settings) showToast(error.message, "error");
+    } finally {
+      if (epoch === state.epoch) {
+        state.loading.settings = false;
+        if (state.route === "settings") renderSettings();
+      }
+    }
+  }
+
+  function setSettingsBusy(busy) {
+    state.savingSettings = busy;
+    const form = document.querySelector('[data-form="settings"]');
+    const fieldset = form?.querySelector("fieldset");
+    const buttons = form?.querySelectorAll("button") || [];
+    const submit = form?.querySelector("[data-settings-submit]");
+    if (fieldset) fieldset.disabled = busy;
+    buttons.forEach((button) => { button.disabled = busy; });
+    if (submit) {
+      submit.classList.toggle("is-loading", busy);
+      submit.innerHTML = `${icon(busy ? "refresh" : "check")}<span>${busy ? "儲存中…" : "儲存設定"}</span>`;
+    }
+    document.getElementById("main-content")?.setAttribute("aria-busy", busy ? "true" : "false");
+  }
+
+  async function submitSettings(form) {
+    if (state.savingSettings) return;
+    const { errors, body } = validateSettingsForm(form);
+    applyFieldErrors(form, errors);
+    const formError = document.getElementById("settings-form-error");
+    if (formError) formError.hidden = true;
+    if (Object.keys(errors).length) return;
+    setSettingsBusy(true);
+    try {
+      const data = await api("/settings", { method: "PUT", body: JSON.stringify(body) });
+      state.settings = data || body;
+      state.loaded.settings = true;
+      state.errors.settings = "";
+      state.lastUpdated = Date.now();
+      state.savingSettings = false;
+      updateShell();
+      if (state.route === "settings") renderSettings();
+      showToast("訂閱安全設定已立即生效", "success");
+    } catch (error) {
+      if (error.status === 401) return;
+      setSettingsBusy(false);
+      const currentError = document.getElementById("settings-form-error");
+      if (currentError) {
+        currentError.hidden = false;
+        currentError.innerHTML = `${icon("alert")}<span>${escapeHTML(error.message)}</span>`;
+        currentError.scrollIntoView({ block: "nearest" });
+      }
+    }
+  }
+
   function startPolling() {
     stopPolling();
     state.pollTimer = window.setInterval(() => {
@@ -2502,6 +2753,7 @@
     if (state.route === "servers") await loadServerData();
     if (state.route === "users" && !state.loaded.users) await loadUsers();
     if (state.route === "connections" && !state.loaded.connections) await loadConnections();
+    if (state.route === "settings" && !state.loaded.settings) await loadSettings();
   }
 
   async function retryCurrent() {
@@ -2509,6 +2761,7 @@
     if (state.route === "servers") await loadServerData();
     if (state.route === "users") await loadUsers();
     if (state.route === "connections") await loadConnections();
+    if (state.route === "settings") await loadSettings();
   }
 
   function resetData() {
@@ -2522,22 +2775,27 @@
     state.protocolSchemaVersion = null;
     state.protocols = [];
     state.servers = [];
+    state.settings = null;
     state.restartRequired = false;
     state.reloading = false;
+    state.savingSettings = false;
     state.loaded.protocols = false;
     state.loaded.servers = false;
     state.loaded.users = false;
     state.loaded.connections = false;
+    state.loaded.settings = false;
     state.errors.overview = "";
     state.errors.protocols = "";
     state.errors.servers = "";
     state.errors.users = "";
     state.errors.connections = "";
+    state.errors.settings = "";
     state.loading.overview = false;
     state.loading.protocols = false;
     state.loading.servers = false;
     state.loading.users = false;
     state.loading.connections = false;
+    state.loading.settings = false;
   }
 
   async function bootstrap() {
@@ -2553,6 +2811,7 @@
       loadServerData({ silent: true });
       if (state.route === "users") loadUsers();
       if (state.route === "connections") loadConnections();
+      if (state.route === "settings") loadSettings();
     } catch (error) {
       if (epoch !== state.epoch || error.status === 401) return;
       state.authenticated = true;
@@ -2562,6 +2821,7 @@
       loadServerData({ silent: true });
       if (state.route === "users") loadUsers();
       if (state.route === "connections") loadConnections();
+      if (state.route === "settings") loadSettings();
     }
   }
 
@@ -2589,6 +2849,7 @@
       loadServerData({ silent: true });
       if (state.route === "users") loadUsers();
       if (state.route === "connections") loadConnections();
+      if (state.route === "settings") loadSettings();
     } catch (error) {
       if (epoch !== state.epoch || error.status === 401) return;
       const currentMessage = document.getElementById("login-message");
@@ -2702,6 +2963,7 @@
     if (type === "server") submitServer(event.target);
     if (type === "user") submitUser(event.target);
     if (type === "confirm") submitConfirm(event.target);
+    if (type === "settings") submitSettings(event.target);
   });
 
   app.addEventListener("input", (event) => {
@@ -2726,6 +2988,10 @@
     }
     if (target.closest('[data-form="user"]')) clearFieldError(target);
     if (target.closest('[data-form="server"]')) clearFieldError(target);
+    if (target.closest('[data-form="settings"]')) {
+      clearFieldError(target);
+      updateSettingsPreview(target.closest("form"));
+    }
   });
 
   app.addEventListener("change", (event) => {
@@ -2762,6 +3028,7 @@
       renderServerDialog();
       window.setTimeout(() => document.getElementById("server-protocol")?.focus(), 0);
     }
+    if (target.name === "legacy_routes_enabled" && target.closest('[data-form="settings"]')) updateSettingsPreview(target.closest("form"));
   });
 
   app.addEventListener("keydown", (event) => {
@@ -2789,10 +3056,25 @@
     if (action === "refresh-servers") loadServerData();
     if (action === "refresh-users") loadUsers();
     if (action === "refresh-connections") loadConnections();
+    if (action === "refresh-settings") loadSettings({ force: true });
     if (action === "new-server") openServerDialog();
     if (action === "new-user") openUserDialog();
     if (action === "dialog-cancel") closeDialog();
     if (action === "reload-core") reloadCore();
+
+    if (action === "reset-settings-paths") {
+      const form = actionElement.closest('[data-form="settings"]');
+      if (form) {
+        form.elements.subscription_path.value = DEFAULT_SUBSCRIPTION_PATH;
+        form.elements.profile_page_path.value = DEFAULT_PROFILE_PATH;
+        form.elements.legacy_routes_enabled.checked = true;
+        applyFieldErrors(form, {});
+        const formError = document.getElementById("settings-form-error");
+        if (formError) formError.hidden = true;
+        updateSettingsPreview(form);
+        form.elements.subscription_path.focus();
+      }
+    }
 
     if (action === "logout") {
       state.epoch += 1;

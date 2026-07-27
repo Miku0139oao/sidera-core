@@ -110,6 +110,7 @@ type adminStore struct {
 	Servers               map[string]*adminServerStore  `json:"servers,omitempty"`
 	Subscriptions         map[string]string             `json:"subscriptions,omitempty"`
 	ExternalSubscriptions map[string]string             `json:"external_subscriptions,omitempty"`
+	Settings              adminSettings                 `json:"settings,omitempty"`
 }
 
 type adminServerStore struct {
@@ -258,6 +259,7 @@ func newAdminAPI(ctx context.Context, logger log.ContextLogger, secret string, d
 			Servers:               make(map[string]*adminServerStore),
 			Subscriptions:         make(map[string]string),
 			ExternalSubscriptions: make(map[string]string),
+			Settings:              defaultAdminSettings(),
 		},
 	}
 	maps.Copy(a.serverRevisions, serverRevisions)
@@ -385,8 +387,9 @@ func (a *adminAPI) loadStore() error {
 	if err = json.Unmarshal(content, &stored); err != nil {
 		return E.Cause(err, "decode dashboard data")
 	}
-	if stored.Version == 1 || stored.Version == 2 || stored.Version == 3 {
+	if stored.Version == 1 || stored.Version == 2 || stored.Version == 3 || stored.Version == 4 {
 		stored.Version = adminStoreVersion
+		stored.Settings = defaultAdminSettings()
 	} else if stored.Version != adminStoreVersion {
 		return E.New("unsupported dashboard data version: ", stored.Version)
 	}
@@ -1084,11 +1087,10 @@ func adminUserKey(inbound string, name string) string {
 
 func (a *adminAPI) buildRouter() http.Handler {
 	router := chi.NewRouter()
-	router.MethodFunc(http.MethodGet, subscriptionRoutePrefix+"{token}", a.getSubscription)
-	router.MethodFunc(http.MethodHead, subscriptionRoutePrefix+"{token}", a.getSubscription)
-	router.Get(profilePageRoutePrefix+"{identifier}", a.getSubscriptionProfile)
 	router.Group(func(router chi.Router) {
 		router.Use(a.authenticate)
+		router.Get(adminRoutePrefix+"/settings", a.getSettings)
+		router.Put(adminRoutePrefix+"/settings", a.updateSettings)
 		router.Get(adminRoutePrefix+"/overview", a.getOverview)
 		router.Get(adminRoutePrefix+"/protocols", a.listProtocols)
 		router.Get(adminRoutePrefix+"/servers", a.listServers)
@@ -1130,6 +1132,9 @@ func (a *adminAPI) ServeHTTP(writer http.ResponseWriter, request *http.Request) 
 	a.handlerAccess.Unlock()
 	defer a.handlers.Done()
 	writer.Header().Set("Cache-Control", "no-store")
+	if a.servePublicRoute(writer, request) {
+		return
+	}
 	a.router.ServeHTTP(writer, request)
 }
 
@@ -1337,7 +1342,7 @@ func (a *adminAPI) getUser(writer http.ResponseWriter, request *http.Request) {
 				if externalID := a.store.ExternalSubscriptions[user.Name]; validExternalSubscriptionID(externalID) && a.publicBaseURL != "" {
 					view.SubscriptionURL = a.publicBaseURL + "/sub/" + url.PathEscape(externalID)
 				} else if token := a.store.Subscriptions[user.Name]; token != "" && a.publicBaseURL != "" && len(a.subscriptionLinksLocked(user.Name, time.Now().UnixMilli(), active)) > 0 {
-					view.SubscriptionURL = a.publicBaseURL + subscriptionRoutePrefix + token
+					view.SubscriptionURL = a.publicBaseURL + a.subscriptionPathLocked() + token
 				}
 				writeAdminJSON(writer, http.StatusOK, view)
 				return
