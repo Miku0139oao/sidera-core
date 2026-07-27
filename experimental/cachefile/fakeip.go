@@ -5,9 +5,9 @@ import (
 	"os"
 	"time"
 
-	"github.com/sagernet/bbolt"
 	"github.com/Miku0139oao/sidera-core/adapter"
 	C "github.com/Miku0139oao/sidera-core/constant"
+	"github.com/sagernet/bbolt"
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 )

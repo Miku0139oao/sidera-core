@@ -2,14 +2,16 @@ package api
 
 import (
 	"errors"
+	"maps"
 	"net/http"
 	"net/url"
 	"sort"
 	"strings"
 	"time"
 
-	"github.com/go-chi/chi/v5"
 	E "github.com/sagernet/sing/common/exceptions"
+
+	"github.com/go-chi/chi/v5"
 )
 
 type adminUserGroupView struct {
@@ -365,9 +367,7 @@ func (a *adminAPI) resetUserGroupTraffic(writer http.ResponseWriter, request *ht
 	a.storeAccess.Unlock()
 	if err := a.saveStore(); err != nil {
 		a.storeAccess.Lock()
-		for tag, record := range previous {
-			a.store.Inbounds[tag] = record
-		}
+		maps.Copy(a.store.Inbounds, previous)
 		a.storeAccess.Unlock()
 		writeAdminError(writer, http.StatusInternalServerError, E.Cause(err, "儲存流量資料失敗").Error())
 		return
@@ -439,9 +439,7 @@ func (a *adminAPI) commitInboundBatch(tags []string, previous map[string]*adminI
 
 func (a *adminAPI) rollbackInboundBatch(tags []string, previous map[string]*adminInboundStore, persist bool) error {
 	a.storeAccess.Lock()
-	for tag, record := range previous {
-		a.store.Inbounds[tag] = record
-	}
+	maps.Copy(a.store.Inbounds, previous)
 	a.storeAccess.Unlock()
 	var rollbackErr error
 	for _, tag := range tags {

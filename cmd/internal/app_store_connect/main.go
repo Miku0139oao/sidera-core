@@ -8,9 +8,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/sagernet/asc-go/asc"
 	"github.com/Miku0139oao/sidera-core/cmd/internal/build_shared"
 	"github.com/Miku0139oao/sidera-core/log"
+	"github.com/sagernet/asc-go/asc"
 	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
 	F "github.com/sagernet/sing/common/format"

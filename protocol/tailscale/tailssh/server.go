@@ -21,9 +21,9 @@ import (
 	"sync"
 	"time"
 
-	gliderssh "github.com/sagernet/gliderssh"
 	"github.com/Miku0139oao/sidera-core/adapter"
 	"github.com/Miku0139oao/sidera-core/option"
+	gliderssh "github.com/sagernet/gliderssh"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"

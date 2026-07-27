@@ -17,6 +17,7 @@ import (
 	C "github.com/Miku0139oao/sidera-core/constant"
 	"github.com/Miku0139oao/sidera-core/option"
 	"github.com/sagernet/sing/service"
+
 	"github.com/stretchr/testify/require"
 )
 
@@ -94,7 +95,6 @@ func TestAdminProtocolTemplatesDecode(t *testing.T) {
 	ctx := adminTestContext()
 	require.Len(t, adminProtocolSpecs, 15)
 	for _, spec := range adminProtocolSpecs {
-		spec := spec
 		t.Run(spec.Type, func(t *testing.T) {
 			template, err := buildAdminProtocolTemplate(spec)
 			require.NoError(t, err)

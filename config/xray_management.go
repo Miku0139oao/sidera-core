@@ -156,7 +156,7 @@ func translateXrayAPIListen(ctx context.Context, source xrayRoot, apiOptions xra
 		}
 		return apiOptions.Listen, nil
 	}
-	var inboundIndex = -1
+	inboundIndex := -1
 	for index, inbound := range source.Inbounds {
 		if inbound.Tag != apiOptions.Tag {
 			continue

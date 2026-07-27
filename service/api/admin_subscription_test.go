@@ -15,6 +15,7 @@ import (
 
 	C "github.com/Miku0139oao/sidera-core/constant"
 	"github.com/Miku0139oao/sidera-core/option"
+
 	"github.com/stretchr/testify/require"
 )
 
@@ -99,9 +100,38 @@ func TestSubscriptionEndpointGroupsExactNameAndProductionProfiles(t *testing.T) 
 	require.Equal(t, http.StatusOK, head.Code)
 	require.Empty(t, head.Body.String())
 	require.NotEmpty(t, head.Header().Get("Content-Length"))
+	require.Equal(t, "12", head.Header().Get("Profile-Update-Interval"))
+	require.Equal(t, "https://panel.example.com/api/list/nodes/subscription-token", head.Header().Get("Profile-Web-Page-Url"))
+	require.Contains(t, head.Header().Get("Subscription-Userinfo"), "upload=0; download=0;")
 	missing := adminRequest(a, http.MethodGet, "/sub/sidera/not-a-token", nil)
 	require.Equal(t, http.StatusNotFound, missing.Code)
 	require.Equal(t, "404 page not found\n", missing.Body.String())
+}
+
+func TestSubscriptionProfilePageSupportsNativeAndLegacyIdentifiers(t *testing.T) {
+	a := &adminAPI{
+		publicBaseURL: "https://panel.example.com",
+		runtimes:      map[string]*adminInboundRuntime{"hy2": {Tag: "hy2", Type: C.TypeHysteria2}},
+		store: adminStore{
+			Subscriptions:         map[string]string{"Alice": "native-token"},
+			ExternalSubscriptions: map[string]string{"Alice": "legacy_Sub-ID"},
+			Inbounds: map[string]*adminInboundStore{
+				"hy2": {Users: []*adminUser{{Name: "Alice", Password: "secret", Enabled: true, UploadBytes: 10, DownloadBytes: 20}}},
+			},
+			Servers: map[string]*adminServerStore{
+				"hy2": subscriptionTestProfile(C.TypeHysteria2, `{}`, "hy2.example.com", 443),
+			},
+		},
+	}
+	a.router = a.buildRouter()
+	for _, identifier := range []string{"native-token", "legacy_Sub-ID"} {
+		response := adminRequest(a, http.MethodGet, profilePageRoutePrefix+identifier, nil)
+		require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+		require.Equal(t, "text/html; charset=utf-8", response.Header().Get("Content-Type"))
+		require.Contains(t, response.Body.String(), "Alice")
+		require.Contains(t, response.Body.String(), "HYSTERIA2")
+		require.NotContains(t, response.Body.String(), "secret")
+	}
 }
 
 func TestSubscriptionURLOnlyInUserDetail(t *testing.T) {
@@ -148,6 +178,15 @@ func TestWebBridgeDispatchesPublicSubscription(t *testing.T) {
 	bridge.ServeHTTP(response, request)
 	require.Equal(t, http.StatusNotFound, response.Code)
 	require.Equal(t, "404 page not found\n", response.Body.String())
+}
+
+func TestWebBridgeDispatchesSubscriptionProfile(t *testing.T) {
+	a := &adminAPI{publicBaseURL: "https://panel.example.com", runtimes: make(map[string]*adminInboundRuntime), store: adminStore{Subscriptions: map[string]string{"Alice": "token"}, Inbounds: make(map[string]*adminInboundStore), Servers: make(map[string]*adminServerStore)}}
+	a.router = a.buildRouter()
+	bridge := &webBridge{admin: a, dashboard: newDashboard(context.Background(), nil, option.APIDashboardOptions{Enabled: true})}
+	response := httptest.NewRecorder()
+	bridge.ServeHTTP(response, httptest.NewRequest(http.MethodGet, profilePageRoutePrefix+"missing", nil))
+	require.Equal(t, http.StatusNotFound, response.Code)
 }
 
 func subscriptionTestProfile(protocolType string, config string, server string, port uint16) *adminServerStore {

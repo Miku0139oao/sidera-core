@@ -23,7 +23,7 @@ func init() {
 		}
 		// Xray removes the AEAD layer in Vision direct mode while retaining the
 		// immediate transport wrapper (including XorConn for random mode).
-		return true, encryptedConn.Conn, reflect.TypeOf(encryptedConn).Elem(), uintptr(unsafe.Pointer(encryptedConn))
+		return true, encryptedConn.Conn, reflect.TypeFor[xrayencryption.CommonConn](), uintptr(unsafe.Pointer(encryptedConn))
 	})
 }
 

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	stdjson "encoding/json"
+	"maps"
 	"net"
 	"net/netip"
 	"net/url"
@@ -585,24 +586,18 @@ func translateXrayInbound(ctx context.Context, source xrayInbound) (map[string]a
 		if convertErr != nil {
 			return nil, nil, convertErr
 		}
-		for key, value := range converted {
-			result[key] = value
-		}
+		maps.Copy(result, converted)
 		stream, convertErr := translateXrayVLESSInboundStream(source.StreamSettings)
 		if convertErr != nil {
 			return nil, nil, convertErr
 		}
-		for key, value := range stream {
-			result[key] = value
-		}
+		maps.Copy(result, stream)
 	case "hysteria":
 		converted, convertErr := translateXrayHysteria2Inbound(ctx, source)
 		if convertErr != nil {
 			return nil, nil, convertErr
 		}
-		for key, value := range converted {
-			result[key] = value
-		}
+		maps.Copy(result, converted)
 	default:
 		return nil, nil, E.New("unsupported Xray inbound protocol: ", source.Protocol)
 	}
@@ -753,17 +748,13 @@ func translateXrayOutbound(ctx context.Context, source xrayOutbound) (map[string
 		if err != nil {
 			return nil, err
 		}
-		for key, value := range converted {
-			result[key] = value
-		}
+		maps.Copy(result, converted)
 		if source.StreamSettings != nil {
 			stream, err := translateXrayStream(source.StreamSettings)
 			if err != nil {
 				return nil, err
 			}
-			for key, value := range stream {
-				result[key] = value
-			}
+			maps.Copy(result, stream)
 		}
 		_, secure := result["tls"]
 		encryption, _ := converted["encryption"].(string)
@@ -1490,8 +1481,8 @@ func translateXrayRoutingRule(source xrayRoutingRule) (map[string]any, error) {
 			if user == "" {
 				continue
 			}
-			if strings.HasPrefix(user, "regexp:") {
-				if _, err := regexp.Compile(strings.TrimPrefix(user, "regexp:")); err == nil {
+			if expression, found := strings.CutPrefix(user, "regexp:"); found {
+				if _, err := regexp.Compile(expression); err == nil {
 					return nil, E.New("Xray regexp user rules have no current Sidera equivalent")
 				}
 				continue
@@ -1617,7 +1608,7 @@ func appendPortMatch(result map[string]any, portField, rangeField string, raw st
 	}
 	var ports []uint16
 	var ranges []string
-	for _, item := range strings.Split(expression, ",") {
+	for item := range strings.SplitSeq(expression, ",") {
 		item = strings.TrimSpace(item)
 		if item == "" {
 			continue
@@ -1677,9 +1668,7 @@ func parseSinglePort(raw stdjson.RawMessage) (uint16, error) {
 
 func cloneHeaders(source map[string]string) map[string]string {
 	result := make(map[string]string, len(source)+1)
-	for key, value := range source {
-		result[key] = value
-	}
+	maps.Copy(result, source)
 	return result
 }
 

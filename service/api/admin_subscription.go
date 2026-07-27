@@ -151,9 +151,45 @@ func (a *adminAPI) getSubscription(writer http.ResponseWriter, request *http.Req
 	body := base64.StdEncoding.EncodeToString([]byte(strings.Join(links, "\n")))
 	writer.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	writer.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	writer.Header().Set("Profile-Update-Interval", "12")
+	writer.Header().Set("Profile-Web-Page-Url", a.publicBaseURL+profilePageRoutePrefix+url.PathEscape(token))
+	upload, download, total, expire := a.subscriptionUsageLocked(name, active)
+	writer.Header().Set("Subscription-Userinfo", "upload="+strconv.FormatInt(upload, 10)+"; download="+strconv.FormatInt(download, 10)+"; total="+strconv.FormatInt(total, 10)+"; expire="+strconv.FormatInt(expire, 10))
 	if request.Method == http.MethodGet {
 		_, _ = writer.Write([]byte(body))
 	}
+}
+
+func (a *adminAPI) subscriptionUsageLocked(name string, active map[string]adminUsage) (upload, download, total, expire int64) {
+	unlimited := false
+	for tag, record := range a.store.Inbounds {
+		if record == nil {
+			continue
+		}
+		for _, user := range record.Users {
+			if user == nil || user.Name != name {
+				continue
+			}
+			usage := active[adminUserKey(tag, name)]
+			upload += user.UploadBytes + usage.Upload
+			download += user.DownloadBytes + usage.Download
+			if user.QuotaBytes == 0 {
+				unlimited = true
+			} else {
+				total += user.QuotaBytes
+			}
+			if user.ExpiresAt > 0 && (expire == 0 || user.ExpiresAt < expire) {
+				expire = user.ExpiresAt
+			}
+		}
+	}
+	if unlimited {
+		total = 0
+	}
+	if expire > 0 {
+		expire /= 1000
+	}
+	return
 }
 
 func (a *adminAPI) subscriptionNameLocked(token string) (string, bool) {

@@ -8,8 +8,6 @@ import (
 	"net"
 	"strings"
 
-	"github.com/sagernet/cronet-go"
-	_ "github.com/sagernet/cronet-go/all"
 	"github.com/Miku0139oao/sidera-core/adapter"
 	"github.com/Miku0139oao/sidera-core/adapter/outbound"
 	"github.com/Miku0139oao/sidera-core/common/dialer"
@@ -17,6 +15,8 @@ import (
 	"github.com/Miku0139oao/sidera-core/dns"
 	"github.com/Miku0139oao/sidera-core/log"
 	"github.com/Miku0139oao/sidera-core/option"
+	"github.com/sagernet/cronet-go"
+	_ "github.com/sagernet/cronet-go/all"
 	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"

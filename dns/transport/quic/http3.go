@@ -10,8 +10,6 @@ import (
 	"strconv"
 	"sync"
 
-	"github.com/sagernet/quic-go"
-	"github.com/sagernet/quic-go/http3"
 	"github.com/Miku0139oao/sidera-core/adapter"
 	"github.com/Miku0139oao/sidera-core/common/dialer"
 	"github.com/Miku0139oao/sidera-core/common/tls"
@@ -20,6 +18,8 @@ import (
 	"github.com/Miku0139oao/sidera-core/dns/transport"
 	"github.com/Miku0139oao/sidera-core/log"
 	"github.com/Miku0139oao/sidera-core/option"
+	"github.com/sagernet/quic-go"
+	"github.com/sagernet/quic-go/http3"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/bufio"

@@ -3,6 +3,7 @@ package hysteria
 import (
 	"context"
 	"errors"
+	"maps"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -133,9 +134,7 @@ func (h *Inbound) UpdateManagedUsers(users []adapter.ManagedUser) error {
 	if h.userNameMap == nil {
 		h.userNameMap = make(map[string]string)
 	}
-	for credential, name := range userNameMap {
-		h.userNameMap[credential] = name
-	}
+	maps.Copy(h.userNameMap, userNameMap)
 	h.userAccess.Unlock()
 	if err = h.replaceServiceLocked(service, oldUsers); err != nil {
 		return err

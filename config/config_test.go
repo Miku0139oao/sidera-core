@@ -8,6 +8,7 @@ import (
 	"github.com/Miku0139oao/sidera-core/config"
 	"github.com/Miku0139oao/sidera-core/include"
 	"github.com/Miku0139oao/sidera-core/option"
+
 	"github.com/stretchr/testify/require"
 )
 

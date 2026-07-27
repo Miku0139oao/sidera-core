@@ -1240,13 +1240,16 @@
     state.users.forEach((user) => {
       let group = groups.get(user.name);
       if (!group) {
-        group = { name: user.name, memberships: [], upload_bytes: 0, download_bytes: 0, active_connections: 0 };
+        group = { name: user.name, memberships: [], upload_bytes: 0, download_bytes: 0, active_connections: 0, online_ips: [] };
         groups.set(user.name, group);
       }
       group.memberships.push(user);
       group.upload_bytes += asNumber(user.upload_bytes);
       group.download_bytes += asNumber(user.download_bytes);
       group.active_connections += asNumber(user.active_connections);
+      (user.online_ips || []).forEach((entry) => {
+        if (!group.online_ips.some((online) => online.address === entry.address)) group.online_ips.push(entry);
+      });
     });
     return [...groups.values()].sort((left, right) => left.name.localeCompare(right.name, "zh-Hant"));
   }
@@ -1357,7 +1360,7 @@
         <td><span class="cell-primary">${escapeHTML(formatInteger(group.memberships.length))} 個節點</span><span class="cell-secondary user-node-list">${group.memberships.map((user) => escapeHTML(user.inbound)).join(" · ")}</span></td>
         <td><span class="status-badge ${status.className}">${status.label}</span></td>
         <td>${renderGroupQuota(group)}</td>
-        <td><span class="cell-primary">${escapeHTML(formatInteger(group.active_connections))} 條</span><span class="cell-secondary">跨 ${escapeHTML(formatInteger(group.memberships.length))} 個節點</span></td>
+        <td><span class="cell-primary">${escapeHTML(formatInteger(group.active_connections))} 條</span><span class="cell-secondary">${escapeHTML(formatInteger(group.online_ips.length))} 個在線 IP · 跨 ${escapeHTML(formatInteger(group.memberships.length))} 個節點</span></td>
         <td>
           <div class="table-actions">
             <button class="icon-button small" type="button" data-action="edit-user" data-name="${encodedName}" aria-label="編輯 ${name}" title="編輯">${icon("edit")}</button>
@@ -1382,6 +1385,7 @@
         <dl class="mobile-detail-grid">
           <div class="detail-item"><dt>節點</dt><dd>${escapeHTML(formatInteger(group.memberships.length))} 個</dd></div>
           <div class="detail-item"><dt>活躍連線</dt><dd>${escapeHTML(formatInteger(group.active_connections))} 條</dd></div>
+          <div class="detail-item"><dt>在線 IP</dt><dd>${escapeHTML(formatInteger(group.online_ips.length))} 個</dd></div>
           <div class="detail-item"><dt>上行</dt><dd>${escapeHTML(formatBytes(group.upload_bytes))}</dd></div>
           <div class="detail-item"><dt>下行</dt><dd>${escapeHTML(formatBytes(group.download_bytes))}</dd></div>
         </dl>

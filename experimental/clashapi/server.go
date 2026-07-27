@@ -13,7 +13,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/sagernet/cors"
 	"github.com/Miku0139oao/sidera-core/adapter"
 	"github.com/Miku0139oao/sidera-core/common/trafficcontrol"
 	"github.com/Miku0139oao/sidera-core/common/urltest"
@@ -21,6 +20,7 @@ import (
 	"github.com/Miku0139oao/sidera-core/experimental"
 	"github.com/Miku0139oao/sidera-core/log"
 	"github.com/Miku0139oao/sidera-core/option"
+	"github.com/sagernet/cors"
 	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/json"

@@ -13,6 +13,7 @@ import (
 	"net"
 
 	N "github.com/sagernet/sing/common/network"
+
 	"lukechampine.com/blake3"
 )
 

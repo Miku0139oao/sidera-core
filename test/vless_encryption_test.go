@@ -8,9 +8,10 @@ import (
 
 	C "github.com/Miku0139oao/sidera-core/constant"
 	"github.com/Miku0139oao/sidera-core/option"
-	"github.com/gofrs/uuid/v5"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/json/badoption"
+
+	"github.com/gofrs/uuid/v5"
 )
 
 func TestVLESSEncryption(t *testing.T) {

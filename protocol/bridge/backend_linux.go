@@ -5,9 +5,9 @@ import (
 	"net/netip"
 	"sync"
 
-	"github.com/sagernet/netlink"
 	"github.com/Miku0139oao/sidera-core/adapter"
 	"github.com/Miku0139oao/sidera-core/option"
+	"github.com/sagernet/netlink"
 	"github.com/sagernet/sing-tun"
 	"github.com/sagernet/sing/common/control"
 	E "github.com/sagernet/sing/common/exceptions"

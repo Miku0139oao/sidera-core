@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"maps"
 	"net"
 	"net/http"
 	"net/url"
@@ -39,6 +40,7 @@ import (
 const (
 	adminRoutePrefix        = "/api/admin"
 	subscriptionRoutePrefix = "/sub/sidera/"
+	profilePageRoutePrefix  = "/api/list/nodes/"
 	adminStoreVersion       = dashboardstore.StoreVersion
 )
 
@@ -161,10 +163,16 @@ type adminUser struct {
 
 type adminUserView struct {
 	adminUser
-	ActiveConnections int    `json:"active_connections"`
-	Revision          int64  `json:"revision"`
-	AppliedRevision   int64  `json:"applied_revision"`
-	SubscriptionURL   string `json:"subscription_url,omitempty"`
+	ActiveConnections int             `json:"active_connections"`
+	OnlineIPs         []adminOnlineIP `json:"online_ips,omitempty"`
+	Revision          int64           `json:"revision"`
+	AppliedRevision   int64           `json:"applied_revision"`
+	SubscriptionURL   string          `json:"subscription_url,omitempty"`
+}
+
+type adminOnlineIP struct {
+	Address string `json:"address"`
+	Since   int64  `json:"since"`
 }
 
 type adminUserInput struct {
@@ -252,9 +260,7 @@ func newAdminAPI(ctx context.Context, logger log.ContextLogger, secret string, d
 			ExternalSubscriptions: make(map[string]string),
 		},
 	}
-	for tag, revision := range serverRevisions {
-		a.serverRevisions[tag] = revision
-	}
+	maps.Copy(a.serverRevisions, serverRevisions)
 	a.discoverServices(ctx)
 	if err := a.loadStore(); err != nil {
 		cancel()
@@ -1080,6 +1086,7 @@ func (a *adminAPI) buildRouter() http.Handler {
 	router := chi.NewRouter()
 	router.MethodFunc(http.MethodGet, subscriptionRoutePrefix+"{token}", a.getSubscription)
 	router.MethodFunc(http.MethodHead, subscriptionRoutePrefix+"{token}", a.getSubscription)
+	router.Get(profilePageRoutePrefix+"{identifier}", a.getSubscriptionProfile)
 	router.Group(func(router chi.Router) {
 		router.Use(a.authenticate)
 		router.Get(adminRoutePrefix+"/overview", a.getOverview)
@@ -1348,9 +1355,15 @@ func makeAdminUserView(user *adminUser, record *adminInboundStore, usage adminUs
 	}
 	copyUser.UploadBytes += usage.Upload
 	copyUser.DownloadBytes += usage.Download
+	onlineIPs := make([]adminOnlineIP, 0, len(usage.SourceSince))
+	for address, since := range usage.SourceSince {
+		onlineIPs = append(onlineIPs, adminOnlineIP{Address: address, Since: since})
+	}
+	sort.Slice(onlineIPs, func(i, j int) bool { return onlineIPs[i].Address < onlineIPs[j].Address })
 	return adminUserView{
 		adminUser: copyUser, ActiveConnections: usage.Connections,
-		Revision: record.Revision, AppliedRevision: record.AppliedRevision,
+		OnlineIPs: onlineIPs,
+		Revision:  record.Revision, AppliedRevision: record.AppliedRevision,
 	}
 }
 

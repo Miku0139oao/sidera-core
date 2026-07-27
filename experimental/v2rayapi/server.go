@@ -67,7 +67,7 @@ func NewServer(logger log.Logger, options option.V2RayAPIOptions) (adapter.V2Ray
 	if options.Metrics != nil {
 		metricsListen = options.Metrics.Listen
 		if metricsListen != "" && statsService == nil {
-			return nil, errors.New("Xray-compatible metrics requires the stats service")
+			return nil, errors.New("Xray-compatible metrics requires the stats service") //nolint:staticcheck // Xray is a product name.
 		}
 	}
 	server := &Server{

@@ -3,6 +3,7 @@ package tuic
 import (
 	"context"
 	"errors"
+	"maps"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -128,9 +129,7 @@ func (h *Inbound) UpdateManagedUsers(users []adapter.ManagedUser) error {
 	if h.users == nil {
 		h.users = make(map[string]option.TUICUser)
 	}
-	for userID, user := range userMap {
-		h.users[userID] = user
-	}
+	maps.Copy(h.users, userMap)
 	h.usersAccess.Unlock()
 	if err = h.replaceServiceLocked(service, oldUsers); err != nil {
 		return err

@@ -9,8 +9,8 @@ import (
 	"strconv"
 	"syscall"
 
-	gliderssh "github.com/sagernet/gliderssh"
 	"github.com/Miku0139oao/sidera-core/adapter"
+	gliderssh "github.com/sagernet/gliderssh"
 )
 
 func isPrivilegedUser() bool {

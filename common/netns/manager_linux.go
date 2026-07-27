@@ -8,10 +8,10 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/sagernet/netlink"
 	"github.com/Miku0139oao/sidera-core/adapter"
 	C "github.com/Miku0139oao/sidera-core/constant"
 	"github.com/Miku0139oao/sidera-core/option"
+	"github.com/sagernet/netlink"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
 

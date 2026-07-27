@@ -10,8 +10,8 @@ import (
 	"os/user"
 	"strings"
 
-	gliderssh "github.com/sagernet/gliderssh"
 	"github.com/Miku0139oao/sidera-core/adapter"
+	gliderssh "github.com/sagernet/gliderssh"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/tailscale/util/winutil"
 

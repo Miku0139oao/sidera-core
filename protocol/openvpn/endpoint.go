@@ -408,10 +408,3 @@ func (m *openVPNUserManager) authenticate(ctx context.Context, username string, 
 	}
 	return nil
 }
-
-func authenticatorFromUsers(users []auth.User) ovpn.UserPassAuthenticator {
-	if len(users) == 0 {
-		return nil
-	}
-	return newOpenVPNUserManager(users).authenticate
-}

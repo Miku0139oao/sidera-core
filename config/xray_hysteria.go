@@ -3,6 +3,7 @@ package config
 import (
 	"context"
 	stdjson "encoding/json"
+	"maps"
 	"strconv"
 	"strings"
 
@@ -168,9 +169,7 @@ func translateXrayHysteria2Inbound(ctx context.Context, source xrayInbound) (map
 		"udp_timeout": strconv.FormatInt(udpIdleTimeout, 10) + "s",
 		"tls":         tlsOptions,
 	}
-	for key, value := range quicOptions {
-		result[key] = value
-	}
+	maps.Copy(result, quicOptions)
 	return result, nil
 }
 

@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/Miku0139oao/sidera-core/option"
+
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"

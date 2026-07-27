@@ -22,6 +22,7 @@ import (
 	"time"
 
 	N "github.com/sagernet/sing/common/network"
+
 	"golang.org/x/crypto/chacha20poly1305"
 	"lukechampine.com/blake3"
 )
@@ -33,7 +34,8 @@ const (
 
 var outBytesPool = sync.Pool{
 	New: func() any {
-		return make([]byte, 5+maxPlaintextSize+chacha20poly1305.Overhead)
+		buffer := make([]byte, 5+maxPlaintextSize+chacha20poly1305.Overhead)
+		return &buffer
 	},
 }
 
@@ -72,8 +74,9 @@ func (c *CommonConn) Write(b []byte) (int, error) {
 	}
 
 	written := 0
-	outBytes := outBytesPool.Get().([]byte)
-	defer outBytesPool.Put(outBytes)
+	outBytesPointer := outBytesPool.Get().(*[]byte)
+	outBytes := *outBytesPointer
+	defer outBytesPool.Put(outBytesPointer)
 	for written < len(b) {
 		plaintext := b[written:]
 		if len(plaintext) > maxPlaintextSize {

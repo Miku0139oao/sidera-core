@@ -38,7 +38,7 @@ jobs:
       - name: Calculate version
         if: github.event_name != 'workflow_dispatch'
         run: |-
-          go run -v ./cmd/internal/read_tag --ci --nightly
+          go run -v ./cmd/internal/read_tag --ci --nightly || echo "version=0.0.0-$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
       - name: Set outputs
         id: outputs
         run: |-

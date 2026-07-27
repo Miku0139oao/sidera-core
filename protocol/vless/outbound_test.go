@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	M "github.com/sagernet/sing/common/metadata"
+
 	"github.com/stretchr/testify/require"
 )
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"maps"
 	"net/http"
 	"os"
 	"time"
@@ -509,9 +510,7 @@ func cloneDashboardOptions(options option.Options) option.Options {
 			dashboardCopy := *apiOptions.Dashboard
 			if apiOptions.Dashboard.AppliedServerRevisions != nil {
 				dashboardCopy.AppliedServerRevisions = make(map[string]int64, len(apiOptions.Dashboard.AppliedServerRevisions))
-				for tag, revision := range apiOptions.Dashboard.AppliedServerRevisions {
-					dashboardCopy.AppliedServerRevisions[tag] = revision
-				}
+				maps.Copy(dashboardCopy.AppliedServerRevisions, apiOptions.Dashboard.AppliedServerRevisions)
 			}
 			apiCopy.Dashboard = &dashboardCopy
 		}

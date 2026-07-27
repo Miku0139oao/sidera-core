@@ -8,9 +8,9 @@ import (
 	"strconv"
 	"strings"
 
-	_ "github.com/sagernet/gomobile"
 	"github.com/Miku0139oao/sidera-core/cmd/internal/build_shared"
 	"github.com/Miku0139oao/sidera-core/log"
+	_ "github.com/sagernet/gomobile"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/rw"
 	"github.com/sagernet/sing/common/shell"

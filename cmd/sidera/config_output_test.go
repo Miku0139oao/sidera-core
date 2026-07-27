@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/Miku0139oao/sidera-core/config"
+
 	"github.com/stretchr/testify/require"
 )
 

@@ -9,9 +9,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/sagernet/quic-go"
 	"github.com/Miku0139oao/sidera-core/adapter"
 	"github.com/Miku0139oao/sidera-core/common/sniff"
+	"github.com/sagernet/quic-go"
 
 	"github.com/stretchr/testify/require"
 )

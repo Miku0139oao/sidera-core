@@ -12,6 +12,7 @@ import (
 	"github.com/Miku0139oao/sidera-core/include"
 	"github.com/Miku0139oao/sidera-core/option"
 	"github.com/sagernet/sing/common/json/badoption"
+
 	"github.com/stretchr/testify/require"
 )
 

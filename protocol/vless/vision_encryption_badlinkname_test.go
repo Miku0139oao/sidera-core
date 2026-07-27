@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/Miku0139oao/sidera-core/protocol/vless/xrayencryption"
+
 	"github.com/stretchr/testify/require"
 )
 
@@ -26,7 +27,7 @@ func TestVisionEncryptionDirectConnection(t *testing.T) {
 			loaded, directConn, reflectType, reflectPointer := creator(encryptedConn)
 			require.True(t, loaded)
 			require.Same(t, transportConn, directConn)
-			require.Equal(t, reflect.TypeOf(xrayencryption.CommonConn{}), reflectType)
+			require.Equal(t, reflect.TypeFor[xrayencryption.CommonConn](), reflectType)
 			require.NotZero(t, reflectPointer)
 		})
 	}
