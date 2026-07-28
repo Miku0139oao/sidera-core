@@ -3,6 +3,7 @@ package api
 import (
 	"errors"
 	"maps"
+	"math"
 	"net/http"
 	"net/url"
 	"sort"
@@ -15,16 +16,24 @@ import (
 )
 
 type adminUserGroupView struct {
-	Name            string           `json:"name"`
-	Memberships     []adminUserView  `json:"memberships"`
-	Revisions       map[string]int64 `json:"revisions"`
-	SubscriptionURL string           `json:"subscription_url,omitempty"`
+	Name            string            `json:"name"`
+	Account         *adminAccountView `json:"account,omitempty"`
+	Memberships     []adminUserView   `json:"memberships"`
+	Revisions       map[string]int64  `json:"revisions"`
+	SubscriptionURL string            `json:"subscription_url,omitempty"`
 }
 
 type adminUserGroupInput struct {
-	Name        string                          `json:"name"`
-	Memberships []adminUserGroupMembershipInput `json:"memberships"`
-	Revisions   map[string]int64                `json:"revisions"`
+	Name            string                          `json:"name"`
+	PolicyScope     string                          `json:"policy_scope"`
+	AccountRevision int64                           `json:"account_revision"`
+	Enabled         *bool                           `json:"enabled"`
+	QuotaBytes      int64                           `json:"quota_bytes"`
+	ExpiresAt       int64                           `json:"expires_at"`
+	MaxIPs          *int                            `json:"max_ips"`
+	ResetDays       int                             `json:"reset_days"`
+	Memberships     []adminUserGroupMembershipInput `json:"memberships"`
+	Revisions       map[string]int64                `json:"revisions"`
 }
 
 type adminUserGroupMembershipInput struct {
@@ -41,7 +50,8 @@ type adminUserGroupMembershipInput struct {
 }
 
 type adminUserGroupRevisionInput struct {
-	Revisions map[string]int64 `json:"revisions"`
+	AccountRevision int64            `json:"account_revision"`
+	Revisions       map[string]int64 `json:"revisions"`
 }
 
 func (input adminUserGroupMembershipInput) userInput(name string, revision int64) adminUserInput {
@@ -86,6 +96,14 @@ func (a *adminAPI) mutateUserGroup(writer http.ResponseWriter, oldName string, i
 	name := strings.TrimSpace(input.Name)
 	if name == "" || len(name) > 128 {
 		writeAdminError(writer, http.StatusBadRequest, "用戶名稱不能留空且不可超過 128 個字元")
+		return
+	}
+	if input.PolicyScope != "" && input.PolicyScope != adminAccountPolicyMembership && input.PolicyScope != adminAccountPolicyGlobal {
+		writeAdminError(writer, http.StatusBadRequest, "帳戶政策範圍不正確")
+		return
+	}
+	if input.QuotaBytes < 0 || input.ExpiresAt < 0 || input.ResetDays < 0 || int64(input.ResetDays) > math.MaxInt64/adminDayMilliseconds || input.MaxIPs != nil && *input.MaxIPs < 0 {
+		writeAdminError(writer, http.StatusBadRequest, "帳戶額度、到期時間、重設週期與 IP 限制不可為負數")
 		return
 	}
 	if len(input.Memberships) == 0 {
@@ -139,6 +157,50 @@ func (a *adminAPI) mutateUserGroup(writer http.ResponseWriter, oldName string, i
 		return
 	}
 
+	accountID := ""
+	var currentAccount *adminAccount
+	if !creating {
+		for _, user := range current {
+			if accountID == "" {
+				accountID = user.AccountID
+			} else if accountID != user.AccountID {
+				writeAdminError(writer, http.StatusConflict, "用戶節點未連結至同一帳戶，請先修復資料")
+				return
+			}
+		}
+		a.storeAccess.RLock()
+		if account := a.store.Accounts[accountID]; account != nil {
+			copyAccount := *account
+			currentAccount = &copyAccount
+		}
+		a.storeAccess.RUnlock()
+		if currentAccount == nil {
+			writeAdminError(writer, http.StatusConflict, "用戶帳戶資料不存在，請重新整理後再試")
+			return
+		}
+		if input.AccountRevision <= 0 || currentAccount.Revision != input.AccountRevision {
+			writeAdminError(writer, http.StatusConflict, "帳戶資料已被其他操作更新，請重新整理後再試")
+			return
+		}
+		if input.PolicyScope == "" {
+			input.PolicyScope = currentAccount.PolicyScope
+		}
+		if input.PolicyScope != currentAccount.PolicyScope {
+			writeAdminError(writer, http.StatusBadRequest, "既有帳戶不可變更政策範圍")
+			return
+		}
+	} else {
+		if input.PolicyScope == "" {
+			input.PolicyScope = adminAccountPolicyGlobal
+		}
+		var err error
+		accountID, err = newAdminID()
+		if err != nil {
+			writeAdminError(writer, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
+
 	affectedSet := make(map[string]bool, len(current)+len(normalized))
 	for tag := range current {
 		affectedSet[tag] = true
@@ -168,9 +230,17 @@ func (a *adminAPI) mutateUserGroup(writer http.ResponseWriter, oldName string, i
 	}
 
 	previous := make(map[string]*adminInboundStore, len(tags))
-	var oldSubscription, newSubscription, oldExternalSubscription, newExternalSubscription string
-	var hadOldSubscription, hadNewSubscription, hadOldExternalSubscription, hadNewExternalSubscription bool
 	a.storeAccess.Lock()
+	if a.store.Accounts == nil {
+		a.store.Accounts = make(map[string]*adminAccount)
+	}
+	for identifier, account := range a.store.Accounts {
+		if identifier != accountID && account != nil && strings.EqualFold(account.Name, name) {
+			a.storeAccess.Unlock()
+			writeAdminError(writer, http.StatusConflict, "用戶名稱已存在")
+			return
+		}
+	}
 	for _, tag := range tags {
 		record := a.store.Inbounds[tag]
 		if record == nil || record.Revision != input.Revisions[tag] {
@@ -180,7 +250,48 @@ func (a *adminAPI) mutateUserGroup(writer http.ResponseWriter, oldName string, i
 		}
 		previous[tag] = cloneInboundStore(record)
 	}
+	previousAccounts := cloneAdminAccounts(a.store.Accounts)
+	previousSubscriptions := maps.Clone(a.store.Subscriptions)
+	previousExternalSubscriptions := maps.Clone(a.store.ExternalSubscriptions)
+	restorePreparedState := func() {
+		maps.Copy(a.store.Inbounds, previous)
+		a.store.Accounts = previousAccounts
+		a.store.Subscriptions = previousSubscriptions
+		a.store.ExternalSubscriptions = previousExternalSubscriptions
+	}
 	now := time.Now().UnixMilli()
+	account := a.store.Accounts[accountID]
+	if creating {
+		enabled := true
+		if input.Enabled != nil {
+			enabled = *input.Enabled
+		}
+		account = &adminAccount{
+			ID: accountID, Name: name, PolicyScope: input.PolicyScope, Enabled: enabled,
+			Revision: nextAdminRevision(0, now), CreatedAt: now, UpdatedAt: now,
+		}
+		a.store.Accounts[accountID] = account
+	} else if account == nil || account.Revision != input.AccountRevision {
+		a.storeAccess.Unlock()
+		writeAdminError(writer, http.StatusConflict, "帳戶資料已被其他操作更新，請重新整理後再試")
+		return
+	}
+	account.Name = name
+	if account.PolicyScope == adminAccountPolicyGlobal {
+		if input.Enabled != nil {
+			account.Enabled = *input.Enabled
+		}
+		account.QuotaBytes = input.QuotaBytes
+		account.ExpiresAt = input.ExpiresAt
+		if input.MaxIPs != nil {
+			account.MaxIPs = *input.MaxIPs
+		}
+		account.ResetDays = input.ResetDays
+	}
+	if !creating {
+		account.Revision = nextAdminRevision(account.Revision, now)
+		account.UpdatedAt = now
+	}
 	for _, tag := range tags {
 		updated := cloneInboundStore(a.store.Inbounds[tag])
 		filtered := updated.Users[:0]
@@ -195,6 +306,7 @@ func (a *adminAPI) mutateUserGroup(writer http.ResponseWriter, oldName string, i
 			existing := current[tag]
 			requestedID := memberIDs[tag]
 			if requestedID != "" && (existing == nil || requestedID != existing.ID) {
+				restorePreparedState()
 				a.storeAccess.Unlock()
 				writeAdminError(writer, http.StatusConflict, "用戶節點身分已變更，請重新整理後再試")
 				return
@@ -206,27 +318,36 @@ func (a *adminAPI) mutateUserGroup(writer http.ResponseWriter, oldName string, i
 			} else {
 				id, err := newAdminID()
 				if err != nil {
+					restorePreparedState()
 					a.storeAccess.Unlock()
 					writeAdminError(writer, http.StatusInternalServerError, err.Error())
 					return
 				}
 				candidate.ID = id
 			}
+			candidate.AccountID = accountID
 			candidate.Name = name
 			candidate.UUID = value.UUID
 			candidate.Password = value.Password
 			candidate.Flow = value.Flow
 			candidate.AlterID = value.AlterID
-			candidate.QuotaBytes = value.QuotaBytes
-			candidate.ExpiresAt = value.ExpiresAt
+			if account.PolicyScope == adminAccountPolicyGlobal {
+				candidate.QuotaBytes = 0
+				candidate.ExpiresAt = 0
+				candidate.MaxIPs = 0
+			} else {
+				candidate.QuotaBytes = value.QuotaBytes
+				candidate.ExpiresAt = value.ExpiresAt
+				if value.MaxIPs != nil {
+					candidate.MaxIPs = *value.MaxIPs
+				}
+			}
 			if value.Enabled != nil {
 				candidate.Enabled = *value.Enabled
 			}
-			if value.MaxIPs != nil {
-				candidate.MaxIPs = *value.MaxIPs
-			}
 			candidate.UpdatedAt = now
 			if err := validateUniqueUser(updated, candidate, ""); err != nil {
+				restorePreparedState()
 				a.storeAccess.Unlock()
 				writeAdminError(writer, http.StatusConflict, err.Error())
 				return
@@ -238,32 +359,20 @@ func (a *adminAPI) mutateUserGroup(writer http.ResponseWriter, oldName string, i
 		a.store.Inbounds[tag] = updated
 	}
 	if !creating && oldName != name {
-		oldSubscription, hadOldSubscription = a.store.Subscriptions[oldName]
-		newSubscription, hadNewSubscription = a.store.Subscriptions[name]
-		oldExternalSubscription, hadOldExternalSubscription = a.store.ExternalSubscriptions[oldName]
-		newExternalSubscription, hadNewExternalSubscription = a.store.ExternalSubscriptions[name]
-		if hadOldSubscription {
-			a.store.Subscriptions[name] = oldSubscription
+		if subscription, loaded := a.store.Subscriptions[oldName]; loaded {
+			a.store.Subscriptions[name] = subscription
 			delete(a.store.Subscriptions, oldName)
 		}
-		if hadOldExternalSubscription {
-			a.store.ExternalSubscriptions[name] = oldExternalSubscription
+		if subscription, loaded := a.store.ExternalSubscriptions[oldName]; loaded {
+			a.store.ExternalSubscriptions[name] = subscription
 			delete(a.store.ExternalSubscriptions, oldName)
 		}
 	}
 	a.storeAccess.Unlock()
 
 	if err := a.commitInboundBatch(tags, previous); err != nil {
-		if !creating && oldName != name {
-			a.storeAccess.Lock()
-			restoreStringMapEntry(a.store.Subscriptions, oldName, oldSubscription, hadOldSubscription)
-			restoreStringMapEntry(a.store.Subscriptions, name, newSubscription, hadNewSubscription)
-			restoreStringMapEntry(a.store.ExternalSubscriptions, oldName, oldExternalSubscription, hadOldExternalSubscription)
-			restoreStringMapEntry(a.store.ExternalSubscriptions, name, newExternalSubscription, hadNewExternalSubscription)
-			a.storeAccess.Unlock()
-			_ = a.saveStore()
-		}
-		writeAdminError(writer, http.StatusInternalServerError, err.Error())
+		restoreErr := a.restoreUserGroupState(tags, previousAccounts, previousSubscriptions, previousExternalSubscriptions)
+		writeAdminError(writer, http.StatusInternalServerError, errors.Join(err, restoreErr).Error())
 		return
 	}
 	if !creating && oldName != name {
@@ -301,12 +410,28 @@ func (a *adminAPI) deleteUserGroup(writer http.ResponseWriter, request *http.Req
 		return
 	}
 	tags := make([]string, 0, len(current))
+	accountID := ""
 	for tag := range current {
 		tags = append(tags, tag)
+		if accountID == "" {
+			accountID = current[tag].AccountID
+		} else if accountID != current[tag].AccountID {
+			writeAdminError(writer, http.StatusConflict, "用戶節點未連結至同一帳戶，請先修復資料")
+			return
+		}
 	}
 	sort.Strings(tags)
 	previous := make(map[string]*adminInboundStore, len(tags))
 	a.storeAccess.Lock()
+	account := a.store.Accounts[accountID]
+	if account == nil || input.AccountRevision <= 0 || account.Revision != input.AccountRevision {
+		a.storeAccess.Unlock()
+		writeAdminError(writer, http.StatusConflict, "帳戶資料已被其他操作更新，請重新整理後再試")
+		return
+	}
+	previousAccounts := cloneAdminAccounts(a.store.Accounts)
+	previousSubscriptions := maps.Clone(a.store.Subscriptions)
+	previousExternalSubscriptions := maps.Clone(a.store.ExternalSubscriptions)
 	for _, tag := range tags {
 		record := a.store.Inbounds[tag]
 		if record == nil || input.Revisions[tag] <= 0 || record.Revision != input.Revisions[tag] {
@@ -327,9 +452,12 @@ func (a *adminAPI) deleteUserGroup(writer http.ResponseWriter, request *http.Req
 		updated.Revision = nextAdminRevision(updated.Revision, time.Now().UnixMilli())
 		a.store.Inbounds[tag] = updated
 	}
+	delete(a.store.Subscriptions, name)
+	delete(a.store.ExternalSubscriptions, name)
 	a.storeAccess.Unlock()
 	if err := a.commitInboundBatch(tags, previous); err != nil {
-		writeAdminError(writer, http.StatusInternalServerError, err.Error())
+		restoreErr := a.restoreUserGroupState(tags, previousAccounts, previousSubscriptions, previousExternalSubscriptions)
+		writeAdminError(writer, http.StatusInternalServerError, errors.Join(err, restoreErr).Error())
 		return
 	}
 	for tag, user := range current {
@@ -350,11 +478,27 @@ func (a *adminAPI) resetUserGroupTraffic(writer http.ResponseWriter, request *ht
 		return
 	}
 	previous := make(map[string]*adminInboundStore, len(current))
+	accountID := ""
+	for _, user := range current {
+		if accountID == "" {
+			accountID = user.AccountID
+		} else if accountID != user.AccountID {
+			writeAdminError(writer, http.StatusConflict, "用戶節點未連結至同一帳戶，請先修復資料")
+			return
+		}
+	}
 	a.storeAccess.Lock()
+	previousAccounts := cloneAdminAccounts(a.store.Accounts)
+	if account := a.store.Accounts[accountID]; account != nil && account.PolicyScope == adminAccountPolicyGlobal {
+		account.BaseUploadBytes = 0
+		account.BaseDownloadBytes = 0
+		account.UpdatedAt = time.Now().UnixMilli()
+	}
 	for tag, target := range current {
 		record := a.store.Inbounds[tag]
 		previous[tag] = cloneInboundStore(record)
-		for _, user := range record.Users {
+		updated := cloneInboundStore(record)
+		for _, user := range updated.Users {
 			if user.ID == target.ID {
 				user.UploadBytes = 0
 				user.DownloadBytes = 0
@@ -363,19 +507,36 @@ func (a *adminAPI) resetUserGroupTraffic(writer http.ResponseWriter, request *ht
 				break
 			}
 		}
+		a.store.Inbounds[tag] = updated
 	}
 	a.storeAccess.Unlock()
-	if err := a.saveStore(); err != nil {
+	tags := make([]string, 0, len(previous))
+	for tag := range previous {
+		tags = append(tags, tag)
+	}
+	sort.Strings(tags)
+	if err := a.commitInboundBatch(tags, previous); err != nil {
 		a.storeAccess.Lock()
-		maps.Copy(a.store.Inbounds, previous)
+		a.store.Accounts = previousAccounts
 		a.storeAccess.Unlock()
-		writeAdminError(writer, http.StatusInternalServerError, E.Cause(err, "儲存流量資料失敗").Error())
+		var restoreErr error
+		for _, tag := range tags {
+			restoreErr = errors.Join(restoreErr, a.applyInbound(tag, true))
+		}
+		restoreErr = errors.Join(restoreErr, a.saveStore())
+		writeAdminError(writer, http.StatusInternalServerError, errors.Join(E.Cause(err, "儲存流量資料失敗"), restoreErr).Error())
 		return
 	}
+	a.trafficAccess.Lock()
 	for tag := range current {
-		a.trafficAccess.Lock()
 		a.baselineUserTrafficLocked(tag, name, false)
-		a.trafficAccess.Unlock()
+	}
+	a.trafficAccess.Unlock()
+	for _, tag := range tags {
+		if err := a.applyInbound(tag, true); err != nil {
+			writeAdminError(writer, http.StatusInternalServerError, E.Cause(err, "更新核心用戶失敗").Error())
+			return
+		}
 	}
 	writer.WriteHeader(http.StatusNoContent)
 }
@@ -401,6 +562,8 @@ func (a *adminAPI) userGroupMembers(name string) map[string]*adminUser {
 
 func (a *adminAPI) userGroupViewLocked(name string, active map[string]adminUsage) (adminUserGroupView, bool) {
 	view := adminUserGroupView{Name: name, Revisions: make(map[string]int64)}
+	accountUsage := a.allAccountUsageLocked(active)
+	accountID := ""
 	for tag, record := range a.store.Inbounds {
 		if runtimeInbound := a.runtimes[tag]; runtimeInbound == nil || runtimeInbound.Manager == nil {
 			continue
@@ -411,15 +574,22 @@ func (a *adminAPI) userGroupViewLocked(name string, active map[string]adminUsage
 			}
 			view.Memberships = append(view.Memberships, makeAdminUserView(user, record, active[adminUserKey(tag, name)], true))
 			view.Revisions[tag] = record.Revision
+			if accountID == "" {
+				accountID = user.AccountID
+			}
 		}
 	}
 	if len(view.Memberships) == 0 {
 		return view, false
 	}
+	if account := a.store.Accounts[accountID]; account != nil {
+		accountView := makeAdminAccountView(account, accountUsage[accountID])
+		view.Account = &accountView
+	}
 	sort.Slice(view.Memberships, func(i, j int) bool { return view.Memberships[i].Inbound < view.Memberships[j].Inbound })
 	if externalID := a.store.ExternalSubscriptions[name]; validExternalSubscriptionID(externalID) && a.publicBaseURL != "" {
 		view.SubscriptionURL = a.publicBaseURL + "/sub/" + url.PathEscape(externalID)
-	} else if token := a.store.Subscriptions[name]; token != "" && a.publicBaseURL != "" && len(a.subscriptionLinksLocked(name, time.Now().UnixMilli(), active)) > 0 {
+	} else if token := a.store.Subscriptions[name]; token != "" && a.publicBaseURL != "" && len(a.subscriptionLinksWithAccountsLocked(name, time.Now().UnixMilli(), active, accountUsage)) > 0 {
 		view.SubscriptionURL = a.publicBaseURL + a.subscriptionPathLocked() + token
 	}
 	return view, true
@@ -451,12 +621,17 @@ func (a *adminAPI) rollbackInboundBatch(tags []string, previous map[string]*admi
 	return rollbackErr
 }
 
-func restoreStringMapEntry(values map[string]string, key string, value string, loaded bool) {
-	if loaded {
-		values[key] = value
-	} else {
-		delete(values, key)
+func (a *adminAPI) restoreUserGroupState(tags []string, accounts map[string]*adminAccount, subscriptions map[string]string, externalSubscriptions map[string]string) error {
+	a.storeAccess.Lock()
+	a.store.Accounts = accounts
+	a.store.Subscriptions = subscriptions
+	a.store.ExternalSubscriptions = externalSubscriptions
+	a.storeAccess.Unlock()
+	var restoreErr error
+	for _, tag := range tags {
+		restoreErr = errors.Join(restoreErr, a.applyInbound(tag, true))
 	}
+	return errors.Join(restoreErr, a.saveStore())
 }
 
 func requestedUserGroupName(request *http.Request) string {

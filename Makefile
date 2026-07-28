@@ -1,6 +1,8 @@
 NAME = sidera
 COMMIT = $(shell git rev-parse --short HEAD)
 TAGS ?= $(shell cat release/DEFAULT_BUILD_TAGS_OTHERS)
+GOTOOLCHAIN ?= go1.25.12
+export GOTOOLCHAIN
 
 GOHOSTOS = $(shell go env GOHOSTOS)
 GOHOSTARCH = $(shell go env GOHOSTARCH)
@@ -17,15 +19,12 @@ LIBBOX_FFI_CONFIG ?= ./experimental/libbox/ffi.json
 .PHONY: test release docs build schema
 
 build:
-	export GOTOOLCHAIN=local && \
 	go build $(MAIN_PARAMS) $(MAIN)
 
 race:
-	export GOTOOLCHAIN=local && \
 	go build -race $(MAIN_PARAMS) $(MAIN)
 
 ci_build:
-	export GOTOOLCHAIN=local && \
 	go build $(PARAMS) $(MAIN) && \
 	go build $(MAIN_PARAMS) $(MAIN)
 

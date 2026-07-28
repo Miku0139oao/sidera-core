@@ -133,6 +133,14 @@ func TestSubscriptionProfilePageSupportsNativeAndLegacyIdentifiers(t *testing.T)
 		require.Contains(t, response.Body.String(), "HYSTERIA2")
 		require.NotContains(t, response.Body.String(), "secret")
 	}
+	legacySubscription := adminRequest(a, http.MethodGet, externalSubscriptionRoutePrefix+"legacy_Sub-ID", nil)
+	require.Equal(t, http.StatusOK, legacySubscription.Code, legacySubscription.Body.String())
+	require.Equal(t, "https://panel.example.com/api/list/nodes/legacy_Sub-ID", legacySubscription.Header().Get("Profile-Web-Page-Url"))
+	decoded, err := base64.StdEncoding.DecodeString(legacySubscription.Body.String())
+	require.NoError(t, err)
+	require.Contains(t, string(decoded), "hysteria2://")
+	a.store.ExternalSubscriptions["Bob"] = "legacy_Sub-ID"
+	require.Equal(t, http.StatusNotFound, adminRequest(a, http.MethodGet, externalSubscriptionRoutePrefix+"legacy_Sub-ID", nil).Code)
 }
 
 func TestSubscriptionURLOnlyInUserDetail(t *testing.T) {
@@ -179,6 +187,10 @@ func TestWebBridgeDispatchesPublicSubscription(t *testing.T) {
 	bridge.ServeHTTP(response, request)
 	require.Equal(t, http.StatusNotFound, response.Code)
 	require.Equal(t, "404 page not found\n", response.Body.String())
+	legacyResponse := httptest.NewRecorder()
+	bridge.ServeHTTP(legacyResponse, httptest.NewRequest(http.MethodGet, externalSubscriptionRoutePrefix+"missing-id", nil))
+	require.Equal(t, http.StatusNotFound, legacyResponse.Code)
+	require.Equal(t, "404 page not found\n", legacyResponse.Body.String())
 }
 
 func TestWebBridgeDispatchesSubscriptionProfile(t *testing.T) {

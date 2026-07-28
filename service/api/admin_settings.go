@@ -54,6 +54,12 @@ func validateAdminSettings(settings adminSettings) error {
 	if pathsOverlap(settings.SubscriptionPath, settings.ProfilePagePath) {
 		return &adminSettingsError{"訂閱路徑與資訊頁路徑不可重疊"}
 	}
+	if settings.SubscriptionPath == externalSubscriptionRoutePrefix {
+		return &adminSettingsError{"訂閱路徑不可使用 3x-ui 相容訂閱路徑 /sub/"}
+	}
+	if settings.ProfilePagePath == externalSubscriptionRoutePrefix {
+		return &adminSettingsError{"資訊頁路徑不可使用 3x-ui 相容訂閱路徑 /sub/"}
+	}
 	for _, reserved := range []string{adminRoutePrefix + "/", dashboardRoutePrefix} {
 		if pathsOverlap(settings.SubscriptionPath, reserved) || pathsOverlap(settings.ProfilePagePath, reserved) {
 			return &adminSettingsError{"公開路徑不可與管理 API 或 dashboard 重疊"}
@@ -128,6 +134,9 @@ func (a *adminAPI) publicRoutePrefixesLocked() (subscriptions []string, profiles
 }
 
 func (a *adminAPI) matchesPublicRoute(path string) bool {
+	if strings.HasPrefix(path, externalSubscriptionRoutePrefix) {
+		return true
+	}
 	a.storeAccess.RLock()
 	subscriptions, profiles := a.publicRoutePrefixesLocked()
 	a.storeAccess.RUnlock()
@@ -146,7 +155,7 @@ func (a *adminAPI) servePublicRoute(writer http.ResponseWriter, request *http.Re
 	for _, prefix := range subscriptions {
 		if value, matched := publicRouteValue(request.URL.Path, prefix); matched {
 			request.SetPathValue("token", value)
-			a.getSubscription(writer, request)
+			a.getSubscription(writer, request, false)
 			return true
 		}
 	}
@@ -156,6 +165,11 @@ func (a *adminAPI) servePublicRoute(writer http.ResponseWriter, request *http.Re
 			a.getSubscriptionProfile(writer, request)
 			return true
 		}
+	}
+	if value, matched := publicRouteValue(request.URL.Path, externalSubscriptionRoutePrefix); matched {
+		request.SetPathValue("token", value)
+		a.getSubscription(writer, request, true)
+		return true
 	}
 	return false
 }

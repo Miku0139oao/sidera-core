@@ -43,3 +43,16 @@ func TestMergeProfilesRejectsDeletedTagCollision(t *testing.T) {
 	}
 	require.ErrorContains(t, MergeProfiles(context.Background(), &options), "collides with base configuration")
 }
+
+func TestMergeProfilesAcceptsVersionFiveStore(t *testing.T) {
+	dataPath := filepath.Join(t.TempDir(), "dashboard.json")
+	require.NoError(t, os.WriteFile(dataPath, []byte(`{"version":5,"servers":{}}`), 0o600))
+	options := option.Options{Services: []option.Service{{
+		Type: C.TypeAPI,
+		Options: &option.APIServiceOptions{Dashboard: &option.APIDashboardOptions{
+			Enabled: true, DataPath: dataPath,
+		}},
+	}}}
+	require.NoError(t, MergeProfiles(context.Background(), &options))
+	require.NotNil(t, options.Services[0].Options.(*option.APIServiceOptions).Dashboard.AppliedServerRevisions)
+}

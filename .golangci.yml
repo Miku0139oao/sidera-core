@@ -12,6 +12,7 @@ run:
     - with_tailscale
     - with_ccm
     - with_ocm
+    - with_3xui_import
     - badlinkname
     - tfogo_checklinkname0
 linters:

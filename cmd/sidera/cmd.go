@@ -20,6 +20,7 @@ var (
 	globalCtx         context.Context
 	configPaths       []string
 	configDirectories []string
+	runtimeConfigPath string
 	workingDir        string
 	disableColor      bool
 )
@@ -32,6 +33,7 @@ var mainCommand = &cobra.Command{
 func init() {
 	mainCommand.PersistentFlags().StringArrayVarP(&configPaths, "config", "c", nil, "set configuration file path")
 	mainCommand.PersistentFlags().StringArrayVarP(&configDirectories, "config-directory", "C", nil, "set configuration directory path")
+	mainCommand.PersistentFlags().StringVar(&runtimeConfigPath, "runtime-config", "", "set last-known-good runtime configuration path")
 	mainCommand.PersistentFlags().StringVarP(&workingDir, "directory", "D", "", "set working directory")
 	mainCommand.PersistentFlags().BoolVarP(&disableColor, "disable-color", "", false, "disable color output")
 }

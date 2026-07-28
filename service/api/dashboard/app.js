@@ -4,7 +4,7 @@
   const API_BASE = "/api/admin";
   const TOKEN_KEY = "sidera-token";
   const THEME_KEY = "sidera-theme";
-  const POLL_INTERVAL = 3000;
+  const POLL_INTERVAL = 5000;
   const REQUEST_TIMEOUT = 12000;
   const GIB = 1024 ** 3;
   const DEFAULT_SUBSCRIPTION_PATH = "/sub/sidera/";
@@ -92,11 +92,12 @@
   };
 
   class APIError extends Error {
-    constructor(message, status = 0, offline = false) {
+    constructor(message, status = 0, offline = false, payload = null) {
       super(message);
       this.name = "APIError";
       this.status = status;
       this.offline = offline;
+      this.payload = payload;
     }
   }
 
@@ -108,12 +109,22 @@
     trafficSamples: [],
     speed: null,
     users: [],
+    accounts: [],
     connections: [],
     inbounds: [],
     protocolSchemaVersion: null,
     protocols: [],
     servers: [],
     settings: null,
+    import3XUI: {
+      busy: false,
+      applying: false,
+      file: null,
+      mapping: "{}",
+      report: null,
+      reportStale: false,
+      error: "",
+    },
     restartRequired: false,
     reloading: false,
     savingSettings: false,
@@ -179,10 +190,51 @@
     minute: "2-digit",
   });
 
+  const derivedCache = {
+    protocols: null,
+    protocolByKey: new Map(),
+    inbounds: null,
+    inboundByTag: new Map(),
+    users: null,
+    accounts: null,
+    userGroups: [],
+  };
+  let resultRenderFrame = 0;
+  let pendingResultRoute = "";
+  let responsiveRenderFrame = 0;
+  let mobileDataListMode = null;
+
   function icon(name, className = "") {
     const paths = ICONS[name] || ICONS.sparkles;
     const classes = className ? `icon ${className}` : "icon";
     return `<svg class="${classes}" viewBox="0 0 24 24" aria-hidden="true" focusable="false">${paths}</svg>`;
+  }
+
+  function currentMobileDataListMode() {
+    const main = document.getElementById("main-content");
+    if (!main) return window.innerWidth <= 700;
+    const style = window.getComputedStyle(main);
+    const contentWidth = main.clientWidth - (Number.parseFloat(style.paddingLeft) || 0) - (Number.parseFloat(style.paddingRight) || 0);
+    return contentWidth <= 760;
+  }
+
+  function useMobileDataLists() {
+    mobileDataListMode = currentMobileDataListMode();
+    return mobileDataListMode;
+  }
+
+  function scheduleResultRender(route) {
+    pendingResultRoute = route;
+    if (resultRenderFrame) return;
+    resultRenderFrame = window.requestAnimationFrame(() => {
+      resultRenderFrame = 0;
+      const pendingRoute = pendingResultRoute;
+      pendingResultRoute = "";
+      if (pendingRoute !== state.route) return;
+      if (pendingRoute === "users") renderUserResults();
+      if (pendingRoute === "connections") renderConnectionResults();
+      if (pendingRoute === "servers") renderServerResults();
+    });
   }
 
   function escapeHTML(value) {
@@ -336,7 +388,7 @@
     const { timeoutMs = REQUEST_TIMEOUT, ...requestOptions } = options;
     const headers = new Headers(requestOptions.headers || {});
     headers.set("Accept", "application/json");
-    if (requestOptions.body !== undefined) headers.set("Content-Type", "application/json");
+    if (requestOptions.body !== undefined && !(requestOptions.body instanceof FormData)) headers.set("Content-Type", "application/json");
     const token = getToken();
     if (token) {
       try {
@@ -393,7 +445,7 @@
 
     if (!response.ok) {
       const message = typeof payload?.error === "string" ? payload.error : `請求失敗（HTTP ${response.status}）`;
-      throw new APIError(message, response.status);
+      throw new APIError(message, response.status, false, payload);
     }
 
     if (response.status !== 204 && (!responseText || invalidJSON || payload === null || typeof payload !== "object")) {
@@ -907,7 +959,7 @@
   }
 
   function protocolForServer(server) {
-    return state.protocols.find((protocol) => protocol.kind === server.kind && protocol.type === server.type) || null;
+    return protocolsByKey().get(`${server.kind}:${server.type}`) || null;
   }
 
   function protocolKey(protocol) {
@@ -915,7 +967,15 @@
   }
 
   function findProtocol(key) {
-    return state.protocols.find((protocol) => protocolKey(protocol) === key) || null;
+    return protocolsByKey().get(key) || null;
+  }
+
+  function protocolsByKey() {
+    if (derivedCache.protocols !== state.protocols) {
+      derivedCache.protocols = state.protocols;
+      derivedCache.protocolByKey = new Map(state.protocols.map((protocol) => [protocolKey(protocol), protocol]));
+    }
+    return derivedCache.protocolByKey;
   }
 
   function serverStatusInfo(status) {
@@ -1101,21 +1161,21 @@
   }
 
   function renderServerGroup(servers, title, description, pending) {
+    const mobile = useMobileDataLists();
     return `
       <section class="server-group ${pending ? "pending" : ""}" aria-labelledby="server-group-${pending ? "pending" : "active"}">
         <div class="server-group-heading">
           <div><h3 id="server-group-${pending ? "pending" : "active"}">${escapeHTML(title)}</h3><p>${escapeHTML(description)}</p></div>
           <span class="server-group-count">${escapeHTML(formatInteger(servers.length))}</span>
         </div>
-        <div class="data-surface desktop-table">
+        ${mobile ? `<div class="mobile-cards">${servers.map(renderServerCard).join("")}</div>` : `<div class="data-surface desktop-table">
           <table class="data-table server-table">
             <caption class="sr-only">${escapeHTML(title)}節點清單</caption>
             <colgroup><col style="width:18%"><col style="width:16%"><col style="width:16%"><col style="width:21%"><col style="width:19%"><col style="width:10%"></colgroup>
             <thead><tr><th scope="col">節點</th><th scope="col">協議</th><th scope="col">狀態 / 來源</th><th scope="col">網路能力</th><th scope="col">公開位址</th><th scope="col"><span class="sr-only">操作</span></th></tr></thead>
             <tbody>${servers.map(renderServerRow).join("")}</tbody>
           </table>
-        </div>
-        <div class="mobile-cards">${servers.map(renderServerCard).join("")}</div>
+        </div>`}
       </section>`;
   }
 
@@ -1253,36 +1313,62 @@
   }
 
   function logicalUserGroups() {
+    if (derivedCache.users === state.users && derivedCache.accounts === state.accounts) return derivedCache.userGroups;
+    const accounts = new Map(state.accounts.map((account) => [account.id, account]));
     const groups = new Map();
     state.users.forEach((user) => {
-      let group = groups.get(user.name);
+      const key = user.account_id || user.name;
+      let group = groups.get(key);
       if (!group) {
-        group = { name: user.name, memberships: [], upload_bytes: 0, download_bytes: 0, active_connections: 0, online_ips: [] };
-        groups.set(user.name, group);
+        const account = accounts.get(user.account_id) || null;
+        group = { name: user.name, account, memberships: [], upload_bytes: 0, download_bytes: 0, active_connections: 0, online_ips: [], onlineIPAddresses: new Set() };
+        groups.set(key, group);
       }
       group.memberships.push(user);
       group.upload_bytes += asNumber(user.upload_bytes);
       group.download_bytes += asNumber(user.download_bytes);
       group.active_connections += asNumber(user.active_connections);
       (user.online_ips || []).forEach((entry) => {
-        if (!group.online_ips.some((online) => online.address === entry.address)) group.online_ips.push(entry);
+        if (!group.onlineIPAddresses.has(entry.address)) {
+          group.onlineIPAddresses.add(entry.address);
+          group.online_ips.push(entry);
+        }
       });
     });
-    return [...groups.values()].sort((left, right) => left.name.localeCompare(right.name, "zh-Hant"));
+    groups.forEach((group) => {
+      if (group.account?.policy_scope !== "account_global") return;
+      group.name = group.account.name;
+      group.upload_bytes = asNumber(group.account.upload_bytes);
+      group.download_bytes = asNumber(group.account.download_bytes);
+      group.active_connections = asNumber(group.account.active_connections);
+      group.online_ips = Array.isArray(group.account.online_ips) ? group.account.online_ips : [];
+    });
+    const result = [...groups.values()].sort((left, right) => left.name.localeCompare(right.name, "zh-Hant"));
+    result.forEach((group) => { delete group.onlineIPAddresses; });
+    derivedCache.users = state.users;
+    derivedCache.accounts = state.accounts;
+    derivedCache.userGroups = result;
+    return result;
   }
 
   function getUserGroupStatus(group) {
-    const statuses = group.memberships.map(getUserStatus);
-    return statuses.find((status) => status.key === "disabled")
-      || statuses.find((status) => status.key === "expired")
-      || statuses.find((status) => status.key === "exhausted")
-      || statuses[0]
-      || { key: "disabled", label: "無節點", className: "" };
+    if (group.account?.policy_scope === "account_global") return getUserStatus(group.account);
+    let fallback = null;
+    let expired = null;
+    let exhausted = null;
+    for (const membership of group.memberships) {
+      const status = getUserStatus(membership);
+      fallback ||= status;
+      if (status.key === "disabled") return status;
+      if (status.key === "expired") expired ||= status;
+      if (status.key === "exhausted") exhausted ||= status;
+    }
+    return expired || exhausted || fallback || { key: "disabled", label: "無節點", className: "" };
   }
 
-  function filteredUsers() {
+  function filteredUsers(groups = logicalUserGroups()) {
     const query = state.filters.userSearch.trim().toLocaleLowerCase("zh-Hant");
-    return logicalUserGroups().filter((group) => {
+    return groups.filter((group) => {
       if (state.filters.userInbound && !group.memberships.some((user) => user.inbound === state.filters.userInbound)) return false;
       const status = getUserGroupStatus(group);
       if (state.filters.userStatus !== "all" && status.key !== state.filters.userStatus) return false;
@@ -1296,8 +1382,8 @@
     const container = document.getElementById("user-results");
     if (!container) return;
     const focusKey = focusedActionKey(container);
-    const users = filteredUsers();
     const allGroups = logicalUserGroups();
+    const users = filteredUsers(allGroups);
     const count = document.getElementById("user-result-count");
     if (count) count.textContent = `顯示 ${integerFormat.format(users.length)} / ${integerFormat.format(allGroups.length)} 位`;
     container.setAttribute("aria-busy", state.loading.users ? "true" : "false");
@@ -1318,7 +1404,8 @@
       return;
     }
 
-    container.innerHTML = `
+    const mobile = useMobileDataLists();
+    container.innerHTML = mobile ? `<div class="mobile-cards">${users.map(renderUserCard).join("")}</div>` : `
       <div class="data-surface desktop-table">
         <table class="data-table">
           <caption class="sr-only">用戶清單</caption>
@@ -1326,8 +1413,7 @@
           <thead><tr><th scope="col">用戶</th><th scope="col">入站</th><th scope="col">狀態</th><th scope="col">流量額度</th><th scope="col">連線 / 到期</th><th scope="col"><span class="sr-only">操作</span></th></tr></thead>
           <tbody>${users.map(renderUserRow).join("")}</tbody>
         </table>
-      </div>
-      <div class="mobile-cards">${users.map(renderUserCard).join("")}</div>`;
+      </div>`;
     restoreActionFocus(container, focusKey);
   }
 
@@ -1360,6 +1446,11 @@
   function renderGroupQuota(group) {
     const trafficMembers = group.memberships.filter((user) => inboundFor(user.inbound)?.traffic !== false);
     if (!trafficMembers.length) return '<span class="cell-secondary">節點未提供個別流量統計</span>';
+    if (group.account?.policy_scope === "account_global") {
+      const used = asNumber(group.upload_bytes) + asNumber(group.download_bytes);
+      const quota = asNumber(group.account.quota_bytes);
+      return `<span class="cell-primary">${escapeHTML(formatBytes(used))}</span><span class="cell-secondary">${quota ? `全域上限 ${escapeHTML(formatBytes(quota))}` : "全域額度不限"}</span>`;
+    }
     const used = trafficMembers.reduce((total, user) => total + asNumber(user.upload_bytes) + asNumber(user.download_bytes), 0);
     const limited = trafficMembers.filter((user) => asNumber(user.quota_bytes) > 0);
     return `<span class="cell-primary">${escapeHTML(formatBytes(used))}</span><span class="cell-secondary">${limited.length ? `${limited.length} 個節點設有額度` : "所有節點不限額"}</span>`;
@@ -1479,6 +1570,62 @@
     return { tone: "success", iconName: "check", message: "不保留 Core 舊版入口；仍使用舊連結的客戶端將無法更新。" };
   }
 
+  function render3XUIImportReport() {
+    const report = state.import3XUI.report;
+    if (!report) {
+      const targets = state.inbounds.filter((inbound) => inbound.managed).map((inbound) => inbound.tag);
+      return `
+        <div class="import-empty" id="import-report" role="status">
+          ${icon("database")}
+          <span>先執行預檢。可映射的 Sidera inbound：${targets.length ? targets.map(escapeHTML).join("、") : "目前沒有可管理的 inbound"}</span>
+        </div>`;
+    }
+    const summary = report.summary || {};
+    const source = report.source || {};
+    const issues = Array.isArray(report.issues) ? report.issues : [];
+    const inbounds = Array.isArray(report.inbounds) ? report.inbounds : [];
+    const issueLimit = 100;
+    const inboundLimit = 100;
+    return `
+      <div class="import-report ${report.ready ? "ready" : "blocked"} ${state.import3XUI.reportStale ? "stale" : ""}" id="import-report" role="status">
+        ${state.import3XUI.reportStale ? `<div class="import-stale-notice">${icon("alert")}<span>資料庫或 mapping 已變更；此報告僅供參考，請重新執行預檢。</span></div>` : ""}
+        <div class="import-report-heading">
+          <span class="settings-card-icon ${report.ready ? "preview" : "danger"}">${icon(report.ready ? "check" : "alert")}</span>
+          <div>
+            <span class="eyebrow">${report.ready ? "可以正式匯入" : "需要處理阻擋項目"}</span>
+            <h4>${escapeHTML(formatInteger(summary.creatable_accounts))} 個帳戶可建立，${escapeHTML(formatInteger(summary.blocked_accounts))} 個遭阻擋</h4>
+            <p>來源包含 ${escapeHTML(formatInteger(source.accounts))} 個帳戶、${escapeHTML(formatInteger(source.memberships))} 個 membership 與 ${escapeHTML(formatInteger(source.inbounds))} 個 inbound。</p>
+          </div>
+        </div>
+        <div class="import-summary-grid" aria-label="預檢摘要">
+          <div><span>錯誤</span><strong>${escapeHTML(formatInteger(summary.errors))}</strong></div>
+          <div><span>警告</span><strong>${escapeHTML(formatInteger(summary.warnings))}</strong></div>
+          <div><span>Fingerprint</span><code>${escapeHTML(report.fingerprint || "-")}</code></div>
+        </div>
+        ${inbounds.length ? `
+          <div class="import-report-section">
+            <h5>Inbound 映射</h5>
+            <div class="import-inbound-list">
+              ${inbounds.slice(0, inboundLimit).map((inbound) => `
+                <div><code>${escapeHTML(inbound.source_id)}</code><span>${escapeHTML(inbound.tag || inbound.remark || "未命名")} · ${escapeHTML(inbound.protocol)}</span><strong>${inbound.target_tag ? `→ ${escapeHTML(inbound.target_tag)}` : "未映射"}</strong></div>`).join("")}
+            </div>
+            ${inbounds.length > inboundLimit ? `<p class="import-truncated">另有 ${escapeHTML(formatInteger(inbounds.length - inboundLimit))} 筆未顯示。</p>` : ""}
+          </div>` : ""}
+        ${issues.length ? `
+          <div class="import-report-section">
+            <h5>相容性問題</h5>
+            <div class="import-issue-list">
+              ${issues.slice(0, issueLimit).map((issue) => `
+                <div class="${issue.severity === "error" ? "error" : "warning"}">
+                  ${icon(issue.severity === "error" ? "alert" : "sparkles")}
+                  <span><strong>${escapeHTML(issue.message)}</strong><code>${escapeHTML(issue.code)} · ${escapeHTML(issue.path)}</code></span>
+                </div>`).join("")}
+            </div>
+            ${issues.length > issueLimit ? `<p class="import-truncated">另有 ${escapeHTML(formatInteger(issues.length - issueLimit))} 筆未顯示；請透過 API 取得完整報告。</p>` : ""}
+          </div>` : ""}
+      </div>`;
+  }
+
   function renderSettings() {
     const main = document.getElementById("main-content");
     if (!main) return;
@@ -1499,7 +1646,8 @@
     const legacyEnabled = Boolean(settings.legacy_routes_enabled);
     const routeState = settingsRouteState(subscriptionPath, profilePath, legacyEnabled);
     const busy = state.loading.settings || state.savingSettings;
-    main.setAttribute("aria-busy", busy ? "true" : "false");
+    const importAvailable = Boolean(state.overview?.features?.three_x_ui_import);
+    main.setAttribute("aria-busy", busy || state.import3XUI.busy ? "true" : "false");
     main.innerHTML = `
       <div class="page-enter settings-page">
         <div class="page-heading">
@@ -1527,7 +1675,7 @@
               <span class="settings-card-icon">${icon("link")}</span>
               <div><h3>公開路徑</h3><p>路徑儲存後立即生效；所有值都必須以斜線開頭及結尾。</p></div>
             </div>
-            <div class="schema-note settings-scope-note">${icon("alert")}<span>此頁只控制 Core 原生入口。外部 x-ui 的 /sub/{id} 與 Caddy 代理不會被這個開關撤銷。</span></div>
+            <div class="schema-note settings-scope-note">${icon("alert")}<span>此頁只控制可設定入口。3x-ui 相容的 /sub/{id} 與 Caddy 代理不會被這個開關撤銷。</span></div>
             <div class="form-error" id="settings-form-error" role="alert" hidden></div>
             <fieldset class="settings-fieldset" ${busy ? "disabled" : ""}>
               <div class="settings-form-grid">
@@ -1568,6 +1716,43 @@
             </div>
           </aside>
         </div>
+
+        ${importAvailable ? `
+        <section class="card settings-import-card" aria-labelledby="settings-import-title">
+          <div class="settings-card-heading compact">
+            <span class="settings-card-icon">${icon("database")}</span>
+            <div><h3 id="settings-import-title">3x-ui 3.5.0 資料匯入</h3><p>以相同資料庫完成預檢與正式套用；來源憑證不會顯示於報告。</p></div>
+          </div>
+          <div class="schema-note settings-scope-note">${icon("shield")}<span>正式匯入會建立 account-global 帳戶、membership、流量基線及新舊訂閱識別碼。任何 runtime 或儲存失敗都會回滾。</span></div>
+          <form class="import-form" data-form="3x-ui-import" novalidate>
+            <div class="form-error" id="import-form-error" role="alert" ${state.import3XUI.error ? "" : "hidden"}>${state.import3XUI.error ? `${icon("alert")}<span>${escapeHTML(state.import3XUI.error)}</span>` : ""}</div>
+            <fieldset class="settings-fieldset" ${state.import3XUI.busy ? "disabled" : ""}>
+              <div class="import-form-grid">
+                <div class="form-field">
+                  <label for="import-database">3x-ui SQLite 備份 <span class="required-mark" aria-hidden="true">*</span></label>
+                  <input class="text-input import-file-input" id="import-database" name="database" type="file" accept=".db,.sqlite,.sqlite3,application/vnd.sqlite3">
+                  <span class="supporting-text" id="import-file-state">${state.import3XUI.file ? `已保留：${escapeHTML(state.import3XUI.file.name)} · ${escapeHTML(formatBytes(state.import3XUI.file.size))}；重新選檔會使報告失效。` : "最大 256 MiB；檔案只會送往目前的 Core。"}</span>
+                </div>
+                <div class="form-field">
+                  <label for="import-inbound-map">Inbound mapping JSON</label>
+                  <textarea class="text-input import-map-editor" id="import-inbound-map" name="inbound_map" spellcheck="false" aria-describedby="import-map-help">${escapeHTML(state.import3XUI.mapping)}</textarea>
+                  <span class="supporting-text" id="import-map-help">以 3x-ui inbound ID 映射到現有 Sidera tag，例如 {"1":"reality-in"}。</span>
+                </div>
+              </div>
+            </fieldset>
+            <div class="settings-form-actions import-actions">
+              <button class="button button-outline ${state.import3XUI.busy && !state.import3XUI.applying ? "is-loading" : ""}" type="submit" ${state.import3XUI.busy ? "disabled" : ""}>${icon(state.import3XUI.busy && !state.import3XUI.applying ? "refresh" : "shield")}<span>${state.import3XUI.busy && !state.import3XUI.applying ? "預檢中…" : "執行預檢"}</span></button>
+              <button class="button button-primary ${state.import3XUI.applying ? "is-loading" : ""}" type="button" data-action="apply-3x-ui-import" ${state.import3XUI.busy || state.import3XUI.reportStale || !state.import3XUI.report?.ready ? "disabled" : ""}>${icon(state.import3XUI.applying ? "refresh" : "database")}<span>${state.import3XUI.applying ? "匯入中…" : "確認正式匯入"}</span></button>
+            </div>
+          </form>
+          ${render3XUIImportReport()}
+        </section>` : `
+        <section class="card settings-import-card" aria-labelledby="settings-import-title">
+          <div class="settings-card-heading compact">
+            <span class="settings-card-icon">${icon("database")}</span>
+            <div><h3 id="settings-import-title">3x-ui 資料匯入未啟用</h3><p>此精簡版本未連結 SQLite 引擎；請使用含 <code>with_3xui_import</code> build tag 的版本執行匯入。</p></div>
+          </div>
+        </section>`}
       </div>`;
   }
 
@@ -1661,7 +1846,8 @@
       return;
     }
 
-    container.innerHTML = `
+    const mobile = useMobileDataLists();
+    container.innerHTML = mobile ? `<div class="mobile-cards">${connections.map(renderConnectionCard).join("")}</div>` : `
       <div class="data-surface desktop-table">
         <table class="data-table">
           <caption class="sr-only">活躍連線清單</caption>
@@ -1669,8 +1855,7 @@
           <thead><tr><th scope="col">用戶 / 入站</th><th scope="col">協定</th><th scope="col">來源</th><th scope="col">目的地</th><th scope="col">流量</th><th scope="col">持續時間</th><th scope="col"><span class="sr-only">操作</span></th></tr></thead>
           <tbody>${connections.map(renderConnectionRow).join("")}</tbody>
         </table>
-      </div>
-      <div class="mobile-cards">${connections.map(renderConnectionCard).join("")}</div>`;
+      </div>`;
     restoreActionFocus(container, focusKey);
   }
 
@@ -1732,7 +1917,11 @@
   }
 
   function inboundFor(tag) {
-    return state.inbounds.find((inbound) => inbound.tag === tag) || null;
+    if (derivedCache.inbounds !== state.inbounds) {
+      derivedCache.inbounds = state.inbounds;
+      derivedCache.inboundByTag = new Map(state.inbounds.map((inbound) => [inbound.tag, inbound]));
+    }
+    return derivedCache.inboundByTag.get(tag) || null;
   }
 
   function secureUUID() {
@@ -1810,6 +1999,13 @@
       activeMembership: 0,
       draft: {
         name: group?.name || "",
+        policy_scope: group?.account?.policy_scope || "account_global",
+        account_revision: Number(group?.account?.revision) || 0,
+        account_enabled: group?.account ? Boolean(group.account.enabled) : true,
+        account_quota_gb: toQuotaGB(group?.account?.quota_bytes),
+        account_max_ips: Number(group?.account?.max_ips) || 0,
+        account_expires_at: toDateTimeLocal(group?.account?.expires_at),
+        account_reset_days: Number(group?.account?.reset_days) || 0,
         memberships,
       },
     };
@@ -1825,6 +2021,7 @@
     if (!dialog || model?.type !== "user") return;
     const editing = Boolean(model.group);
     const draft = model.draft;
+    const globalPolicy = draft.policy_scope === "account_global";
     const activeTab = model.activeTab || "basics";
     const activeMembership = Math.min(model.activeMembership || 0, Math.max(0, draft.memberships.length - 1));
     model.activeMembership = activeMembership;
@@ -1854,6 +2051,13 @@
                   <input class="text-input" id="user-name" name="name" value="${escapeHTML(draft.name)}" maxlength="128" autocomplete="off" aria-describedby="name-error">
                   <span class="supporting-text field-message" id="name-error" data-help="用於識別流量、連線與訂閱，最多 128 個字元。">用於識別流量、連線與訂閱，最多 128 個字元。</span>
                 </div>
+                ${globalPolicy ? `
+                  <div class="form-field"><label for="account-quota-gb">全域流量額度（GB）</label><input class="text-input" id="account-quota-gb" name="account_quota_gb" type="number" value="${escapeHTML(draft.account_quota_gb)}" min="0" step="0.01" inputmode="decimal" placeholder="0" aria-describedby="account_quota_gb-error"><span class="supporting-text field-message" id="account_quota_gb-error" data-help="跨所有節點合計；0 或留空表示不限額。">跨所有節點合計；0 或留空表示不限額。</span></div>
+                  <div class="form-field"><label for="account-expires-at">帳戶到期時間</label><input class="text-input" id="account-expires-at" name="account_expires_at" type="datetime-local" value="${escapeHTML(draft.account_expires_at)}" aria-describedby="account_expires_at-error"><span class="supporting-text field-message" id="account_expires_at-error" data-help="留空表示永不到期。">留空表示永不到期。</span></div>
+                  <div class="form-field"><label for="account-max-ips">全域來源 IP 上限</label><input class="text-input" id="account-max-ips" name="account_max_ips" type="number" value="${escapeHTML(draft.account_max_ips)}" min="0" max="65535" step="1" inputmode="numeric" aria-describedby="account_max_ips-error"><span class="supporting-text field-message" id="account_max_ips-error" data-help="跨所有節點合計；0 表示不限。">跨所有節點合計；0 表示不限。</span></div>
+                  <div class="form-field"><label for="account-reset-days">自動續期天數</label><input class="text-input" id="account-reset-days" name="account_reset_days" type="number" value="${escapeHTML(draft.account_reset_days)}" min="0" max="24855" step="1" inputmode="numeric" aria-describedby="account_reset_days-error"><span class="supporting-text field-message" id="account_reset_days-error" data-help="到期後流量歸零並延長指定天數；0 表示不自動續期。">到期後流量歸零並延長指定天數；0 表示不自動續期。</span></div>
+                  <div class="form-field full"><div class="switch-row"><span class="switch-copy"><strong>啟用帳戶</strong><span>停用後立即拒絕此帳戶在所有節點的新連線。</span></span><label class="switch-control"><span class="sr-only">啟用帳戶</span><input name="account_enabled" type="checkbox" role="switch" ${draft.account_enabled ? "checked" : ""}><span class="switch-track"></span></label></div></div>`
+                  : '<div class="schema-note full">此帳戶由舊版資料遷移，限制仍分別套用於各節點。新帳戶會使用跨節點全域政策。</div>'}
                 <div class="user-basics-summary full">
                   <span class="summary-symbol">${icon("server")}</span>
                   <div><strong>${formatInteger(draft.memberships.length)} 個節點</strong><p>${draft.memberships.map((membership) => escapeHTML(membership.inbound)).join(" · ")}</p></div>
@@ -1910,6 +2114,7 @@
     const inbound = inboundFor(draft.inbound);
     if (!inbound) return "";
     const suffix = String(index);
+    const globalPolicy = state.dialog.draft.policy_scope === "account_global";
     return `<section class="membership-card" data-membership-index="${suffix}" ${active ? "" : "hidden"}>
       <div class="membership-heading"><div><strong>${escapeHTML(inbound.tag)}</strong><span>${escapeHTML(inbound.type)} · ${escapeHTML(credentialLabel(inbound.credential))}</span></div><button class="icon-button small" type="button" data-action="remove-user-membership" data-index="${suffix}" aria-label="移除 ${escapeHTML(inbound.tag)}" ${state.dialog.draft.memberships.length === 1 ? "disabled" : ""}>${icon("trash")}</button></div>
       <input type="hidden" name="id_${suffix}" value="${escapeHTML(draft.id)}"><input type="hidden" name="inbound_${suffix}" value="${escapeHTML(inbound.tag)}">
@@ -1917,9 +2122,10 @@
         ${credentialFields(inbound, draft, suffix)}
         ${inbound.flow ? `<div class="form-field full"><label for="flow_${suffix}">Flow</label><input class="text-input" id="flow_${suffix}" name="flow_${suffix}" value="${escapeHTML(draft.flow)}" autocomplete="off" spellcheck="false" aria-describedby="flow_${suffix}-error"><span class="supporting-text field-message" id="flow_${suffix}-error" data-help="留空表示不指定 Flow。">留空表示不指定 Flow。</span></div>` : ""}
         ${inbound.alter_id ? `<div class="form-field"><label for="alter_id_${suffix}">Alter ID</label><input class="text-input" id="alter_id_${suffix}" name="alter_id_${suffix}" type="number" value="${escapeHTML(draft.alter_id)}" min="0" max="2147483647" step="1" inputmode="numeric" aria-describedby="alter_id_${suffix}-error"><span class="supporting-text field-message" id="alter_id_${suffix}-error" data-help="必須是 0 或正整數。">必須是 0 或正整數。</span></div>` : ""}
-        ${inbound.traffic === false ? '<div class="schema-note">此協議不提供個別流量額度。</div>' : `<div class="form-field"><label for="quota_gb_${suffix}">流量額度（GB）</label><input class="text-input" id="quota_gb_${suffix}" name="quota_gb_${suffix}" type="number" value="${escapeHTML(draft.quota_gb)}" min="0" step="0.01" inputmode="decimal" placeholder="0" aria-describedby="quota_gb_${suffix}-error"><span class="supporting-text field-message" id="quota_gb_${suffix}-error" data-help="0 或留空表示不限額。">0 或留空表示不限額。</span></div>`}
-        <div class="form-field"><label for="expires_at_${suffix}">到期時間</label><input class="text-input" id="expires_at_${suffix}" name="expires_at_${suffix}" type="datetime-local" value="${escapeHTML(draft.expires_at)}" aria-describedby="expires_at_${suffix}-error"><span class="supporting-text field-message" id="expires_at_${suffix}-error" data-help="留空表示永不到期。">留空表示永不到期。</span></div>
-        <div class="form-field"><label for="max_ips_${suffix}">來源 IP 上限</label><input class="text-input" id="max_ips_${suffix}" name="max_ips_${suffix}" type="number" value="${escapeHTML(draft.max_ips)}" min="0" max="65535" step="1" inputmode="numeric" aria-describedby="max_ips_${suffix}-error"><span class="supporting-text field-message" id="max_ips_${suffix}-error" data-help="0 表示不限。">0 表示不限。</span></div>
+        ${globalPolicy ? '<div class="schema-note full">流量額度、到期時間及來源 IP 上限由基本資料中的全域帳戶政策統一管理。</div>' : `
+          ${inbound.traffic === false ? '<div class="schema-note">此協議不提供個別流量額度。</div>' : `<div class="form-field"><label for="quota_gb_${suffix}">流量額度（GB）</label><input class="text-input" id="quota_gb_${suffix}" name="quota_gb_${suffix}" type="number" value="${escapeHTML(draft.quota_gb)}" min="0" step="0.01" inputmode="decimal" placeholder="0" aria-describedby="quota_gb_${suffix}-error"><span class="supporting-text field-message" id="quota_gb_${suffix}-error" data-help="0 或留空表示不限額。">0 或留空表示不限額。</span></div>`}
+          <div class="form-field"><label for="expires_at_${suffix}">到期時間</label><input class="text-input" id="expires_at_${suffix}" name="expires_at_${suffix}" type="datetime-local" value="${escapeHTML(draft.expires_at)}" aria-describedby="expires_at_${suffix}-error"><span class="supporting-text field-message" id="expires_at_${suffix}-error" data-help="留空表示永不到期。">留空表示永不到期。</span></div>
+          <div class="form-field"><label for="max_ips_${suffix}">來源 IP 上限</label><input class="text-input" id="max_ips_${suffix}" name="max_ips_${suffix}" type="number" value="${escapeHTML(draft.max_ips)}" min="0" max="65535" step="1" inputmode="numeric" aria-describedby="max_ips_${suffix}-error"><span class="supporting-text field-message" id="max_ips_${suffix}-error" data-help="0 表示不限。">0 表示不限。</span></div>`}
         <div class="form-field full"><div class="switch-row"><span class="switch-copy"><strong>啟用此節點</strong><span>停用後拒絕此 membership 的新連線。</span></span><label class="switch-control"><span class="sr-only">啟用此節點</span><input name="enabled_${suffix}" type="checkbox" role="switch" ${draft.enabled ? "checked" : ""}><span class="switch-track"></span></label></div></div>
       </div>
     </section>`;
@@ -2241,6 +2447,13 @@
     }));
     return {
       name: value("name", current.name),
+      policy_scope: current.policy_scope,
+      account_revision: current.account_revision,
+      account_enabled: form.elements.namedItem("account_enabled")?.checked ?? current.account_enabled,
+      account_quota_gb: value("account_quota_gb", current.account_quota_gb),
+      account_max_ips: value("account_max_ips", current.account_max_ips),
+      account_expires_at: value("account_expires_at", current.account_expires_at),
+      account_reset_days: value("account_reset_days", current.account_reset_days),
       memberships,
     };
   }
@@ -2253,6 +2466,31 @@
     if (!name) errors.name = "請輸入用戶名稱。";
     else if (name.length > 128) errors.name = "用戶名稱不可超過 128 個字元。";
     const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    const globalPolicy = draft.policy_scope === "account_global";
+
+    let accountQuotaBytes = 0;
+    let accountExpiresAt = 0;
+    let accountMaxIPs = 0;
+    let accountResetDays = 0;
+    if (globalPolicy) {
+      if (draft.account_quota_gb !== "") {
+        const quotaGB = Number(draft.account_quota_gb);
+        if (!Number.isFinite(quotaGB) || quotaGB < 0) errors.account_quota_gb = "額度必須是 0 或正數。";
+        else {
+          accountQuotaBytes = Math.round(quotaGB * GIB);
+          if (!Number.isSafeInteger(accountQuotaBytes)) errors.account_quota_gb = "額度過大，請輸入較小的數值。";
+        }
+      }
+      if (draft.account_expires_at) {
+        accountExpiresAt = new Date(draft.account_expires_at).getTime();
+        if (!Number.isFinite(accountExpiresAt) || accountExpiresAt < 0) errors.account_expires_at = "到期時間格式不正確。";
+      }
+      accountMaxIPs = Number(draft.account_max_ips || 0);
+      if (!Number.isSafeInteger(accountMaxIPs) || accountMaxIPs < 0 || accountMaxIPs > 65535) errors.account_max_ips = "來源 IP 上限必須是 0 至 65,535 的整數。";
+      accountResetDays = Number(draft.account_reset_days || 0);
+      if (!Number.isSafeInteger(accountResetDays) || accountResetDays < 0 || accountResetDays > 24855) errors.account_reset_days = "自動續期天數必須是 0 至 24,855 的整數。";
+      if (accountResetDays > 0 && accountExpiresAt <= 0) errors.account_reset_days = "設定自動續期前必須先設定帳戶到期時間。";
+    }
 
     const memberships = draft.memberships.map((membership, index) => {
       const inbound = inboundFor(membership.inbound);
@@ -2270,7 +2508,7 @@
         }
       }
       let quotaBytes = 0;
-      if (inbound.traffic !== false && membership.quota_gb !== "") {
+      if (!globalPolicy && inbound.traffic !== false && membership.quota_gb !== "") {
         const quotaGB = Number(membership.quota_gb);
         if (!Number.isFinite(quotaGB) || quotaGB < 0) errors[`quota_gb_${index}`] = "額度必須是 0 或正數。";
         else {
@@ -2279,7 +2517,7 @@
         }
       }
       let expiresAt = 0;
-      if (membership.expires_at) {
+      if (!globalPolicy && membership.expires_at) {
         expiresAt = new Date(membership.expires_at).getTime();
         if (!Number.isFinite(expiresAt) || expiresAt < 0) errors[`expires_at_${index}`] = "到期時間格式不正確。";
       }
@@ -2288,8 +2526,8 @@
         alterID = Number(membership.alter_id || 0);
         if (!Number.isSafeInteger(alterID) || alterID < 0 || alterID > 2147483647) errors[`alter_id_${index}`] = "Alter ID 必須是 0 至 2,147,483,647 的整數。";
       }
-      const maxIPs = Number(membership.max_ips || 0);
-      if (!Number.isSafeInteger(maxIPs) || maxIPs < 0 || maxIPs > 65535) errors[`max_ips_${index}`] = "來源 IP 上限必須是 0 至 65,535 的整數。";
+      const maxIPs = globalPolicy ? 0 : Number(membership.max_ips || 0);
+      if (!globalPolicy && (!Number.isSafeInteger(maxIPs) || maxIPs < 0 || maxIPs > 65535)) errors[`max_ips_${index}`] = "來源 IP 上限必須是 0 至 65,535 的整數。";
       return {
         id: membership.id,
         inbound: inbound.tag,
@@ -2314,6 +2552,13 @@
       errors,
       body: {
         name,
+        policy_scope: draft.policy_scope,
+        account_revision: Number(draft.account_revision) || 0,
+        enabled: draft.account_enabled,
+        quota_bytes: accountQuotaBytes,
+        expires_at: accountExpiresAt,
+        max_ips: accountMaxIPs,
+        reset_days: accountResetDays,
         memberships,
         revisions,
       },
@@ -2607,6 +2852,7 @@
       const data = await api("/users");
       if (epoch !== state.epoch) return;
       state.users = Array.isArray(data?.users) ? data.users : [];
+      state.accounts = Array.isArray(data?.accounts) ? data.accounts : [];
       if (Array.isArray(data?.inbounds)) state.inbounds = data.inbounds;
       state.loaded.users = true;
       state.errors.users = "";
@@ -2730,6 +2976,84 @@
     }
   }
 
+  function validate3XUIImportMapping(value) {
+    let mapping;
+    try {
+      mapping = JSON.parse(value || "{}");
+    } catch (_) {
+      return "Inbound mapping 必須是有效的 JSON 物件。";
+    }
+    if (!mapping || Array.isArray(mapping) || typeof mapping !== "object") return "Inbound mapping 必須是 JSON 物件。";
+    for (const [source, target] of Object.entries(mapping)) {
+      if (!/^[1-9]\d*$/.test(source) || typeof target !== "string" || !target || target !== target.trim()) {
+        return "每個 mapping key 必須是正整數 inbound ID，value 必須是無前後空白的 Sidera tag。";
+      }
+    }
+    return "";
+  }
+
+  function invalidate3XUIImportReport() {
+    if (!state.import3XUI.report) return;
+    if (state.import3XUI.reportStale) return;
+    state.import3XUI.reportStale = true;
+    const report = document.getElementById("import-report");
+    if (report) {
+      report.classList.add("stale");
+      report.insertAdjacentHTML("afterbegin", `<div class="import-stale-notice">${icon("alert")}<span>資料庫或 mapping 已變更；此報告僅供參考，請重新執行預檢。</span></div>`);
+    }
+    const apply = document.querySelector('[data-action="apply-3x-ui-import"]');
+    if (apply) apply.disabled = true;
+  }
+
+  async function submit3XUIImport(form, applying = false) {
+    if (state.import3XUI.busy) return;
+    const selectedFile = form.elements.database.files?.[0] || state.import3XUI.file;
+    const mapping = form.elements.inbound_map.value.trim() || "{}";
+    state.import3XUI.file = selectedFile || null;
+    state.import3XUI.mapping = mapping;
+    state.import3XUI.error = !selectedFile ? "請選擇 3x-ui SQLite 備份。" : validate3XUIImportMapping(mapping);
+    if (applying && (state.import3XUI.reportStale || !state.import3XUI.report?.ready || !state.import3XUI.report.fingerprint)) {
+      state.import3XUI.error = "資料庫或 mapping 已變更，請重新執行預檢。";
+    }
+    if (state.import3XUI.error) {
+      if (state.route === "settings") renderSettings();
+      return;
+    }
+    if (applying && !window.confirm(`即將建立 ${formatInteger(state.import3XUI.report.summary?.creatable_accounts)} 個 account-global 帳戶。確定要正式匯入？`)) return;
+
+    const body = new FormData();
+    body.append("database", selectedFile, selectedFile.name || "x-ui.db");
+    body.append("inbound_map", mapping);
+    if (applying) body.append("fingerprint", state.import3XUI.report.fingerprint);
+    state.import3XUI.busy = true;
+    state.import3XUI.applying = applying;
+    if (state.route === "settings") renderSettings();
+    try {
+      const report = await api(`/imports/3x-ui/${applying ? "apply" : "dry-run"}`, { method: "POST", body, timeoutMs: 90000 });
+      if (applying) {
+        const imported = report.summary?.creatable_accounts || report.source?.accounts || 0;
+        state.import3XUI = { busy: false, applying: false, file: null, mapping: "{}", report: null, reportStale: false, error: "" };
+        showToast(`已正式匯入 ${formatInteger(imported)} 個 account-global 帳戶`, "success");
+        await Promise.all([loadUsers({ force: true }), loadOverview({ silent: true, force: true })]);
+      } else {
+        state.import3XUI.report = report;
+        state.import3XUI.reportStale = false;
+        showToast(report.ready ? "預檢通過，可以正式匯入" : "預檢完成，請先處理阻擋項目", report.ready ? "success" : "info");
+      }
+    } catch (error) {
+      if (error.status === 401) return;
+      if (error.status === 409 && error.payload?.fingerprint) {
+        state.import3XUI.report = error.payload;
+        state.import3XUI.reportStale = false;
+      }
+      state.import3XUI.error = error.status === 409 && error.payload?.fingerprint ? "匯入狀態已變更，請依照最新報告處理後重新預檢。" : error.message;
+    } finally {
+      state.import3XUI.busy = false;
+      state.import3XUI.applying = false;
+      if (state.authenticated && state.route === "settings") renderSettings();
+    }
+  }
+
   function startPolling() {
     stopPolling();
     state.pollTimer = window.setInterval(() => {
@@ -2770,12 +3094,14 @@
     state.trafficSamples = [];
     state.speed = null;
     state.users = [];
+    state.accounts = [];
     state.connections = [];
     state.inbounds = [];
     state.protocolSchemaVersion = null;
     state.protocols = [];
     state.servers = [];
     state.settings = null;
+    state.import3XUI = { busy: false, applying: false, file: null, mapping: "{}", report: null, reportStale: false, error: "" };
     state.restartRequired = false;
     state.reloading = false;
     state.savingSettings = false;
@@ -2874,7 +3200,7 @@
     const firstError = Object.keys(errors)[0] || "";
     if (firstError) {
       const membershipMatch = firstError.match(/_(\d+)$/);
-      const nextTab = firstError === "name" ? "basics" : membershipMatch ? "nodes" : state.dialog.activeTab;
+      const nextTab = firstError === "name" || firstError.startsWith("account_") ? "basics" : membershipMatch ? "nodes" : state.dialog.activeTab;
       const nextMembership = membershipMatch ? Number(membershipMatch[1]) : state.dialog.activeMembership;
       if (nextTab !== state.dialog.activeTab || nextMembership !== state.dialog.activeMembership) {
         state.dialog.activeTab = nextTab;
@@ -2964,6 +3290,7 @@
     if (type === "user") submitUser(event.target);
     if (type === "confirm") submitConfirm(event.target);
     if (type === "settings") submitSettings(event.target);
+    if (type === "3x-ui-import") submit3XUIImport(event.target);
   });
 
   app.addEventListener("input", (event) => {
@@ -2972,25 +3299,30 @@
       state.filters.userSearch = target.value;
       const clear = target.parentElement.querySelector(".search-clear");
       if (clear) clear.hidden = !target.value;
-      renderUserResults();
+      scheduleResultRender("users");
     }
     if (target.dataset.filter === "connection-search") {
       state.filters.connectionSearch = target.value;
       const clear = target.parentElement.querySelector(".search-clear");
       if (clear) clear.hidden = !target.value;
-      renderConnectionResults();
+      scheduleResultRender("connections");
     }
     if (target.dataset.filter === "server-search") {
       state.filters.serverSearch = target.value;
       const clear = target.parentElement.querySelector(".search-clear");
       if (clear) clear.hidden = !target.value;
-      renderServerResults();
+      scheduleResultRender("servers");
     }
     if (target.closest('[data-form="user"]')) clearFieldError(target);
     if (target.closest('[data-form="server"]')) clearFieldError(target);
     if (target.closest('[data-form="settings"]')) {
       clearFieldError(target);
       updateSettingsPreview(target.closest("form"));
+    }
+    if (target.name === "inbound_map" && target.closest('[data-form="3x-ui-import"]')) {
+      state.import3XUI.mapping = target.value;
+      state.import3XUI.error = "";
+      invalidate3XUIImportReport();
     }
   });
 
@@ -3029,6 +3361,13 @@
       window.setTimeout(() => document.getElementById("server-protocol")?.focus(), 0);
     }
     if (target.name === "legacy_routes_enabled" && target.closest('[data-form="settings"]')) updateSettingsPreview(target.closest("form"));
+    if (target.name === "database" && target.closest('[data-form="3x-ui-import"]')) {
+      state.import3XUI.file = target.files?.[0] || null;
+      state.import3XUI.error = "";
+      invalidate3XUIImportReport();
+      const fileState = document.getElementById("import-file-state");
+      if (fileState) fileState.textContent = state.import3XUI.file ? `${state.import3XUI.file.name} · ${formatBytes(state.import3XUI.file.size)}` : "最大 256 MiB；檔案只會送往目前的 Core。";
+    }
   });
 
   app.addEventListener("keydown", (event) => {
@@ -3061,6 +3400,10 @@
     if (action === "new-user") openUserDialog();
     if (action === "dialog-cancel") closeDialog();
     if (action === "reload-core") reloadCore();
+    if (action === "apply-3x-ui-import") {
+      const form = actionElement.closest('[data-form="3x-ui-import"]');
+      if (form) submit3XUIImport(form, true);
+    }
 
     if (action === "reset-settings-paths") {
       const form = actionElement.closest('[data-form="settings"]');
@@ -3314,7 +3657,7 @@
         confirmLabel: "刪除用戶",
         successMessage: "用戶已刪除",
         action: async () => {
-          await api(`/user-groups?name=${encodeURIComponent(group.name)}`, { method: "DELETE", body: JSON.stringify({ revisions }) });
+          await api(`/user-groups?name=${encodeURIComponent(group.name)}`, { method: "DELETE", body: JSON.stringify({ account_revision: Number(group.account?.revision) || 0, revisions }) });
           await Promise.all([loadUsers({ silent: true, force: true }), loadOverview({ silent: true, force: true })]);
         },
       });
@@ -3380,6 +3723,17 @@
   });
 
   window.addEventListener("offline", () => setOffline(true));
+
+  window.addEventListener("resize", () => {
+    if (responsiveRenderFrame || mobileDataListMode === null) return;
+    responsiveRenderFrame = window.requestAnimationFrame(() => {
+      responsiveRenderFrame = 0;
+      const nextMode = currentMobileDataListMode();
+      if (nextMode === mobileDataListMode) return;
+      mobileDataListMode = nextMode;
+      if (state.route === "users" || state.route === "connections" || state.route === "servers") scheduleResultRender(state.route);
+    });
+  });
 
   document.addEventListener("visibilitychange", () => {
     if (!document.hidden && state.authenticated) {

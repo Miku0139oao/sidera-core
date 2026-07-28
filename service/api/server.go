@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/netip"
 	"strings"
+	"time"
 
 	"github.com/Miku0139oao/sidera-core/adapter"
 	boxService "github.com/Miku0139oao/sidera-core/adapter/service"
@@ -31,17 +32,19 @@ func RegisterService(registry *boxService.Registry) {
 
 type Service struct {
 	boxService.Adapter
-	ctx            context.Context
-	cancel         context.CancelFunc
-	logger         log.ContextLogger
-	options        option.APIServiceOptions
-	listener       *listener.Listener
-	tlsConfig      tls.ServerConfig
-	startedService *daemon.StartedService
-	grpcServer     *grpc.Server
-	httpServer     *http.Server
-	dashboard      *dashboard
-	admin          *adminAPI
+	ctx             context.Context
+	cancel          context.CancelFunc
+	logger          log.ContextLogger
+	options         option.APIServiceOptions
+	listener        *listener.Listener
+	tlsConfig       tls.ServerConfig
+	startedService  *daemon.StartedService
+	grpcServer      *grpc.Server
+	httpServer      *http.Server
+	tcpListener     net.Listener
+	dashboard       *dashboard
+	admin           *adminAPI
+	runtimeRollback func() error
 }
 
 func NewService(ctx context.Context, logger log.ContextLogger, tag string, options option.APIServiceOptions) (adapter.Service, error) {
@@ -120,6 +123,9 @@ func (s *Service) Start(stage adapter.StartStage) error {
 		BaseContext: func(net.Listener) context.Context {
 			return s.ctx
 		},
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       2 * time.Minute,
+		MaxHeaderBytes:    1 << 20,
 	}
 	if s.tlsConfig != nil {
 		err := s.tlsConfig.Start()
@@ -140,18 +146,54 @@ func (s *Service) Start(stage adapter.StartStage) error {
 	if s.tlsConfig != nil {
 		tcpListener = aTLS.NewListener(tcpListener, s.tlsConfig)
 	}
+	s.tcpListener = tcpListener
+	return nil
+}
+
+// CommitRuntime persists state that is valid only after the complete Box has
+// started successfully.
+func (s *Service) CommitRuntime() error {
 	if s.admin != nil {
-		if err = s.admin.start(); err != nil {
-			return E.Cause(err, "start dashboard management")
+		rollback, err := s.admin.markServerProfilesApplied()
+		if err != nil {
+			return err
+		}
+		s.runtimeRollback = rollback
+	}
+	return nil
+}
+
+func (s *Service) RollbackRuntime() error {
+	rollback := s.runtimeRollback
+	s.runtimeRollback = nil
+	if rollback != nil {
+		return rollback()
+	}
+	return nil
+}
+
+func (s *Service) ValidateRuntimeActivation() error {
+	if s.tcpListener == nil || s.httpServer == nil {
+		return E.New("API listener is not ready")
+	}
+	return nil
+}
+
+func (s *Service) ActivateRuntime() {
+	s.runtimeRollback = nil
+	if s.admin != nil {
+		if err := s.admin.start(); err != nil {
+			s.logger.Error("start dashboard management: ", err)
 		}
 	}
+	tcpListener := s.tcpListener
+	s.tcpListener = nil
 	go func() {
 		serveErr := s.httpServer.Serve(tcpListener)
 		if serveErr != nil && s.ctx.Err() == nil {
 			s.logger.Error("serve error: ", serveErr)
 		}
 	}()
-	return nil
 }
 
 func (s *Service) Close() error {
