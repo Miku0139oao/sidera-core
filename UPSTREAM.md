@@ -1,5 +1,9 @@
 # Upstream Baselines
 
+Sidera Core is an independent project. Upstream trees are historical and interoperability references, not release or CI parents.
+
+CI and release binaries use official Go (`actions/setup-go`). They do not patch Go from MetaCubeX or ship Windows 7 / macOS 10.13 compatibility toolchains.
+
 Sidera Core pins upstream revisions so compatibility targets remain reproducible.
 
 | Project | Role | Stable baseline | Development snapshot |
