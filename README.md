@@ -31,9 +31,12 @@ matrix.
 
 ## Build
 
-The supported release toolchain is Go 1.25.12. The repository includes a
-`.go-version` file, and Make targets set `GOTOOLCHAIN=go1.25.12` to avoid
-private runtime symbol changes in newer Go releases.
+The supported release toolchain is Go 1.26.5. The repository includes a
+`.go-version` file, and Make targets set `GOTOOLCHAIN=go1.26.5` so local,
+container, and release builds use the same tested patch release. Compatibility
+with the private runtime symbols enabled by the `badlinkname` build tag is
+covered by the Go 1.26 CI build and race-test jobs. Go 1.24.7 remains the
+module compatibility floor, with Go 1.24 and 1.25 retained in the test matrix.
 
 ```sh
 go build ./cmd/sidera

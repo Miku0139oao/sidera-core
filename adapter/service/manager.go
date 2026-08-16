@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"runtime"
 	"slices"
 	"sync"
 
@@ -28,9 +29,12 @@ type Manager struct {
 	stage             adapter.StartStage
 	runtimeActive     bool
 	runtimeCommitting bool
+	startInFlight     int
+	startOwner        uint64
 	services          []adapter.Service
 	serviceByTag      map[string]adapter.Service
 	updates           map[string]bool
+	updateOwners      map[uint64]int
 }
 
 func NewManager(logger log.ContextLogger, registry adapter.ServiceRegistry) *Manager {
@@ -39,6 +43,7 @@ func NewManager(logger log.ContextLogger, registry adapter.ServiceRegistry) *Man
 		registry:     registry,
 		serviceByTag: make(map[string]adapter.Service),
 		updates:      make(map[string]bool),
+		updateOwners: make(map[uint64]int),
 	}
 	manager.condition = sync.NewCond(&manager.access)
 	return manager
@@ -46,13 +51,17 @@ func NewManager(logger log.ContextLogger, registry adapter.ServiceRegistry) *Man
 
 func (m *Manager) Start(stage adapter.StartStage) error {
 	m.access.Lock()
-	if m.closing || m.closed {
+	if err := m.waitForLifecycleIdleLocked(); err != nil {
 		m.access.Unlock()
-		return os.ErrClosed
+		return err
 	}
 	if m.runtimeCommitting {
 		m.access.Unlock()
 		return E.New("runtime commit in progress")
+	}
+	if m.runtimeActive {
+		m.access.Unlock()
+		return E.New("runtime is already active")
 	}
 	if m.started && m.stage >= stage {
 		panic("already started")
@@ -62,8 +71,11 @@ func (m *Manager) Start(stage adapter.StartStage) error {
 	if stage == adapter.StartStateInitialize {
 		m.runtimeActive = false
 	}
+	m.startInFlight++
+	m.startOwner = currentGoroutineID()
 	services := append([]adapter.Service(nil), m.services...)
 	m.access.Unlock()
+	defer m.finishStart()
 	for _, service := range services {
 		name := "service/" + service.Type() + "[" + service.Tag() + "]"
 		done := adapter.LogElapsed(m.logger, stage, " ", name)
@@ -86,7 +98,7 @@ func (m *Manager) Close() error {
 		return nil
 	}
 	m.closing = true
-	for m.runtimeCommitting || len(m.updates) > 0 {
+	for m.runtimeCommitting || len(m.updates) > 0 || m.startInFlight > 0 {
 		m.condition.Wait()
 	}
 	m.started = false
@@ -187,13 +199,9 @@ func (m *Manager) Create(ctx context.Context, logger log.ContextLogger, tag stri
 		m.access.Unlock()
 		return E.New("replacing an active service requires a full Box reload: ", tag)
 	}
+	m.beginUpdateOwnerLocked()
 	m.access.Unlock()
-	defer func() {
-		m.access.Lock()
-		delete(m.updates, tag)
-		m.condition.Broadcast()
-		m.access.Unlock()
-	}()
+	defer m.finishUpdate(tag)
 	managedService, err := m.registry.Create(ctx, logger, tag, serviceType, options)
 	if err != nil {
 		return err
@@ -270,9 +278,9 @@ func (m *Manager) Create(ctx context.Context, logger log.ContextLogger, tag stri
 
 func (m *Manager) CommitRuntime(beforeCommit func() (func() error, error)) error {
 	m.access.Lock()
-	if m.closing || m.closed {
+	if err := m.waitForLifecycleIdleLocked(); err != nil {
 		m.access.Unlock()
-		return os.ErrClosed
+		return err
 	}
 	if m.runtimeActive {
 		m.access.Unlock()
@@ -281,6 +289,10 @@ func (m *Manager) CommitRuntime(beforeCommit func() (func() error, error)) error
 	if m.runtimeCommitting {
 		m.access.Unlock()
 		return E.New("runtime commit already in progress")
+	}
+	if !m.started || m.stage < adapter.StartStateStarted {
+		m.access.Unlock()
+		return E.New("runtime commit requires services to finish start")
 	}
 	m.runtimeCommitting = true
 	services := append([]adapter.Service(nil), m.services...)
@@ -396,4 +408,65 @@ func causeIfError(err error, message ...any) error {
 		return nil
 	}
 	return E.Cause(err, message...)
+}
+
+func (m *Manager) waitForLifecycleIdleLocked() error {
+	gid := currentGoroutineID()
+	for {
+		if m.closing || m.closed {
+			return os.ErrClosed
+		}
+		if m.updateOwners[gid] > 0 || m.startInFlight > 0 && m.startOwner == gid {
+			return E.New("cannot start or commit runtime from a service update")
+		}
+		if len(m.updates) == 0 && m.startInFlight == 0 {
+			return nil
+		}
+		m.condition.Wait()
+	}
+}
+
+func (m *Manager) beginUpdateOwnerLocked() {
+	m.updateOwners[currentGoroutineID()]++
+}
+
+func (m *Manager) finishUpdate(tag string) {
+	m.access.Lock()
+	delete(m.updates, tag)
+	gid := currentGoroutineID()
+	if m.updateOwners[gid] > 1 {
+		m.updateOwners[gid]--
+	} else {
+		delete(m.updateOwners, gid)
+	}
+	m.condition.Broadcast()
+	m.access.Unlock()
+}
+
+func (m *Manager) finishStart() {
+	m.access.Lock()
+	m.startInFlight--
+	if m.startInFlight == 0 {
+		m.startOwner = 0
+	}
+	m.condition.Broadcast()
+	m.access.Unlock()
+}
+
+func currentGoroutineID() uint64 {
+	var buf [64]byte
+	n := runtime.Stack(buf[:], false)
+	const prefix = "goroutine "
+	if n <= len(prefix) {
+		return 0
+	}
+	var id uint64
+	for i := len(prefix); i < n; i++ {
+		c := buf[i]
+		if c < '0' || c > '9' {
+			break
+		}
+		id = id*10 + uint64(c-'0')
+	}
+	return id
 }

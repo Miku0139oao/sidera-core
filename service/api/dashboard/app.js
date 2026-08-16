@@ -1352,7 +1352,14 @@
   }
 
   function getUserGroupStatus(group) {
-    if (group.account?.policy_scope === "account_global") return getUserStatus(group.account);
+    if (group.account?.policy_scope === "account_global") {
+      const accountStatus = getUserStatus(group.account);
+      if (accountStatus.key !== "valid") return accountStatus;
+      if (!group.memberships.some((membership) => membership.enabled)) {
+        return { key: "disabled", label: "所有節點已停用", className: "" };
+      }
+      return accountStatus;
+    }
     let fallback = null;
     let expired = null;
     let exhausted = null;

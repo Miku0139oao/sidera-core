@@ -13,16 +13,47 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-var (
-	winTrustLibrary                               = windows.NewLazySystemDLL("wintrust.dll")
-	winTrustProviderDataFromStateDataProcedure    = winTrustLibrary.NewProc("WTHelperProvDataFromStateData")
-	winTrustProviderSignerFromChainProcedure      = winTrustLibrary.NewProc("WTHelperGetProvSignerFromChain")
-	winTrustProviderCertificateFromChainProcedure = winTrustLibrary.NewProc("WTHelperGetProvCertFromChain")
-)
+//go:generate go run golang.org/x/sys/windows/mkwinsyscall -output zsyscall_authenticode_windows.go authenticode_windows.go
+
+//sys winTrustProviderDataFromStateData(stateData windows.Handle) (providerData uintptr) = wintrust.WTHelperProvDataFromStateData
+//sys winTrustProviderSignerFromChain(providerData uintptr, signerIndex uint32, counterSigner uint32, counterSignerIndex uint32) (providerSigner uintptr) = wintrust.WTHelperGetProvSignerFromChain
+//sys winTrustProviderCertificateFromChain(providerSigner uintptr, certificateIndex uint32) (providerCertificate uintptr) = wintrust.WTHelperGetProvCertFromChain
 
 type cryptProviderCertificate struct {
-	structureSize      uint32
+	_                  uint32
 	certificateContext *windows.CertContext
+}
+
+func readCurrentProcessValue[T any](address uintptr, value *T) error {
+	size := unsafe.Sizeof(*value)
+	buffer, err := readCurrentProcessBytes(address, uint32(size))
+	if err != nil {
+		return err
+	}
+	copy(unsafe.Slice((*byte)(unsafe.Pointer(value)), int(size)), buffer)
+	return nil
+}
+
+func readCurrentProcessBytes(address uintptr, size uint32) ([]byte, error) {
+	if address == 0 || size == 0 {
+		return nil, E.New("empty process memory range")
+	}
+	buffer := make([]byte, size)
+	var bytesRead uintptr
+	err := windows.ReadProcessMemory(
+		windows.CurrentProcess(),
+		address,
+		&buffer[0],
+		uintptr(size),
+		&bytesRead,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if bytesRead != uintptr(size) {
+		return nil, E.New("short process memory read: ", bytesRead, " of ", size, " bytes")
+	}
+	return buffer, nil
 }
 
 func authenticodeSigner(path string, file windows.Handle) ([]byte, error) {
@@ -80,27 +111,39 @@ func authenticodeSigner(path string, file windows.Handle) ([]byte, error) {
 }
 
 func verifiedSignerCertificate(stateData windows.Handle) ([]byte, error) {
-	providerData, _, _ := winTrustProviderDataFromStateDataProcedure.Call(uintptr(stateData))
+	providerData := winTrustProviderDataFromStateData(stateData)
 	if providerData == 0 {
 		return nil, E.New("missing Authenticode provider data")
 	}
-	providerSigner, _, _ := winTrustProviderSignerFromChainProcedure.Call(providerData, 0, 0, 0)
+	providerSigner := winTrustProviderSignerFromChain(providerData, 0, 0, 0)
 	if providerSigner == 0 {
 		return nil, E.New("missing Authenticode provider signer")
 	}
-	providerCertificate, _, _ := winTrustProviderCertificateFromChainProcedure.Call(providerSigner, 0)
+	providerCertificate := winTrustProviderCertificateFromChain(providerSigner, 0)
 	if providerCertificate == 0 {
 		return nil, E.New("missing Authenticode provider certificate")
 	}
-	certificateContext := (*cryptProviderCertificate)(unsafe.Pointer(providerCertificate)).certificateContext
-	if certificateContext == nil {
+	var providerCertificateValue cryptProviderCertificate
+	err := readCurrentProcessValue(providerCertificate, &providerCertificateValue)
+	if err != nil {
+		return nil, E.Cause(err, "read Authenticode provider certificate")
+	}
+	if providerCertificateValue.certificateContext == nil {
 		return nil, E.New("empty Authenticode signer certificate context")
 	}
-	if certificateContext.Length == 0 || certificateContext.EncodedCert == nil {
+	var certificateContext windows.CertContext
+	err = readCurrentProcessValue(uintptr(unsafe.Pointer(providerCertificateValue.certificateContext)), &certificateContext)
+	if err != nil {
+		return nil, E.Cause(err, "read Authenticode certificate context")
+	}
+	if certificateContext.EncodedCert == nil || certificateContext.Length == 0 {
 		return nil, E.New("empty Authenticode signer certificate")
 	}
-	encodedCertificate := unsafe.Slice(certificateContext.EncodedCert, int(certificateContext.Length))
-	return append([]byte(nil), encodedCertificate...), nil
+	encodedCertificate, err := readCurrentProcessBytes(uintptr(unsafe.Pointer(certificateContext.EncodedCert)), certificateContext.Length)
+	if err != nil {
+		return nil, E.Cause(err, "read Authenticode signer certificate")
+	}
+	return encodedCertificate, nil
 }
 
 func validateCodeSigningCertificate(encodedCertificate []byte) (*x509.Certificate, error) {

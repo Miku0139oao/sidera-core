@@ -15,6 +15,7 @@ import (
 
 	C "github.com/Miku0139oao/sidera-core/constant"
 	"github.com/Miku0139oao/sidera-core/option"
+	"github.com/Miku0139oao/sidera-core/protocol/vless/xrayencryption"
 	E "github.com/sagernet/sing/common/exceptions"
 	SJSON "github.com/sagernet/sing/common/json"
 
@@ -292,6 +293,25 @@ func (a *adminAPI) subscriptionLinksWithAccountsLocked(name string, now int64, a
 	return links
 }
 
+func (a *adminAPI) subscriptionURLLocked(name string, active map[string]adminUsage) string {
+	return a.subscriptionURLWithAccountsLocked(name, active, a.accountUsageLocked(active))
+}
+
+func (a *adminAPI) subscriptionURLWithAccountsLocked(name string, active map[string]adminUsage, accountUsage map[string]adminUsage) string {
+	if a.publicBaseURL == "" || len(a.subscriptionLinksWithAccountsLocked(name, time.Now().UnixMilli(), active, accountUsage)) == 0 {
+		return ""
+	}
+	externalID := a.store.ExternalSubscriptions[name]
+	if owner, valid := a.externalSubscriptionNameLocked(externalID); valid && owner == name {
+		return a.publicBaseURL + "/sub/" + url.PathEscape(externalID)
+	}
+	token := a.store.Subscriptions[name]
+	if owner, valid := a.subscriptionNameLocked(token); valid && owner == name {
+		return a.publicBaseURL + a.subscriptionPathLocked() + token
+	}
+	return ""
+}
+
 func subscriptionLink(ctx context.Context, tag string, profile *adminServerStore, user *adminUser) (string, bool) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -315,9 +335,17 @@ func subscriptionLink(ctx context.Context, tag string, profile *adminServerStore
 		if err != nil {
 			return "", false
 		}
+		decryption := config.Decryption
+		if decryption == "" {
+			decryption = "none"
+		}
+		encryption, err := xrayencryption.ClientEncryptionFromDecryption(decryption)
+		if err != nil {
+			return "", false
+		}
 		shortIDs := append([]string(nil), config.TLS.Reality.ShortID...)
 		sort.Strings(shortIDs)
-		query := url.Values{"encryption": {"none"}, "security": {"reality"}, "type": {"tcp"}, "fp": {"chrome"}, "pbk": {base64.RawURLEncoding.EncodeToString(privateKey.PublicKey().Bytes())}}
+		query := url.Values{"encryption": {encryption}, "security": {"reality"}, "type": {"tcp"}, "fp": {"chrome"}, "pbk": {base64.RawURLEncoding.EncodeToString(privateKey.PublicKey().Bytes())}}
 		if user.Flow != "" {
 			query.Set("flow", user.Flow)
 		}

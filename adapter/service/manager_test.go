@@ -144,6 +144,55 @@ func TestActivePlainReplacementIsRejectedBeforeConstruction(t *testing.T) {
 	require.Same(t, oldService, current)
 }
 
+func TestRuntimeCommitWaitsForInFlightServiceReplacement(t *testing.T) {
+	var events []string
+	created := 0
+	replacementStarted := make(chan struct{})
+	allowReplacement := make(chan struct{})
+	registry := NewRegistry()
+	Register[option.StubOptions](registry, "runtime-test", func(context.Context, log.ContextLogger, string, option.StubOptions) (adapter.Service, error) {
+		created++
+		identifier := "old"
+		if created == 2 {
+			identifier = "new"
+			close(replacementStarted)
+			<-allowReplacement
+		}
+		return &dynamicRuntimeTestService{Adapter: NewAdapter("runtime-test", "dynamic"), events: &events, identifier: identifier}, nil
+	})
+	logger := log.NewNOPFactory().Logger()
+	manager := NewManager(logger, registry)
+	require.NoError(t, manager.Create(context.Background(), logger, "dynamic", "runtime-test", &option.StubOptions{}))
+	for _, stage := range adapter.ListStartStages {
+		require.NoError(t, manager.Start(stage))
+	}
+	events = nil
+
+	replacementDone := make(chan error, 1)
+	go func() {
+		replacementDone <- manager.Create(context.Background(), logger, "dynamic", "runtime-test", &option.StubOptions{})
+	}()
+	<-replacementStarted
+	commitDone := make(chan error, 1)
+	go func() {
+		commitDone <- manager.CommitRuntime(nil)
+	}()
+	select {
+	case err := <-commitDone:
+		t.Fatalf("runtime commit returned while replacement was still in flight: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	close(allowReplacement)
+	require.NoError(t, <-replacementDone)
+	require.NoError(t, <-commitDone)
+	current, loaded := manager.Get("dynamic")
+	require.True(t, loaded)
+	require.Equal(t, "new", current.(*dynamicRuntimeTestService).identifier)
+	require.Equal(t, []string{"initialize", "start", "post-start", "finish-start", "close:old", "validate", "commit", "activate"}, events)
+	require.NoError(t, manager.Close())
+}
+
 func TestCloseReturnsServiceErrors(t *testing.T) {
 	expected := errors.New("close failed")
 	registry := NewRegistry()
@@ -193,6 +242,96 @@ func TestCloseWaitsForRuntimeCommitAndPreventsActivation(t *testing.T) {
 	require.ErrorIs(t, <-commitDone, os.ErrClosed)
 	require.NoError(t, <-closeDone)
 	require.ErrorIs(t, manager.Start(adapter.StartStateInitialize), os.ErrClosed)
+}
+
+func TestCommitRuntimeRequiresFinishedStart(t *testing.T) {
+	registry := NewRegistry()
+	Register[option.StubOptions](registry, "runtime-test", func(context.Context, log.ContextLogger, string, option.StubOptions) (adapter.Service, error) {
+		return &dynamicRuntimeTestService{Adapter: NewAdapter("runtime-test", "dynamic"), events: new([]string)}, nil
+	})
+	logger := log.NewNOPFactory().Logger()
+	manager := NewManager(logger, registry)
+	require.NoError(t, manager.Create(context.Background(), logger, "dynamic", "runtime-test", &option.StubOptions{}))
+	require.NoError(t, manager.Start(adapter.StartStateInitialize))
+	require.ErrorContains(t, manager.CommitRuntime(nil), "finish start")
+	require.NoError(t, manager.Close())
+}
+
+func TestStartAfterRuntimeActiveIsRejected(t *testing.T) {
+	registry := NewRegistry()
+	Register[option.StubOptions](registry, "runtime-test", func(context.Context, log.ContextLogger, string, option.StubOptions) (adapter.Service, error) {
+		return &dynamicRuntimeTestService{Adapter: NewAdapter("runtime-test", "dynamic"), events: new([]string)}, nil
+	})
+	logger := log.NewNOPFactory().Logger()
+	manager := NewManager(logger, registry)
+	require.NoError(t, manager.Create(context.Background(), logger, "dynamic", "runtime-test", &option.StubOptions{}))
+	for _, stage := range adapter.ListStartStages {
+		require.NoError(t, manager.Start(stage))
+	}
+	require.NoError(t, manager.CommitRuntime(nil))
+	require.ErrorContains(t, manager.Start(adapter.StartStateInitialize), "already active")
+	require.NoError(t, manager.Close())
+}
+
+func TestCommitRuntimeWaitsForStartCallbacks(t *testing.T) {
+	startStarted := make(chan struct{})
+	allowStart := make(chan struct{})
+	registry := NewRegistry()
+	Register[option.StubOptions](registry, "runtime-test", func(context.Context, log.ContextLogger, string, option.StubOptions) (adapter.Service, error) {
+		return &blockingStartTestService{
+			Adapter:      NewAdapter("runtime-test", "dynamic"),
+			startStarted: startStarted,
+			allowStart:   allowStart,
+		}, nil
+	})
+	logger := log.NewNOPFactory().Logger()
+	manager := NewManager(logger, registry)
+	require.NoError(t, manager.Create(context.Background(), logger, "dynamic", "runtime-test", &option.StubOptions{}))
+	require.NoError(t, manager.Start(adapter.StartStateInitialize))
+	require.NoError(t, manager.Start(adapter.StartStateStart))
+	require.NoError(t, manager.Start(adapter.StartStatePostStart))
+
+	startDone := make(chan error, 1)
+	go func() {
+		startDone <- manager.Start(adapter.StartStateStarted)
+	}()
+	<-startStarted
+	commitDone := make(chan error, 1)
+	go func() {
+		commitDone <- manager.CommitRuntime(nil)
+	}()
+	select {
+	case err := <-commitDone:
+		t.Fatalf("runtime commit returned while start callbacks were still running: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(allowStart)
+	require.NoError(t, <-startDone)
+	require.NoError(t, <-commitDone)
+	require.NoError(t, manager.Close())
+}
+
+func TestStartFromCreateCallbackDoesNotDeadlock(t *testing.T) {
+	var startErr error
+	registry := NewRegistry()
+	logger := log.NewNOPFactory().Logger()
+	manager := NewManager(logger, registry)
+	Register[option.StubOptions](registry, "reentry-test", func(context.Context, log.ContextLogger, string, option.StubOptions) (adapter.Service, error) {
+		startErr = manager.Start(adapter.StartStateInitialize)
+		return &dynamicRuntimeTestService{Adapter: NewAdapter("reentry-test", "reentry"), events: new([]string)}, nil
+	})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		require.NoError(t, manager.Create(context.Background(), logger, "reentry", "reentry-test", &option.StubOptions{}))
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Create deadlocked waiting for Start from its own constructor")
+	}
+	require.ErrorContains(t, startErr, "service update")
+	require.NoError(t, manager.Close())
 }
 
 type dynamicRuntimeTestService struct {
@@ -265,6 +404,30 @@ func (s *dynamicPlainTestService) Close() error {
 	*s.events = append(*s.events, "close:"+s.identifier)
 	return s.closeErr
 }
+
+type blockingStartTestService struct {
+	Adapter
+	startStarted chan struct{}
+	allowStart   chan struct{}
+}
+
+func (s *blockingStartTestService) Start(stage adapter.StartStage) error {
+	if stage == adapter.StartStateStarted {
+		close(s.startStarted)
+		<-s.allowStart
+	}
+	return nil
+}
+
+func (s *blockingStartTestService) Close() error { return nil }
+
+func (s *blockingStartTestService) ValidateRuntimeActivation() error { return nil }
+
+func (s *blockingStartTestService) CommitRuntime() error { return nil }
+
+func (s *blockingStartTestService) RollbackRuntime() error { return nil }
+
+func (s *blockingStartTestService) ActivateRuntime() {}
 
 type startedCallbackTestService struct {
 	Adapter

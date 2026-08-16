@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/http"
 	"net/netip"
@@ -213,8 +214,32 @@ func (s *Service) Close() error {
 	if s.startedService != nil {
 		s.startedService.Close()
 	}
-	return common.Close(
+	return filterCloseError(common.Close(
 		common.PtrOrNil(s.listener),
 		s.tlsConfig,
-	)
+	))
+}
+
+func filterCloseError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var joined interface{ Unwrap() []error }
+	if errors.As(err, &joined) {
+		var filtered []error
+		for _, e := range joined.Unwrap() {
+			if e == nil || errors.Is(e, net.ErrClosed) {
+				continue
+			}
+			filtered = append(filtered, e)
+		}
+		if len(filtered) == 0 {
+			return nil
+		}
+		return errors.Join(filtered...)
+	}
+	if errors.Is(err, net.ErrClosed) {
+		return nil
+	}
+	return err
 }

@@ -55,7 +55,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: 1.25.12
+          go-version: 1.26.5
           cache: false
       - name: Cache Go modules
         uses: actions/cache/restore@v4
@@ -146,7 +146,7 @@ jobs:
         if: ${{ ! matrix.legacy_win7 }}
         uses: actions/setup-go@v5
         with:
-          go-version: 1.25.12
+          go-version: 1.26.5
           cache: false
       - name: Cache Go modules
         uses: actions/cache/restore@v4
@@ -161,7 +161,7 @@ jobs:
         with:
           path: |
             ~/go/go_win7
-          key: go_win7_12512
+          key: go_win7_1265
       - name: Setup Go for Windows 7
         if: matrix.legacy_win7 && steps.cache-go-for-windows7.outputs.cache-hit != 'true'
         env:
@@ -481,7 +481,7 @@ jobs:
         if: ${{ ! matrix.legacy_osx }}
         uses: actions/setup-go@v5
         with:
-          go-version: ^1.25.3
+          go-version: 1.26.5
           cache: false
       - name: Cache Go modules
         uses: actions/cache/restore@v4
@@ -496,7 +496,7 @@ jobs:
         with:
           path: |
             ~/go/go_osx
-          key: go_osx_1258
+          key: go_osx_1265
       - name: Setup Go for macOS 10.13
         if: matrix.legacy_osx && steps.cache-go-for-macos1013.outputs.cache-hit != 'true'
         env:
@@ -580,7 +580,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: ^1.25.4
+          go-version: 1.26.5
           cache: false
       - name: Cache Go modules
         uses: actions/cache@v4
@@ -685,7 +685,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: 1.25.12
+          go-version: 1.26.5
           cache: false
       - name: Cache Go modules
         uses: actions/cache@v4
@@ -749,7 +749,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: 1.25.12
+          go-version: 1.26.5
           cache: false
       - name: Cache Go modules
         uses: actions/cache/restore@v4
@@ -857,7 +857,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: 1.25.12
+          go-version: 1.26.5
           cache: false
       - name: Cache Go modules
         uses: actions/cache/restore@v4
@@ -967,7 +967,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: 1.25.12
+          go-version: 1.26.5
           cache: false
       - name: Cache Go modules
         uses: actions/cache@v4
@@ -1076,7 +1076,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: 1.25.12
+          go-version: 1.26.5
           cache: false
       - name: Cache Go modules
         uses: actions/cache@v4
@@ -1232,7 +1232,7 @@ jobs:
         if: matrix.build
         uses: actions/setup-go@v5
         with:
-          go-version: 1.25.12
+          go-version: 1.26.5
           cache: false
       - name: Cache Go modules
         if: matrix.build
@@ -1246,8 +1246,8 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/Library/Caches/go-build
-          key: libbox-go-build-${{ matrix.artifact }}-1.25.12-${{ hashFiles('go.sum') }}
-          restore-keys: libbox-go-build-${{ matrix.artifact }}-1.25.12-
+          key: libbox-go-build-${{ matrix.artifact }}-1.26.5-${{ hashFiles('go.sum') }}
+          restore-keys: libbox-go-build-${{ matrix.artifact }}-1.26.5-
       - name: Set tag
         if: matrix.build
         run: git tag v${{ needs.calculate_version.outputs.version }} -f
@@ -1310,7 +1310,7 @@ jobs:
         if: matrix.if
         uses: actions/setup-go@v5
         with:
-          go-version: 1.25.12
+          go-version: 1.26.5
           cache: false
       - name: Cache Go modules
         if: matrix.if

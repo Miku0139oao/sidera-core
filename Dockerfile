@@ -1,4 +1,4 @@
-FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS builder
+FROM --platform=$BUILDPLATFORM golang:1.26.5-alpine AS builder
 LABEL maintainer="Miku0139oao"
 COPY . /go/src/github.com/Miku0139oao/sidera-core
 WORKDIR /go/src/github.com/Miku0139oao/sidera-core

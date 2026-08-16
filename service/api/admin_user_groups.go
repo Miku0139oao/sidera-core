@@ -5,7 +5,6 @@ import (
 	"maps"
 	"math"
 	"net/http"
-	"net/url"
 	"sort"
 	"strings"
 	"time"
@@ -287,6 +286,13 @@ func (a *adminAPI) mutateUserGroup(writer http.ResponseWriter, oldName string, i
 			account.MaxIPs = *input.MaxIPs
 		}
 		account.ResetDays = input.ResetDays
+		for tag, user := range current {
+			if _, retained := normalized[tag]; retained {
+				continue
+			}
+			account.BaseUploadBytes = saturatingAdminTrafficAdd(account.BaseUploadBytes, user.UploadBytes)
+			account.BaseDownloadBytes = saturatingAdminTrafficAdd(account.BaseDownloadBytes, user.DownloadBytes)
+		}
 	}
 	if !creating {
 		account.Revision = nextAdminRevision(account.Revision, now)
@@ -515,10 +521,19 @@ func (a *adminAPI) resetUserGroupTraffic(writer http.ResponseWriter, request *ht
 		tags = append(tags, tag)
 	}
 	sort.Strings(tags)
+	a.trafficAccess.Lock()
+	previousTrafficBaselines := maps.Clone(a.trafficBaselines)
+	for tag := range current {
+		a.baselineUserTrafficLocked(tag, name, false)
+	}
+	a.trafficAccess.Unlock()
 	if err := a.commitInboundBatch(tags, previous); err != nil {
 		a.storeAccess.Lock()
 		a.store.Accounts = previousAccounts
 		a.storeAccess.Unlock()
+		a.trafficAccess.Lock()
+		a.trafficBaselines = previousTrafficBaselines
+		a.trafficAccess.Unlock()
 		var restoreErr error
 		for _, tag := range tags {
 			restoreErr = errors.Join(restoreErr, a.applyInbound(tag, true))
@@ -526,17 +541,6 @@ func (a *adminAPI) resetUserGroupTraffic(writer http.ResponseWriter, request *ht
 		restoreErr = errors.Join(restoreErr, a.saveStore())
 		writeAdminError(writer, http.StatusInternalServerError, errors.Join(E.Cause(err, "儲存流量資料失敗"), restoreErr).Error())
 		return
-	}
-	a.trafficAccess.Lock()
-	for tag := range current {
-		a.baselineUserTrafficLocked(tag, name, false)
-	}
-	a.trafficAccess.Unlock()
-	for _, tag := range tags {
-		if err := a.applyInbound(tag, true); err != nil {
-			writeAdminError(writer, http.StatusInternalServerError, E.Cause(err, "更新核心用戶失敗").Error())
-			return
-		}
 	}
 	writer.WriteHeader(http.StatusNoContent)
 }
@@ -587,11 +591,7 @@ func (a *adminAPI) userGroupViewLocked(name string, active map[string]adminUsage
 		view.Account = &accountView
 	}
 	sort.Slice(view.Memberships, func(i, j int) bool { return view.Memberships[i].Inbound < view.Memberships[j].Inbound })
-	if externalID := a.store.ExternalSubscriptions[name]; validExternalSubscriptionID(externalID) && a.publicBaseURL != "" {
-		view.SubscriptionURL = a.publicBaseURL + "/sub/" + url.PathEscape(externalID)
-	} else if token := a.store.Subscriptions[name]; token != "" && a.publicBaseURL != "" && len(a.subscriptionLinksWithAccountsLocked(name, time.Now().UnixMilli(), active, accountUsage)) > 0 {
-		view.SubscriptionURL = a.publicBaseURL + a.subscriptionPathLocked() + token
-	}
+	view.SubscriptionURL = a.subscriptionURLWithAccountsLocked(name, active, accountUsage)
 	return view, true
 }
 

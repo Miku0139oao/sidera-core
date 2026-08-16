@@ -1085,10 +1085,21 @@ func (a *adminAPI) renewExpiredAccounts(now int64) error {
 	sort.Strings(tags)
 	a.storeAccess.Unlock()
 
+	a.trafficAccess.Lock()
+	previousTrafficBaselines := maps.Clone(a.trafficBaselines)
+	for tag, names := range baselines {
+		for _, name := range names {
+			a.baselineUserTrafficLocked(tag, name, false)
+		}
+	}
+	a.trafficAccess.Unlock()
 	if err := a.commitInboundBatch(tags, previous); err != nil {
 		a.storeAccess.Lock()
 		a.store.Accounts = previousAccounts
 		a.storeAccess.Unlock()
+		a.trafficAccess.Lock()
+		a.trafficBaselines = previousTrafficBaselines
+		a.trafficAccess.Unlock()
 		var restoreErr error
 		for _, tag := range tags {
 			restoreErr = errors.Join(restoreErr, a.applyInbound(tag, true))
@@ -1096,18 +1107,7 @@ func (a *adminAPI) renewExpiredAccounts(now int64) error {
 		restoreErr = errors.Join(restoreErr, a.saveStore())
 		return errors.Join(err, restoreErr)
 	}
-	a.trafficAccess.Lock()
-	for tag, names := range baselines {
-		for _, name := range names {
-			a.baselineUserTrafficLocked(tag, name, false)
-		}
-	}
-	a.trafficAccess.Unlock()
-	var applyErr error
-	for _, tag := range tags {
-		applyErr = errors.Join(applyErr, a.applyInbound(tag, true))
-	}
-	return applyErr
+	return nil
 }
 
 func (a *adminAPI) reconcile() error {
@@ -1928,11 +1928,7 @@ func (a *adminAPI) getUser(writer http.ResponseWriter, request *http.Request) {
 		for _, user := range record.Users {
 			if user.ID == id {
 				view := makeAdminUserView(user, record, active[adminUserKey(tag, user.Name)], true)
-				if externalID := a.store.ExternalSubscriptions[user.Name]; validExternalSubscriptionID(externalID) && a.publicBaseURL != "" {
-					view.SubscriptionURL = a.publicBaseURL + "/sub/" + url.PathEscape(externalID)
-				} else if token := a.store.Subscriptions[user.Name]; token != "" && a.publicBaseURL != "" && len(a.subscriptionLinksLocked(user.Name, time.Now().UnixMilli(), active)) > 0 {
-					view.SubscriptionURL = a.publicBaseURL + a.subscriptionPathLocked() + token
-				}
+				view.SubscriptionURL = a.subscriptionURLLocked(user.Name, active)
 				writeAdminJSON(writer, http.StatusOK, view)
 				return
 			}

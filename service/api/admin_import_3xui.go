@@ -729,7 +729,7 @@ func inspect3XUITableColumns(ctx context.Context, database *sql.DB, table string
 }
 
 func inspect3XUIInbounds(ctx context.Context, database *sql.DB, mapping map[int64]string, targetTypes map[string]string, report *admin3XUIImportReport) ([]admin3XUIImportInbound, map[int64]admin3XUIImportInbound, map[int64]bool, error) {
-	rows, err := database.QueryContext(ctx, "SELECT id, COALESCE(tag, ''), COALESCE(remark, ''), lower(COALESCE(protocol, '')), COALESCE(enable, 0), COALESCE(port, 0) FROM inbounds ORDER BY id")
+	rows, err := database.QueryContext(ctx, "SELECT id, COALESCE(tag, ''), COALESCE(remark, ''), lower(COALESCE(protocol, '')), COALESCE(settings, ''), COALESCE(stream_settings, ''), COALESCE(enable, 0), COALESCE(port, 0) FROM inbounds ORDER BY id")
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -739,10 +739,12 @@ func inspect3XUIInbounds(ctx context.Context, database *sql.DB, mapping map[int6
 	invalid := make(map[int64]bool)
 	for rows.Next() {
 		var inbound admin3XUIImportInbound
+		var settings, streamSettings string
 		var enabled int
-		if err = rows.Scan(&inbound.SourceID, &inbound.Tag, &inbound.Remark, &inbound.Protocol, &enabled, &inbound.Port); err != nil {
+		if err = rows.Scan(&inbound.SourceID, &inbound.Tag, &inbound.Remark, &inbound.Protocol, &settings, &streamSettings, &enabled, &inbound.Port); err != nil {
 			return nil, nil, nil, err
 		}
+		inbound.Protocol = normalize3XUIInboundProtocol(inbound.Protocol, settings, streamSettings)
 		inbound.Enabled = enabled != 0
 		if _, found := byID[inbound.SourceID]; found {
 			report.addIssue("error", "duplicate_inbound_id", "inbounds/"+strconv.FormatInt(inbound.SourceID, 10), "3x-ui inbound ID 重複")
@@ -768,6 +770,41 @@ func inspect3XUIInbounds(ctx context.Context, database *sql.DB, mapping map[int6
 	}
 	report.Source.Inbounds = len(inbounds)
 	return inbounds, byID, invalid, rows.Err()
+}
+
+func normalize3XUIInboundProtocol(protocol string, settings string, streamSettings string) string {
+	if protocol == C.TypeHysteria2 {
+		return protocol
+	}
+	if protocol != C.TypeHysteria {
+		return protocol
+	}
+	if hysteriaJSONVersion(settings) == 2 {
+		return C.TypeHysteria2
+	}
+	var stream struct {
+		Version          int `json:"version"`
+		HysteriaSettings struct {
+			Version int `json:"version"`
+		} `json:"hysteriaSettings"`
+	}
+	if json.Unmarshal([]byte(streamSettings), &stream) == nil && (stream.Version == 2 || stream.HysteriaSettings.Version == 2) {
+		return C.TypeHysteria2
+	}
+	return protocol
+}
+
+func hysteriaJSONVersion(raw string) int {
+	if raw == "" {
+		return 0
+	}
+	var options struct {
+		Version int `json:"version"`
+	}
+	if json.Unmarshal([]byte(raw), &options) != nil {
+		return 0
+	}
+	return options.Version
 }
 
 func inspect3XUIClients(ctx context.Context, database *sql.DB, existingAccountNames map[string]bool, existingSubscriptionIDs map[string]string, blocked map[int64]bool, report *admin3XUIImportReport) ([]admin3XUIImportAccount, map[int64]*admin3XUISourceClient, error) {
@@ -917,15 +954,11 @@ func inspect3XUIMemberships(ctx context.Context, database *sql.DB, mapping map[i
 			continue
 		}
 		targetTag := mapping[inboundID]
-		effectiveFlow := flow
-		if effectiveFlow == "" {
-			effectiveFlow = client.flow
-		}
 		client.report.Memberships = append(client.report.Memberships, admin3XUIImportAccountInbound{
 			SourceInboundID: inboundID,
 			SourceProtocol:  inbound.Protocol,
 			TargetTag:       targetTag,
-			Flow:            effectiveFlow,
+			Flow:            flow,
 			HasFlowOverride: flow != "",
 		})
 		if invalidInbounds[inboundID] {
@@ -948,7 +981,7 @@ func inspect3XUIMemberships(ctx context.Context, database *sql.DB, mapping map[i
 		if !has3XUICredential(client, inbound.Protocol) {
 			report.addIssue("error", "missing_credential", path, "來源 client 缺少該協定所需的憑證")
 			blocked[clientID] = true
-		} else if normalized, normalizeErr := normalizeAdminInput(make3XUIAdminUserInput(client, inbound.Protocol, targetTag, effectiveFlow), targetSchemas[targetTag]); normalizeErr != nil {
+		} else if normalized, normalizeErr := normalizeAdminInput(make3XUIAdminUserInput(client, inbound.Protocol, targetTag, flow), targetSchemas[targetTag]); normalizeErr != nil {
 			report.addIssue("error", "invalid_credential", path, "來源 client 憑證不符合目標 inbound 要求")
 			blocked[clientID] = true
 		} else {

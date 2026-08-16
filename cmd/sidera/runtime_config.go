@@ -398,6 +398,9 @@ func writeRuntimeConfigFile(path string, content []byte) error {
 		return statErr
 	}
 	if hasCurrent {
+		if err = secureStateFile(path); err != nil {
+			return err
+		}
 		if err = filemanager.Rename(globalCtx, path, backupPath); err != nil {
 			return err
 		}

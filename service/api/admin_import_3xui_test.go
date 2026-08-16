@@ -81,6 +81,47 @@ func Test3XUIImportDryRunReportsUnmappedInbound(t *testing.T) {
 	require.Contains(t, response.Body.String(), `"code":"unmapped_inbound"`)
 }
 
+func Test3XUIImportNormalizes3XUIHysteriaVersion2(t *testing.T) {
+	databasePath := create3XUIImportTestDatabase(t)
+	execute3XUIImportTestSQL(t, databasePath,
+		`UPDATE inbounds SET protocol = 'hysteria', settings = '{"version":2,"obfsPassword":"secret"}', stream_settings = '{"network":"hysteria","hysteriaSettings":{"version":2}}' WHERE id = 1`,
+		`UPDATE client_inbounds SET flow_override = '' WHERE client_id = 1 AND inbound_id = 1`,
+	)
+	a := newAdminTestAPI(t, &adminTestManagedService{tag: "target", type_: C.TypeHysteria2}, false)
+	a.router = a.buildRouter()
+
+	response := request3XUIImportDryRun(t, a, databasePath, `{"1":"target"}`)
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	var report admin3XUIImportReport
+	require.NoError(t, json.Unmarshal(response.Body.Bytes(), &report))
+	require.True(t, report.Ready, response.Body.String())
+	require.Equal(t, C.TypeHysteria2, report.Inbounds[0].Protocol)
+	require.Equal(t, C.TypeHysteria2, report.Accounts[0].Memberships[0].SourceProtocol)
+	require.Empty(t, report.Accounts[0].Memberships[0].Flow)
+	require.False(t, report.Accounts[0].Memberships[0].HasFlowOverride)
+}
+
+func TestNormalize3XUIInboundProtocolHysteria2Shapes(t *testing.T) {
+	tests := []struct {
+		name           string
+		protocol       string
+		settings       string
+		streamSettings string
+		want           string
+	}{
+		{name: "already hysteria2", protocol: C.TypeHysteria2, want: C.TypeHysteria2},
+		{name: "settings version 2", protocol: C.TypeHysteria, settings: `{"version":2}`, streamSettings: `{"network":"hysteria"}`, want: C.TypeHysteria2},
+		{name: "hysteriaSettings version 2", protocol: C.TypeHysteria, settings: `{"version":1}`, streamSettings: `{"network":"hysteria","hysteriaSettings":{"version":2}}`, want: C.TypeHysteria2},
+		{name: "hysteria v1", protocol: C.TypeHysteria, settings: `{"version":1}`, streamSettings: `{"network":"hysteria","hysteriaSettings":{"version":1}}`, want: C.TypeHysteria},
+		{name: "unrelated protocol", protocol: C.TypeVLESS, settings: `{"version":2}`, want: C.TypeVLESS},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			require.Equal(t, test.want, normalize3XUIInboundProtocol(test.protocol, test.settings, test.streamSettings))
+		})
+	}
+}
+
 func Test3XUIImportDryRunRejectsNonCanonicalMappingID(t *testing.T) {
 	databasePath := create3XUIImportTestDatabase(t)
 	a := newAdminTestAPI(t, &adminTestManagedService{tag: "target", type_: C.TypeVLESS}, false)
@@ -296,6 +337,31 @@ func Test3XUIImportApplyCreatesGlobalAccountTransaction(t *testing.T) {
 
 	duplicate := request3XUIImportApply(t, a, databasePath, `{"1":"target"}`, report.Fingerprint)
 	require.Equal(t, http.StatusConflict, duplicate.Code, duplicate.Body.String())
+}
+
+func Test3XUIImportApplyIgnoresClientFlowWhenOverrideEmpty(t *testing.T) {
+	databasePath := create3XUIImportTestDatabase(t)
+	execute3XUIImportTestSQL(t, databasePath,
+		`UPDATE client_inbounds SET flow_override = '' WHERE client_id = 1 AND inbound_id = 1`,
+	)
+	managed := &adminTestManagedService{tag: "target", type_: C.TypeVLESS}
+	a := newAdminTestAPI(t, managed, false)
+	require.NoError(t, a.synchronizeStore())
+	a.router = a.buildRouter()
+
+	dryRun := request3XUIImportDryRun(t, a, databasePath, `{"1":"target"}`)
+	require.Equal(t, http.StatusOK, dryRun.Code, dryRun.Body.String())
+	var report admin3XUIImportReport
+	require.NoError(t, json.Unmarshal(dryRun.Body.Bytes(), &report))
+	require.True(t, report.Ready, dryRun.Body.String())
+
+	response := request3XUIImportApply(t, a, databasePath, `{"1":"target"}`, report.Fingerprint)
+	require.Equal(t, http.StatusCreated, response.Code, response.Body.String())
+	require.Len(t, a.store.Inbounds["target"].Users, 1)
+	user := a.store.Inbounds["target"].Users[0]
+	require.Empty(t, user.Flow)
+	require.Len(t, managed.users, 1)
+	require.Empty(t, managed.users[0].Flow)
 }
 
 func Test3XUIImportApplyRequiresMatchingFingerprint(t *testing.T) {

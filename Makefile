@@ -1,7 +1,7 @@
 NAME = sidera
 COMMIT = $(shell git rev-parse --short HEAD)
 TAGS ?= $(shell cat release/DEFAULT_BUILD_TAGS_OTHERS)
-GOTOOLCHAIN ?= go1.25.12
+GOTOOLCHAIN ?= go1.26.5
 export GOTOOLCHAIN
 
 GOHOSTOS = $(shell go env GOHOSTOS)
