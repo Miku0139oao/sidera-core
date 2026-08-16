@@ -258,11 +258,6 @@ func (a *adminAPI) subscriptionRequestNameLocked(identifier string, external boo
 	return a.subscriptionNameLocked(identifier)
 }
 
-func (a *adminAPI) subscriptionLinksLocked(name string, now int64, active map[string]adminUsage) []string {
-	accountUsage := a.accountUsageLocked(active)
-	return a.subscriptionLinksWithAccountsLocked(name, now, active, accountUsage)
-}
-
 func (a *adminAPI) subscriptionLinksWithAccountsLocked(name string, now int64, active map[string]adminUsage, accountUsage map[string]adminUsage) []string {
 	links := make([]string, 0)
 	for tag, profile := range a.store.Servers {
