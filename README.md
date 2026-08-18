@@ -31,8 +31,22 @@ matrix.
 
 ## Build
 
+The supported release toolchain is Go 1.26.5. The repository includes a
+`.go-version` file, and Make targets set `GOTOOLCHAIN=go1.26.5` so local,
+container, and release builds use the same tested patch release. Compatibility
+with the private runtime symbols enabled by the `badlinkname` build tag is
+covered by the Go 1.26 CI build and race-test jobs. Go 1.24.7 remains the
+module compatibility floor, with Go 1.24 and 1.25 retained in the test matrix.
+
 ```sh
 go build ./cmd/sidera
+```
+
+The optional 3x-ui SQLite importer is excluded from the compact default binary.
+Build it explicitly when migration support is required:
+
+```sh
+go build -tags with_3xui_import ./cmd/sidera
 ```
 
 The release build profiles and optional feature tags are listed in `release/`.

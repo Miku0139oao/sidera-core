@@ -3,6 +3,8 @@ package api
 import (
 	"context"
 	stdjson "encoding/json"
+	"math"
+	"net/http"
 	"net/http/httptest"
 	"net/netip"
 	"os"
@@ -12,6 +14,7 @@ import (
 
 	"github.com/Miku0139oao/sidera-core/adapter"
 	C "github.com/Miku0139oao/sidera-core/constant"
+	"github.com/Miku0139oao/sidera-core/log"
 	"github.com/Miku0139oao/sidera-core/option"
 	"github.com/sagernet/sing/common/json/badoption"
 
@@ -127,6 +130,29 @@ func TestPendingTrafficFlushesInsideMutationBoundary(t *testing.T) {
 	require.EqualValues(t, 30, user.UpdatedAt)
 }
 
+func TestPendingTrafficBatchAggregatesStableIdentities(t *testing.T) {
+	managed := &adminTestManagedService{tag: "owned", type_: C.TypeSOCKS}
+	a := newAdminTestAPI(t, managed, true)
+	a.store.Inbounds[managed.tag] = &adminInboundStore{
+		Type: C.TypeSOCKS,
+		Users: []*adminUser{
+			{ID: "alice-id", Name: "alice", Enabled: true, TrafficGeneration: 2},
+			{ID: "bob-id", Name: "bob", Enabled: true, TrafficGeneration: 1},
+		},
+	}
+	a.applyTrafficEventsLocked([]adminTrafficEvent{
+		{Inbound: managed.tag, UserID: "alice-id", Generation: 2, Upload: 10, UpdatedAt: 20},
+		{Inbound: managed.tag, UserID: "alice-id", Generation: 2, Download: 30, UpdatedAt: 40},
+		{Inbound: managed.tag, UserID: "alice-id", Generation: 1, Upload: 100, UpdatedAt: 50},
+		{Inbound: managed.tag, User: "bob", Generation: 1, Upload: 5, Download: 7, UpdatedAt: 30},
+	})
+	require.EqualValues(t, 10, a.store.Inbounds[managed.tag].Users[0].UploadBytes)
+	require.EqualValues(t, 30, a.store.Inbounds[managed.tag].Users[0].DownloadBytes)
+	require.EqualValues(t, 40, a.store.Inbounds[managed.tag].Users[0].UpdatedAt)
+	require.EqualValues(t, 5, a.store.Inbounds[managed.tag].Users[1].UploadBytes)
+	require.EqualValues(t, 7, a.store.Inbounds[managed.tag].Users[1].DownloadBytes)
+}
+
 func TestTrafficEventsUseStableIdentityAndResetGeneration(t *testing.T) {
 	managed := &adminTestManagedService{tag: "owned", type_: C.TypeSOCKS}
 	a := newAdminTestAPI(t, managed, true)
@@ -158,6 +184,84 @@ func TestAdminUserConnectionLimitKeepsEarliestSources(t *testing.T) {
 	require.Equal(t, 1, user.MaxIPs)
 }
 
+func TestGlobalAccountPolicyAggregatesTrafficAndIPsOnce(t *testing.T) {
+	now := time.Now().UnixMilli()
+	a := &adminAPI{store: adminStore{
+		Accounts: map[string]*adminAccount{
+			"account": {
+				ID: "account", Name: "Alice", PolicyScope: adminAccountPolicyGlobal, Enabled: true,
+				QuotaBytes: 200, MaxIPs: 1, BaseUploadBytes: 10, BaseDownloadBytes: 20,
+			},
+		},
+		Inbounds: map[string]*adminInboundStore{
+			"first":  {Authoritative: true, Users: []*adminUser{{ID: "one", AccountID: "account", Inbound: "first", Name: "Alice", Enabled: true, UploadBytes: 30, DownloadBytes: 40}}},
+			"second": {Authoritative: true, Users: []*adminUser{{ID: "two", AccountID: "account", Inbound: "second", Name: "Alice", Enabled: true, UploadBytes: 5, DownloadBytes: 6}}},
+		},
+	}}
+	active := map[string]adminUsage{
+		adminUserKey("first", "Alice"):  {Upload: 7, Download: 8, Connections: 1, SourceSince: map[string]int64{"203.0.113.1": 1}},
+		adminUserKey("second", "Alice"): {Upload: 9, Download: 10, Connections: 2, SourceSince: map[string]int64{"203.0.113.1": 2, "203.0.113.2": 3}},
+	}
+	a.storeAccess.RLock()
+	usage := a.accountUsageLocked(active)["account"]
+	require.EqualValues(t, 61, usage.Upload)
+	require.EqualValues(t, 84, usage.Download)
+	require.Equal(t, 3, usage.Connections)
+	require.Equal(t, map[string]int64{"203.0.113.1": 1, "203.0.113.2": 3}, usage.SourceSince)
+	require.True(t, a.userConnectionAllowedWithAccountsLocked("first", "Alice", "one", "203.0.113.1", now, active, map[string]adminUsage{"account": usage}))
+	require.False(t, a.userConnectionAllowedWithAccountsLocked("second", "Alice", "two", "203.0.113.2", now, active, map[string]adminUsage{"account": usage}))
+	upload, download, total, expire := a.subscriptionUsageLocked("Alice", active)
+	a.storeAccess.RUnlock()
+	require.EqualValues(t, 61, upload)
+	require.EqualValues(t, 84, download)
+	require.EqualValues(t, 200, total)
+	require.Zero(t, expire)
+
+	a.store.Accounts["account"].QuotaBytes = 145
+	a.storeAccess.RLock()
+	usage = a.accountUsageLocked(active)["account"]
+	require.False(t, adminUserEnabledWithAccount(a.store.Inbounds["first"].Users[0], a.store.Accounts["account"], now, active[adminUserKey("first", "Alice")], usage))
+	a.storeAccess.RUnlock()
+	require.False(t, adminUserEnabledWithAccount(
+		&adminUser{Enabled: true},
+		&adminAccount{PolicyScope: adminAccountPolicyGlobal, Enabled: true, QuotaBytes: math.MaxInt64},
+		now,
+		adminUsage{},
+		adminUsage{Upload: math.MaxInt64, Download: 1},
+	))
+}
+
+func TestMembershipAccountUsageAggregatesWithoutAccountRescan(t *testing.T) {
+	a := &adminAPI{store: adminStore{
+		Accounts: map[string]*adminAccount{
+			"account": {ID: "account", Name: "Alice", PolicyScope: adminAccountPolicyMembership},
+		},
+		Inbounds: map[string]*adminInboundStore{
+			"one": {Users: []*adminUser{{AccountID: "account", Name: "Alice", UploadBytes: 10}}},
+			"two": {Users: []*adminUser{{AccountID: "account", Name: "Alice", DownloadBytes: 20}}},
+		},
+	}}
+	usage := a.allAccountUsageLocked(map[string]adminUsage{
+		adminUserKey("one", "Alice"): {Upload: 1, Connections: 1, SourceSince: map[string]int64{"192.0.2.1": 20}},
+		adminUserKey("two", "Alice"): {Download: 2, Connections: 1, SourceSince: map[string]int64{"192.0.2.1": 10, "192.0.2.2": 30}},
+	})["account"]
+	require.EqualValues(t, 11, usage.Upload)
+	require.EqualValues(t, 22, usage.Download)
+	require.Equal(t, 2, usage.Connections)
+	require.EqualValues(t, 10, usage.SourceSince["192.0.2.1"])
+	require.EqualValues(t, 30, usage.SourceSince["192.0.2.2"])
+}
+
+func TestMembershipQuotaAccountingSaturates(t *testing.T) {
+	user := &adminUser{
+		Enabled:       true,
+		QuotaBytes:    math.MaxInt64,
+		UploadBytes:   math.MaxInt64 - 1,
+		DownloadBytes: 1,
+	}
+	require.False(t, adminUserEnabled(user, time.Now().UnixMilli(), adminUsage{Upload: 1}))
+}
+
 func TestMutateInboundFailureDoesNotChangeOwnership(t *testing.T) {
 	managed := &adminTestManagedService{tag: "base", type_: C.TypeSOCKS}
 	a := newAdminTestAPI(t, managed, false)
@@ -184,9 +288,42 @@ func TestDeleteUserWithoutTrafficManager(t *testing.T) {
 			Name: "alice", Password: "password", Enabled: true,
 		}},
 	}
+	a.store.ExternalSubscriptions["alice"] = "legacy_Sub-ID"
 	a.router = a.buildRouter()
 	response := adminRequest(a, "DELETE", adminRoutePrefix+"/users/alice-id?revision=1", nil)
 	require.Equal(t, 204, response.Code, response.Body.String())
+	require.NotContains(t, a.store.ExternalSubscriptions, "alice")
+}
+
+func TestDeleteUserSaveFailureRestoresAccountAndExternalSubscription(t *testing.T) {
+	managed := &adminTestManagedService{
+		tag: "owned", type_: C.TypeSOCKS,
+		users: []adapter.ManagedUser{{Name: "alice", Password: "password"}},
+	}
+	a := newAdminTestAPI(t, managed, false)
+	invalidParent := filepath.Join(t.TempDir(), "not-a-directory")
+	require.NoError(t, os.WriteFile(invalidParent, []byte("x"), 0o600))
+	a.dataPath = filepath.Join(invalidParent, "dashboard.json")
+	a.store.Accounts = map[string]*adminAccount{
+		"account": {ID: "account", Name: "alice", PolicyScope: adminAccountPolicyGlobal, Enabled: true, Revision: 1, CreatedAt: 1, UpdatedAt: 1},
+	}
+	a.store.Inbounds[managed.tag] = &adminInboundStore{
+		Type: C.TypeSOCKS, Authoritative: true, Revision: 1, AppliedRevision: 1,
+		Users: []*adminUser{{
+			ID: "alice-id", AccountID: "account", Inbound: managed.tag, Type: C.TypeSOCKS,
+			Name: "alice", Password: "password", Enabled: true,
+		}},
+	}
+	a.store.ExternalSubscriptions["alice"] = "legacy_Sub-ID"
+	a.router = a.buildRouter()
+
+	response := adminRequest(a, "DELETE", adminRoutePrefix+"/users/alice-id?revision=1", nil)
+	require.Equal(t, http.StatusInternalServerError, response.Code, response.Body.String())
+	require.Len(t, a.store.Inbounds[managed.tag].Users, 1)
+	require.Contains(t, a.store.Accounts, "account")
+	require.Equal(t, "legacy_Sub-ID", a.store.ExternalSubscriptions["alice"])
+	require.Len(t, managed.users, 1)
+	require.Equal(t, "alice", managed.users[0].Name)
 }
 
 func TestUpdateUserPreservesOmittedIPLimit(t *testing.T) {
@@ -222,6 +359,43 @@ func TestUpdateUserPreservesOmittedIPLimit(t *testing.T) {
 	require.Equal(t, 2, a.store.Inbounds[managed.tag].Users[0].MaxIPs)
 }
 
+func TestLegacyUserRenameReappliesRuntimeAfterAccountSplit(t *testing.T) {
+	first := &adminTestManagedService{tag: "first", type_: C.TypeSOCKS}
+	second := &adminTestManagedService{tag: "second", type_: C.TypeSOCKS}
+	a := newAdminTestAPI(t, first, false)
+	a.inbounds = append(a.inbounds, adminInboundRuntime{
+		Tag: second.Tag(), Type: second.Type(), Kind: adminServerKindInbound,
+		Manager: &adminManagedRuntime{service: second},
+	})
+	for index := range a.inbounds {
+		a.runtimes[a.inbounds[index].Tag] = &a.inbounds[index]
+	}
+	a.store.Accounts = map[string]*adminAccount{
+		"global": {ID: "global", Name: "alice", PolicyScope: adminAccountPolicyGlobal, Enabled: false, Revision: 1, CreatedAt: 1, UpdatedAt: 1},
+	}
+	a.store.Inbounds[first.Tag()] = &adminInboundStore{
+		Type: first.Type(), Authoritative: true, Revision: 1, AppliedRevision: 1,
+		Users: []*adminUser{{ID: "first-id", AccountID: "global", Inbound: first.Tag(), Type: first.Type(), Name: "alice", Password: "first-password", Enabled: true}},
+	}
+	a.store.Inbounds[second.Tag()] = &adminInboundStore{
+		Type: second.Type(), Authoritative: true, Revision: 1, AppliedRevision: 1,
+		Users: []*adminUser{{ID: "second-id", AccountID: "global", Inbound: second.Tag(), Type: second.Type(), Name: "alice", Password: "second-password", Enabled: true}},
+	}
+	a.router = a.buildRouter()
+	body, err := stdjson.Marshal(map[string]any{
+		"inbound": first.Tag(), "name": "renamed", "password": "first-password", "enabled": true, "revision": 1,
+	})
+	require.NoError(t, err)
+
+	response := adminRequest(a, "PUT", adminRoutePrefix+"/users/first-id", body)
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	require.Len(t, first.users, 1)
+	require.Equal(t, "renamed", first.users[0].Name)
+	renamed := a.store.Inbounds[first.Tag()].Users[0]
+	require.NotEqual(t, "global", renamed.AccountID)
+	require.Equal(t, adminAccountPolicyMembership, a.store.Accounts[renamed.AccountID].PolicyScope)
+}
+
 func TestUserGroupMutationsAreRevisionSafeAcrossInbounds(t *testing.T) {
 	first := &adminTestManagedService{tag: "first", type_: C.TypeSOCKS}
 	second := &adminTestManagedService{tag: "second", type_: C.TypeSOCKS}
@@ -238,7 +412,8 @@ func TestUserGroupMutationsAreRevisionSafeAcrossInbounds(t *testing.T) {
 	a.router = a.buildRouter()
 
 	createBody, err := stdjson.Marshal(map[string]any{
-		"name": "alice",
+		"name": "alice", "policy_scope": adminAccountPolicyGlobal, "enabled": true,
+		"quota_bytes": 4096, "expires_at": int64(4102444800000), "max_ips": 2, "reset_days": 30,
 		"memberships": []map[string]any{
 			{"inbound": first.Tag(), "password": "first-password", "enabled": true, "max_ips": 1},
 			{"inbound": second.Tag(), "password": "second-password", "enabled": true, "quota_bytes": 1024},
@@ -252,9 +427,15 @@ func TestUserGroupMutationsAreRevisionSafeAcrossInbounds(t *testing.T) {
 	require.Len(t, a.store.Inbounds[second.Tag()].Users, 1)
 	require.Equal(t, "first-password", first.users[0].Password)
 	require.Equal(t, "second-password", second.users[0].Password)
+	accountID := a.store.Inbounds[first.Tag()].Users[0].AccountID
+	require.NotEmpty(t, accountID)
+	require.Equal(t, accountID, a.store.Inbounds[second.Tag()].Users[0].AccountID)
+	require.EqualValues(t, 4096, a.store.Accounts[accountID].QuotaBytes)
+	require.Zero(t, a.store.Inbounds[second.Tag()].Users[0].QuotaBytes)
 
 	rollbackBody, err := stdjson.Marshal(map[string]any{
-		"name": "alice",
+		"name": "alice", "policy_scope": adminAccountPolicyGlobal, "account_revision": a.store.Accounts[accountID].Revision,
+		"enabled": true, "quota_bytes": 8192, "expires_at": int64(4102444800000), "max_ips": 2, "reset_days": 30,
 		"memberships": []map[string]any{
 			{"id": a.store.Inbounds[first.Tag()].Users[0].ID, "inbound": first.Tag(), "password": "changed-first", "enabled": true},
 			{"id": a.store.Inbounds[second.Tag()].Users[0].ID, "inbound": second.Tag(), "password": "changed-second", "enabled": true},
@@ -273,9 +454,32 @@ func TestUserGroupMutationsAreRevisionSafeAcrossInbounds(t *testing.T) {
 	require.Equal(t, "second-password", a.store.Inbounds[second.Tag()].Users[0].Password)
 	require.Equal(t, "first-password", first.users[0].Password)
 	require.Equal(t, "second-password", second.users[0].Password)
+	require.EqualValues(t, 4096, a.store.Accounts[accountID].QuotaBytes)
+
+	accountRevision := a.store.Accounts[accountID].Revision
+	invalidIdentityBody, err := stdjson.Marshal(map[string]any{
+		"name": "alice", "policy_scope": adminAccountPolicyGlobal, "account_revision": accountRevision,
+		"enabled": true, "quota_bytes": 8192, "expires_at": int64(4102444800000), "max_ips": 2, "reset_days": 30,
+		"memberships": []map[string]any{
+			{"id": "stale-membership-id", "inbound": first.Tag(), "password": "changed-first", "enabled": true},
+			{"id": a.store.Inbounds[second.Tag()].Users[0].ID, "inbound": second.Tag(), "password": "changed-second", "enabled": true},
+		},
+		"revisions": map[string]int64{
+			first.Tag():  a.store.Inbounds[first.Tag()].Revision,
+			second.Tag(): a.store.Inbounds[second.Tag()].Revision,
+		},
+	})
+	require.NoError(t, err)
+	response = adminRequest(a, "PUT", adminRoutePrefix+"/user-groups/alice", invalidIdentityBody)
+	require.Equal(t, http.StatusConflict, response.Code, response.Body.String())
+	require.EqualValues(t, 4096, a.store.Accounts[accountID].QuotaBytes)
+	require.Equal(t, accountRevision, a.store.Accounts[accountID].Revision)
+	require.Equal(t, "first-password", a.store.Inbounds[first.Tag()].Users[0].Password)
+	require.Equal(t, "second-password", a.store.Inbounds[second.Tag()].Users[0].Password)
 
 	staleBody, err := stdjson.Marshal(map[string]any{
-		"name": "renamed/user",
+		"name": "renamed/user", "policy_scope": adminAccountPolicyGlobal, "account_revision": a.store.Accounts[accountID].Revision,
+		"enabled": true, "quota_bytes": 4096, "expires_at": int64(4102444800000), "max_ips": 2, "reset_days": 30,
 		"memberships": []map[string]any{
 			{"id": a.store.Inbounds[first.Tag()].Users[0].ID, "inbound": first.Tag(), "password": "changed", "enabled": true},
 		},
@@ -295,7 +499,8 @@ func TestUserGroupMutationsAreRevisionSafeAcrossInbounds(t *testing.T) {
 	subscriptionToken := a.store.Subscriptions["alice"]
 	require.NotEmpty(t, subscriptionToken)
 	renameBody, err := stdjson.Marshal(map[string]any{
-		"name": "renamed/user",
+		"name": "renamed/user", "policy_scope": adminAccountPolicyGlobal, "account_revision": a.store.Accounts[accountID].Revision,
+		"enabled": true, "quota_bytes": 4096, "expires_at": int64(4102444800000), "max_ips": 2, "reset_days": 30,
 		"memberships": []map[string]any{
 			{"id": a.store.Inbounds[first.Tag()].Users[0].ID, "inbound": first.Tag(), "password": "first-password", "enabled": true},
 			{"id": a.store.Inbounds[second.Tag()].Users[0].ID, "inbound": second.Tag(), "password": "second-password", "enabled": true},
@@ -319,12 +524,124 @@ func TestUserGroupMutationsAreRevisionSafeAcrossInbounds(t *testing.T) {
 		first.Tag():  a.store.Inbounds[first.Tag()].Revision,
 		second.Tag(): a.store.Inbounds[second.Tag()].Revision,
 	}
-	deleteBody, err := stdjson.Marshal(map[string]any{"revisions": revisions})
+	deleteBody, err := stdjson.Marshal(map[string]any{"account_revision": a.store.Accounts[accountID].Revision, "revisions": revisions})
 	require.NoError(t, err)
 	response = adminRequest(a, "DELETE", adminRoutePrefix+"/user-groups?name=renamed%2Fuser", deleteBody)
 	require.Equal(t, 204, response.Code, response.Body.String())
 	require.Empty(t, a.store.Inbounds[first.Tag()].Users)
 	require.Empty(t, a.store.Inbounds[second.Tag()].Users)
+	require.NotContains(t, a.store.Accounts, accountID)
+}
+
+func TestGlobalAccountRetainsTrafficFromRemovedMembership(t *testing.T) {
+	first := &adminTestManagedService{tag: "first", type_: C.TypeSOCKS}
+	second := &adminTestManagedService{tag: "second", type_: C.TypeSOCKS}
+	a := newAdminTestAPI(t, first, false)
+	a.inbounds = append(a.inbounds, adminInboundRuntime{Tag: second.Tag(), Type: second.Type(), Kind: adminServerKindInbound, Manager: &adminManagedRuntime{service: second}})
+	for index := range a.inbounds {
+		a.runtimes[a.inbounds[index].Tag] = &a.inbounds[index]
+	}
+	a.store.Accounts = map[string]*adminAccount{
+		"account": {
+			ID: "account", Name: "Alice", PolicyScope: adminAccountPolicyGlobal, Enabled: true,
+			QuotaBytes: 1000, BaseUploadBytes: 100, BaseDownloadBytes: 200,
+			Revision: 1, CreatedAt: 1, UpdatedAt: 1,
+		},
+	}
+	a.store.Inbounds[first.Tag()] = &adminInboundStore{
+		Type: first.Type(), Authoritative: true, Revision: 1,
+		Users: []*adminUser{{ID: "one", AccountID: "account", Inbound: first.Tag(), Type: first.Type(), Name: "Alice", Password: "first", Enabled: true, UploadBytes: 10, DownloadBytes: 20}},
+	}
+	a.store.Inbounds[second.Tag()] = &adminInboundStore{
+		Type: second.Type(), Authoritative: true, Revision: 1,
+		Users: []*adminUser{{ID: "two", AccountID: "account", Inbound: second.Tag(), Type: second.Type(), Name: "Alice", Password: "second", Enabled: true, UploadBytes: 30, DownloadBytes: 40}},
+	}
+	a.router = a.buildRouter()
+	body, err := stdjson.Marshal(map[string]any{
+		"name": "Alice", "policy_scope": adminAccountPolicyGlobal, "account_revision": int64(1),
+		"enabled": true, "quota_bytes": int64(1000), "expires_at": int64(0), "max_ips": 0, "reset_days": 0,
+		"memberships": []map[string]any{
+			{"id": "one", "inbound": first.Tag(), "password": "first", "enabled": true},
+		},
+		"revisions": map[string]int64{first.Tag(): 1, second.Tag(): 1},
+	})
+	require.NoError(t, err)
+
+	response := adminRequest(a, http.MethodPut, adminRoutePrefix+"/user-groups/Alice", body)
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	require.Len(t, a.store.Inbounds[first.Tag()].Users, 1)
+	require.Empty(t, a.store.Inbounds[second.Tag()].Users)
+	account := a.store.Accounts["account"]
+	require.EqualValues(t, 130, account.BaseUploadBytes)
+	require.EqualValues(t, 240, account.BaseDownloadBytes)
+	usage := a.accountUsageLocked(nil)["account"]
+	require.EqualValues(t, 140, usage.Upload)
+	require.EqualValues(t, 260, usage.Download)
+}
+
+func TestGlobalAccountManualResetClearsImportedAndMembershipTraffic(t *testing.T) {
+	first := &adminTestManagedService{tag: "first", type_: C.TypeSOCKS}
+	second := &adminTestManagedService{tag: "second", type_: C.TypeSOCKS}
+	a := newAdminTestAPI(t, first, false)
+	a.inbounds = append(a.inbounds, adminInboundRuntime{Tag: second.Tag(), Type: second.Type(), Kind: adminServerKindInbound, Manager: &adminManagedRuntime{service: second}})
+	for index := range a.inbounds {
+		a.runtimes[a.inbounds[index].Tag] = &a.inbounds[index]
+	}
+	a.store.Accounts = map[string]*adminAccount{
+		"account": {ID: "account", Name: "Alice", PolicyScope: adminAccountPolicyGlobal, Enabled: true, BaseUploadBytes: 100, BaseDownloadBytes: 200, Revision: 1, CreatedAt: 1, UpdatedAt: 1},
+	}
+	a.store.Inbounds[first.Tag()] = &adminInboundStore{Type: first.Type(), Authoritative: true, Revision: 1, Users: []*adminUser{{ID: "one", AccountID: "account", Inbound: first.Tag(), Type: first.Type(), Name: "Alice", Password: "first", Enabled: true, UploadBytes: 10, DownloadBytes: 20}}}
+	a.store.Inbounds[second.Tag()] = &adminInboundStore{Type: second.Type(), Authoritative: true, Revision: 1, Users: []*adminUser{{ID: "two", AccountID: "account", Inbound: second.Tag(), Type: second.Type(), Name: "Alice", Password: "second", Enabled: true, UploadBytes: 30, DownloadBytes: 40}}}
+	a.router = a.buildRouter()
+
+	response := adminRequest(a, http.MethodPost, adminRoutePrefix+"/user-groups/reset-traffic?name=Alice", nil)
+	require.Equal(t, http.StatusNoContent, response.Code, response.Body.String())
+	require.Zero(t, a.store.Accounts["account"].BaseUploadBytes)
+	require.Zero(t, a.store.Accounts["account"].BaseDownloadBytes)
+	for _, tag := range []string{first.Tag(), second.Tag()} {
+		user := a.store.Inbounds[tag].Users[0]
+		require.Zero(t, user.UploadBytes)
+		require.Zero(t, user.DownloadBytes)
+		require.EqualValues(t, 1, user.TrafficGeneration)
+	}
+	require.Equal(t, 1, first.updateCalls)
+	require.Equal(t, 1, second.updateCalls)
+}
+
+func TestExpiredGlobalAccountRenewsAcrossMemberships(t *testing.T) {
+	now := time.Now().UnixMilli()
+	first := &adminTestManagedService{tag: "first", type_: C.TypeSOCKS}
+	second := &adminTestManagedService{tag: "second", type_: C.TypeSOCKS}
+	a := newAdminTestAPI(t, first, false)
+	a.inbounds = append(a.inbounds, adminInboundRuntime{Tag: second.Tag(), Type: second.Type(), Kind: adminServerKindInbound, Manager: &adminManagedRuntime{service: second}})
+	for index := range a.inbounds {
+		a.runtimes[a.inbounds[index].Tag] = &a.inbounds[index]
+	}
+	a.store.Accounts = map[string]*adminAccount{
+		"account": {ID: "account", Name: "Alice", PolicyScope: adminAccountPolicyGlobal, Enabled: false, QuotaBytes: 1000, ExpiresAt: now - 31*adminDayMilliseconds, ResetDays: 30, BaseUploadBytes: 100, BaseDownloadBytes: 200, Revision: 1, CreatedAt: 1, UpdatedAt: 1},
+	}
+	a.store.Inbounds[first.Tag()] = &adminInboundStore{Type: first.Type(), Authoritative: true, Revision: 1, Users: []*adminUser{{ID: "one", AccountID: "account", Inbound: first.Tag(), Type: first.Type(), Name: "Alice", Password: "first", Enabled: true, UploadBytes: 10, DownloadBytes: 20}}}
+	a.store.Inbounds[second.Tag()] = &adminInboundStore{Type: second.Type(), Authoritative: true, Revision: 1, Users: []*adminUser{{ID: "two", AccountID: "account", Inbound: second.Tag(), Type: second.Type(), Name: "Alice", Password: "second", Enabled: true, UploadBytes: 30, DownloadBytes: 40}}}
+
+	require.NoError(t, a.renewExpiredAccounts(now))
+	account := a.store.Accounts["account"]
+	require.True(t, account.Enabled)
+	require.Greater(t, account.ExpiresAt, now)
+	require.LessOrEqual(t, account.ExpiresAt, now+30*adminDayMilliseconds)
+	require.Zero(t, account.BaseUploadBytes)
+	require.Zero(t, account.BaseDownloadBytes)
+	require.Greater(t, account.Revision, int64(1))
+	for _, tag := range []string{first.Tag(), second.Tag()} {
+		user := a.store.Inbounds[tag].Users[0]
+		require.Zero(t, user.UploadBytes)
+		require.Zero(t, user.DownloadBytes)
+		require.EqualValues(t, 1, user.TrafficGeneration)
+		require.Greater(t, a.store.Inbounds[tag].Revision, int64(1))
+	}
+	require.Len(t, first.users, 1)
+	require.Len(t, second.users, 1)
+	require.Equal(t, 1, first.updateCalls)
+	require.Equal(t, 1, second.updateCalls)
 }
 
 func TestAdminCollectionResponsesRedactCredentials(t *testing.T) {
@@ -465,11 +782,103 @@ func TestServerProfilesApplyOnlyMatchingRuntimeRevision(t *testing.T) {
 		Kind: adminServerKindInbound, Type: C.TypeSOCKS, Revision: 2, AppliedRevision: 1,
 	}
 	a.serverRevisions = map[string]int64{managed.tag: 1}
-	require.NoError(t, a.markServerProfilesApplied())
+	_, err := a.markServerProfilesApplied()
+	require.NoError(t, err)
 	require.EqualValues(t, 1, a.store.Servers[managed.tag].AppliedRevision)
 	a.serverRevisions[managed.tag] = 2
-	require.NoError(t, a.markServerProfilesApplied())
+	_, err = a.markServerProfilesApplied()
+	require.NoError(t, err)
 	require.EqualValues(t, 2, a.store.Servers[managed.tag].AppliedRevision)
+}
+
+func TestServerProfileCommitRestoresMemoryWhenSaveFails(t *testing.T) {
+	directory := t.TempDir()
+	blockedParent := filepath.Join(directory, "not-a-directory")
+	require.NoError(t, os.WriteFile(blockedParent, []byte("blocked"), 0o600))
+	managed := &adminTestManagedService{tag: "owned", type_: C.TypeSOCKS}
+	a := newAdminTestAPI(t, managed, true)
+	a.dataPath = filepath.Join(blockedParent, "dashboard.json")
+	a.store.Servers[managed.tag] = &adminServerStore{
+		Kind: adminServerKindInbound, Type: C.TypeSOCKS, Revision: 2, AppliedRevision: 1,
+	}
+	a.serverRevisions = map[string]int64{managed.tag: 2}
+
+	rollback, err := a.markServerProfilesApplied()
+	require.Error(t, err)
+	require.Nil(t, rollback)
+	require.EqualValues(t, 1, a.store.Servers[managed.tag].AppliedRevision)
+
+	a.dataPath = filepath.Join(directory, "dashboard.json")
+	require.NoError(t, a.saveStore())
+	content, err := os.ReadFile(a.dataPath)
+	require.NoError(t, err)
+	var stored adminStore
+	require.NoError(t, stdjson.Unmarshal(content, &stored))
+	require.EqualValues(t, 1, stored.Servers[managed.tag].AppliedRevision)
+}
+
+func TestDashboardStoreRecoversFromValidBackup(t *testing.T) {
+	dataPath := filepath.Join(t.TempDir(), "dashboard.json")
+	validStore := adminStore{
+		Version:               adminStoreVersion,
+		Accounts:              make(map[string]*adminAccount),
+		Inbounds:              make(map[string]*adminInboundStore),
+		Servers:               map[string]*adminServerStore{"recovered": {Kind: adminServerKindInbound, Type: C.TypeSOCKS}},
+		Subscriptions:         make(map[string]string),
+		ExternalSubscriptions: make(map[string]string),
+	}
+	content, err := stdjson.Marshal(validStore)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(dataPath, []byte("{corrupt"), 0o600))
+	require.NoError(t, os.WriteFile(dataPath+".bak", content, 0o600))
+
+	a := &adminAPI{
+		ctx: context.Background(), logger: log.NewNOPFactory().Logger(), dataPath: dataPath,
+		store: adminStore{
+			Version: adminStoreVersion, Accounts: make(map[string]*adminAccount),
+			Inbounds: make(map[string]*adminInboundStore), Servers: make(map[string]*adminServerStore),
+			Subscriptions: make(map[string]string), ExternalSubscriptions: make(map[string]string),
+		},
+	}
+	require.NoError(t, a.loadStore())
+	require.Contains(t, a.store.Servers, "recovered")
+}
+
+func TestDashboardStoreKeepsPreviousGenerationAsBackup(t *testing.T) {
+	dataPath := filepath.Join(t.TempDir(), "dashboard.json")
+	a := &adminAPI{
+		ctx: context.Background(), logger: log.NewNOPFactory().Logger(), dataPath: dataPath,
+		store: adminStore{
+			Version: adminStoreVersion, Accounts: make(map[string]*adminAccount),
+			Inbounds: make(map[string]*adminInboundStore), Servers: make(map[string]*adminServerStore),
+			Subscriptions: make(map[string]string), ExternalSubscriptions: make(map[string]string),
+		},
+	}
+	require.NoError(t, a.saveStore())
+	a.store.Servers["current"] = &adminServerStore{Kind: adminServerKindInbound, Type: C.TypeSOCKS}
+	require.NoError(t, a.saveStore())
+
+	backup, err := os.ReadFile(dataPath + ".bak")
+	require.NoError(t, err)
+	var previous adminStore
+	require.NoError(t, stdjson.Unmarshal(backup, &previous))
+	require.NotContains(t, previous.Servers, "current")
+}
+
+func TestServerProfileCommitCanBeRolledBackAfterSave(t *testing.T) {
+	managed := &adminTestManagedService{tag: "owned", type_: C.TypeSOCKS}
+	a := newAdminTestAPI(t, managed, true)
+	a.store.Servers[managed.tag] = &adminServerStore{
+		Kind: adminServerKindInbound, Type: C.TypeSOCKS, Revision: 2, AppliedRevision: 1,
+	}
+	a.serverRevisions = map[string]int64{managed.tag: 2}
+
+	rollback, err := a.markServerProfilesApplied()
+	require.NoError(t, err)
+	require.NotNil(t, rollback)
+	require.EqualValues(t, 2, a.store.Servers[managed.tag].AppliedRevision)
+	require.NoError(t, rollback())
+	require.EqualValues(t, 1, a.store.Servers[managed.tag].AppliedRevision)
 }
 
 func TestPendingServerCanBeUpdatedBeforeFirstReload(t *testing.T) {

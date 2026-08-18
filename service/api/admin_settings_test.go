@@ -30,7 +30,7 @@ func TestAdminSettingsConfigurePublicRoutes(t *testing.T) {
 				"hy2": subscriptionTestProfile(C.TypeHysteria2, `{}`, "hy2.example.com", 443),
 			},
 			Subscriptions:         map[string]string{"Alice": "native-token"},
-			ExternalSubscriptions: make(map[string]string),
+			ExternalSubscriptions: map[string]string{"Alice": "legacy_Sub-ID"},
 			Settings: adminSettings{
 				SubscriptionPath:    "/access/a8Jf_92/",
 				ProfilePagePath:     "/portal/N4mE-71/",
@@ -50,6 +50,11 @@ func TestAdminSettingsConfigurePublicRoutes(t *testing.T) {
 	require.Equal(t, http.MethodGet, profilePost.Header().Get("Allow"))
 	require.Equal(t, http.StatusNotFound, adminRequest(a, http.MethodGet, subscriptionRoutePrefix+"native-token", nil).Code)
 	require.Equal(t, http.StatusNotFound, adminRequest(a, http.MethodGet, profilePageRoutePrefix+"native-token", nil).Code)
+	legacy := adminRequest(a, http.MethodGet, externalSubscriptionRoutePrefix+"legacy_Sub-ID", nil)
+	require.Equal(t, http.StatusOK, legacy.Code, legacy.Body.String())
+	require.Equal(t, "https://panel.example.com/portal/N4mE-71/legacy_Sub-ID", legacy.Header().Get("Profile-Web-Page-Url"))
+	require.Equal(t, http.StatusNotFound, adminRequest(a, http.MethodGet, "/access/a8Jf_92/legacy_Sub-ID", nil).Code)
+	require.Equal(t, http.StatusNotFound, adminRequest(a, http.MethodGet, externalSubscriptionRoutePrefix+"native-token", nil).Code)
 }
 
 func TestAdminSettingsRejectsLegacyCrossRouteCollisions(t *testing.T) {
@@ -61,6 +66,8 @@ func TestAdminSettingsRejectsLegacyCrossRouteCollisions(t *testing.T) {
 		settings.LegacyRoutesEnabled = false
 		require.NoError(t, validateAdminSettings(settings))
 	}
+	require.Error(t, validateAdminSettings(adminSettings{SubscriptionPath: "/subscription/", ProfilePagePath: externalSubscriptionRoutePrefix}))
+	require.Error(t, validateAdminSettings(adminSettings{SubscriptionPath: externalSubscriptionRoutePrefix, ProfilePagePath: "/profile/"}))
 }
 
 func TestAdminSettingsAPIUpdatesAndPersists(t *testing.T) {

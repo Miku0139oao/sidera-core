@@ -22,11 +22,21 @@ var commandCheck = &cobra.Command{
 	Args: cobra.NoArgs,
 }
 
+var checkActiveRuntime bool
+
 func init() {
+	commandCheck.Flags().BoolVar(&checkActiveRuntime, "active-runtime", false, "check the last-known-good runtime configuration")
 	mainCommand.AddCommand(commandCheck)
 }
 
 func check() error {
+	if checkActiveRuntime {
+		options, _, err := readRuntimeConfig(resolvedRuntimeConfigPath())
+		if err != nil {
+			return err
+		}
+		return validateConfigOptions(options)
+	}
 	options, err := readConfigAndMerge()
 	if err != nil {
 		return err

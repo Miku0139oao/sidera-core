@@ -15,6 +15,7 @@ import (
 
 	C "github.com/Miku0139oao/sidera-core/constant"
 	"github.com/Miku0139oao/sidera-core/option"
+	"github.com/Miku0139oao/sidera-core/protocol/vless/xrayencryption"
 	E "github.com/sagernet/sing/common/exceptions"
 	SJSON "github.com/sagernet/sing/common/json"
 
@@ -84,6 +85,14 @@ func (a *adminAPI) ensureSubscriptionTokensLocked() error {
 			delete(a.store.Subscriptions, name)
 		}
 	}
+	if a.store.ExternalSubscriptions == nil {
+		a.store.ExternalSubscriptions = make(map[string]string)
+	}
+	for name := range a.store.ExternalSubscriptions {
+		if !names[name] {
+			delete(a.store.ExternalSubscriptions, name)
+		}
+	}
 	orderedNames := make([]string, 0, len(names))
 	for name := range names {
 		orderedNames = append(orderedNames, name)
@@ -117,7 +126,7 @@ func validSubscriptionToken(token string) bool {
 	return err == nil && len(decoded) == subscriptionTokenBytes && base64.RawURLEncoding.EncodeToString(decoded) == token
 }
 
-func (a *adminAPI) getSubscription(writer http.ResponseWriter, request *http.Request) {
+func (a *adminAPI) getSubscription(writer http.ResponseWriter, request *http.Request, external bool) {
 	writer.Header().Set("Cache-Control", "no-store")
 	if a.publicBaseURL == "" {
 		http.NotFound(writer, request)
@@ -128,7 +137,7 @@ func (a *adminAPI) getSubscription(writer http.ResponseWriter, request *http.Req
 		token = chi.URLParam(request, "token")
 	}
 	a.storeAccess.RLock()
-	name, found := a.subscriptionNameLocked(token)
+	name, found := a.subscriptionRequestNameLocked(token, external)
 	a.storeAccess.RUnlock()
 	if !found {
 		http.NotFound(writer, request)
@@ -138,14 +147,16 @@ func (a *adminAPI) getSubscription(writer http.ResponseWriter, request *http.Req
 	now := time.Now().UnixMilli()
 
 	a.storeAccess.RLock()
-	currentName, current := a.subscriptionNameLocked(token)
+	currentName, current := a.subscriptionRequestNameLocked(token, external)
 	if !current || currentName != name {
 		a.storeAccess.RUnlock()
 		http.NotFound(writer, request)
 		return
 	}
-	links := a.subscriptionLinksLocked(name, now, active)
+	accountUsage := a.accountUsageLocked(active)
+	links := a.subscriptionLinksWithAccountsLocked(name, now, active, accountUsage)
 	profilePagePath := a.profilePagePathLocked()
+	upload, download, total, expire := a.subscriptionUsageWithAccountsLocked(name, active, accountUsage)
 	a.storeAccess.RUnlock()
 	if len(links) == 0 {
 		http.NotFound(writer, request)
@@ -157,7 +168,6 @@ func (a *adminAPI) getSubscription(writer http.ResponseWriter, request *http.Req
 	writer.Header().Set("Content-Length", strconv.Itoa(len(body)))
 	writer.Header().Set("Profile-Update-Interval", "12")
 	writer.Header().Set("Profile-Web-Page-Url", a.publicBaseURL+profilePagePath+url.PathEscape(token))
-	upload, download, total, expire := a.subscriptionUsageLocked(name, active)
 	writer.Header().Set("Subscription-Userinfo", "upload="+strconv.FormatInt(upload, 10)+"; download="+strconv.FormatInt(download, 10)+"; total="+strconv.FormatInt(total, 10)+"; expire="+strconv.FormatInt(expire, 10))
 	if request.Method == http.MethodGet {
 		_, _ = writer.Write([]byte(body))
@@ -165,6 +175,25 @@ func (a *adminAPI) getSubscription(writer http.ResponseWriter, request *http.Req
 }
 
 func (a *adminAPI) subscriptionUsageLocked(name string, active map[string]adminUsage) (upload, download, total, expire int64) {
+	accountUsage := a.accountUsageLocked(active)
+	return a.subscriptionUsageWithAccountsLocked(name, active, accountUsage)
+}
+
+func (a *adminAPI) subscriptionUsageWithAccountsLocked(name string, active map[string]adminUsage, accountUsage map[string]adminUsage) (upload, download, total, expire int64) {
+	for _, account := range a.store.Accounts {
+		if account == nil || account.Name != name || account.PolicyScope != adminAccountPolicyGlobal {
+			continue
+		}
+		usage := accountUsage[account.ID]
+		upload = usage.Upload
+		download = usage.Download
+		total = account.QuotaBytes
+		expire = account.ExpiresAt
+		if expire > 0 {
+			expire /= 1000
+		}
+		return
+	}
 	unlimited := false
 	for tag, record := range a.store.Inbounds {
 		if record == nil {
@@ -175,12 +204,12 @@ func (a *adminAPI) subscriptionUsageLocked(name string, active map[string]adminU
 				continue
 			}
 			usage := active[adminUserKey(tag, name)]
-			upload += user.UploadBytes + usage.Upload
-			download += user.DownloadBytes + usage.Download
+			upload = saturatingAdminTrafficAdd(upload, user.UploadBytes, usage.Upload)
+			download = saturatingAdminTrafficAdd(download, user.DownloadBytes, usage.Download)
 			if user.QuotaBytes == 0 {
 				unlimited = true
 			} else {
-				total += user.QuotaBytes
+				total = saturatingAdminTrafficAdd(total, user.QuotaBytes)
 			}
 			if user.ExpiresAt > 0 && (expire == 0 || user.ExpiresAt < expire) {
 				expire = user.ExpiresAt
@@ -205,7 +234,31 @@ func (a *adminAPI) subscriptionNameLocked(token string) (string, bool) {
 	return "", false
 }
 
-func (a *adminAPI) subscriptionLinksLocked(name string, now int64, active map[string]adminUsage) []string {
+func (a *adminAPI) externalSubscriptionNameLocked(identifier string) (string, bool) {
+	if !validExternalSubscriptionID(identifier) {
+		return "", false
+	}
+	matchedName := ""
+	for candidateName, candidateID := range a.store.ExternalSubscriptions {
+		if len(identifier) != len(candidateID) || subtle.ConstantTimeCompare([]byte(identifier), []byte(candidateID)) != 1 {
+			continue
+		}
+		if matchedName != "" {
+			return "", false
+		}
+		matchedName = candidateName
+	}
+	return matchedName, matchedName != ""
+}
+
+func (a *adminAPI) subscriptionRequestNameLocked(identifier string, external bool) (string, bool) {
+	if external {
+		return a.externalSubscriptionNameLocked(identifier)
+	}
+	return a.subscriptionNameLocked(identifier)
+}
+
+func (a *adminAPI) subscriptionLinksWithAccountsLocked(name string, now int64, active map[string]adminUsage, accountUsage map[string]adminUsage) []string {
 	links := make([]string, 0)
 	for tag, profile := range a.store.Servers {
 		if profile == nil || profile.Deleted || profile.Kind != adminServerKindInbound || profile.Revision == 0 || profile.Revision != profile.AppliedRevision {
@@ -220,7 +273,11 @@ func (a *adminAPI) subscriptionLinksLocked(name string, now int64, active map[st
 			continue
 		}
 		for _, user := range record.Users {
-			if user == nil || user.Name != name || !adminUserEnabled(user, now, active[adminUserKey(tag, name)]) {
+			if user == nil || user.Name != name {
+				continue
+			}
+			membershipUsage := active[adminUserKey(tag, name)]
+			if !adminUserEnabledWithAccount(user, a.store.Accounts[user.AccountID], now, membershipUsage, accountUsage[user.AccountID]) {
 				continue
 			}
 			if link, ok := subscriptionLink(a.ctx, tag, profile, user); ok {
@@ -229,6 +286,25 @@ func (a *adminAPI) subscriptionLinksLocked(name string, now int64, active map[st
 		}
 	}
 	return links
+}
+
+func (a *adminAPI) subscriptionURLLocked(name string, active map[string]adminUsage) string {
+	return a.subscriptionURLWithAccountsLocked(name, active, a.accountUsageLocked(active))
+}
+
+func (a *adminAPI) subscriptionURLWithAccountsLocked(name string, active map[string]adminUsage, accountUsage map[string]adminUsage) string {
+	if a.publicBaseURL == "" || len(a.subscriptionLinksWithAccountsLocked(name, time.Now().UnixMilli(), active, accountUsage)) == 0 {
+		return ""
+	}
+	externalID := a.store.ExternalSubscriptions[name]
+	if owner, valid := a.externalSubscriptionNameLocked(externalID); valid && owner == name {
+		return a.publicBaseURL + "/sub/" + url.PathEscape(externalID)
+	}
+	token := a.store.Subscriptions[name]
+	if owner, valid := a.subscriptionNameLocked(token); valid && owner == name {
+		return a.publicBaseURL + a.subscriptionPathLocked() + token
+	}
+	return ""
 }
 
 func subscriptionLink(ctx context.Context, tag string, profile *adminServerStore, user *adminUser) (string, bool) {
@@ -254,9 +330,17 @@ func subscriptionLink(ctx context.Context, tag string, profile *adminServerStore
 		if err != nil {
 			return "", false
 		}
+		decryption := config.Decryption
+		if decryption == "" {
+			decryption = "none"
+		}
+		encryption, err := xrayencryption.ClientEncryptionFromDecryption(decryption)
+		if err != nil {
+			return "", false
+		}
 		shortIDs := append([]string(nil), config.TLS.Reality.ShortID...)
 		sort.Strings(shortIDs)
-		query := url.Values{"encryption": {"none"}, "security": {"reality"}, "type": {"tcp"}, "fp": {"chrome"}, "pbk": {base64.RawURLEncoding.EncodeToString(privateKey.PublicKey().Bytes())}}
+		query := url.Values{"encryption": {encryption}, "security": {"reality"}, "type": {"tcp"}, "fp": {"chrome"}, "pbk": {base64.RawURLEncoding.EncodeToString(privateKey.PublicKey().Bytes())}}
 		if user.Flow != "" {
 			query.Set("flow", user.Flow)
 		}

@@ -7,6 +7,8 @@
 package xrayencryption
 
 import (
+	"crypto/ecdh"
+	"crypto/mlkem"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -91,6 +93,71 @@ func ParseEncryption(config string) (*ClientInstance, error) {
 }
 
 func NewClient(config string) (*ClientInstance, error) { return ParseEncryption(config) }
+
+func ClientEncryptionFromDecryption(config string) (string, error) {
+	if config == "none" {
+		return "none", nil
+	}
+	if config == "" {
+		return "", errors.New("xray encryption: empty decryption")
+	}
+	fields := strings.Split(config, ".")
+	if len(fields) < 4 || fields[0] != methodName {
+		return "", fmt.Errorf("xray encryption: unsupported decryption %q", config)
+	}
+	if _, err := parseMode(fields[1]); err != nil {
+		return "", err
+	}
+	secondsFrom, secondsTo, err := parseSecondsRange(fields[2])
+	if err != nil {
+		return "", err
+	}
+	padding, keyFields, err := splitPaddingAndKeys(fields[3:])
+	if err != nil {
+		return "", err
+	}
+	keys, err := decodeKeys(keyFields, 32, 64)
+	if err != nil {
+		return "", err
+	}
+	var paddingLens, paddingGaps [][3]int
+	if err = ParsePadding(padding, &paddingLens, &paddingGaps); err != nil {
+		return "", err
+	}
+
+	clientKeyFields := make([]string, len(keys))
+	for index, key := range keys {
+		var publicKey []byte
+		switch len(key) {
+		case 32:
+			privateKey, keyErr := ecdh.X25519().NewPrivateKey(key)
+			if keyErr != nil {
+				return "", keyErr
+			}
+			publicKey = privateKey.PublicKey().Bytes()
+		case 64:
+			privateKey, keyErr := mlkem.NewDecapsulationKey768(key)
+			if keyErr != nil {
+				return "", keyErr
+			}
+			publicKey = privateKey.EncapsulationKey().Bytes()
+		default:
+			return "", fmt.Errorf("xray encryption: invalid key %d length %d", index, len(key))
+		}
+		clientKeyFields[index] = base64.RawURLEncoding.EncodeToString(publicKey)
+	}
+
+	handshakeMode := "1rtt"
+	if secondsFrom > 0 || secondsTo > 0 {
+		handshakeMode = "0rtt"
+	}
+	clientFields := []string{methodName, fields[1], handshakeMode}
+	if padding != "" {
+		clientFields = append(clientFields, strings.Split(padding, ".")...)
+	}
+	clientFields = append(clientFields, clientKeyFields...)
+	return strings.Join(clientFields, "."), nil
+}
 
 func parseMode(mode string) (uint32, error) {
 	switch mode {

@@ -1,10 +1,10 @@
-site_name: sing-box
-site_url: https://sing-box.sagernet.org/
-site_author: nekohasekai
-repo_url: https://github.com/SagerNet/sing-box
-repo_name: SagerNet/sing-box
-copyright: Copyright &copy; 2022 nekohasekai
-site_description: The universal proxy platform.
+site_name: Sidera Core
+site_url: https://github.com/Miku0139oao/sidera-core
+site_author: Miku0139oao
+repo_url: https://github.com/Miku0139oao/sidera-core
+repo_name: Miku0139oao/sidera-core
+copyright: Copyright &copy; 2022 nekohasekai and Sidera Core contributors
+site_description: Sidera Core proxy platform.
 remote_branch: docs
 edit_uri: ""
 theme:
@@ -250,7 +250,7 @@ markdown_extensions:
 extra:
   social:
     - icon: fontawesome/brands/github
-      link: https://github.com/SagerNet/sing-box
+      link: https://github.com/Miku0139oao/sidera-core
   generator: false
 plugins:
   - search

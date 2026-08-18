@@ -3,10 +3,12 @@ package api
 import (
 	"context"
 	"crypto/ecdh"
+	"crypto/mlkem"
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -54,6 +56,10 @@ func TestSubscriptionEndpointGroupsExactNameAndProductionProfiles(t *testing.T) 
 	privateKey, err := ecdh.X25519().NewPrivateKey(bytesOf(1, 32))
 	require.NoError(t, err)
 	privateEncoded := base64.RawURLEncoding.EncodeToString(privateKey.Bytes())
+	encryptionPrivateKey, err := ecdh.X25519().NewPrivateKey(bytesOf(2, 32))
+	require.NoError(t, err)
+	encryptionPrivateEncoded := base64.RawURLEncoding.EncodeToString(encryptionPrivateKey.Bytes())
+	expectedEncryption := "mlkem768x25519plus.native.0rtt." + base64.RawURLEncoding.EncodeToString(encryptionPrivateKey.PublicKey().Bytes())
 	a := &adminAPI{
 		publicBaseURL: "https://panel.example.com",
 		runtimes: map[string]*adminInboundRuntime{
@@ -72,7 +78,7 @@ func TestSubscriptionEndpointGroupsExactNameAndProductionProfiles(t *testing.T) 
 				"pending": {Users: []*adminUser{{Name: "Alice", Password: "pending", Enabled: true}}},
 			},
 			Servers: map[string]*adminServerStore{
-				"reality": subscriptionTestProfile(C.TypeVLESS, `{"tls":{"enabled":true,"reality":{"enabled":true,"private_key":"`+privateEncoded+`","short_id":["b2","a1"]}}}`, "vless.example.com", 443),
+				"reality": subscriptionTestProfile(C.TypeVLESS, `{"decryption":"mlkem768x25519plus.native.600s.`+encryptionPrivateEncoded+`","tls":{"enabled":true,"reality":{"enabled":true,"private_key":"`+privateEncoded+`","short_id":["b2","a1"]}}}`, "vless.example.com", 443),
 				"hy2":     subscriptionTestProfile(C.TypeHysteria2, `{"obfs":{"type":"salamander","password":"obfs-secret"}}`, "2001:db8::1", 8443),
 				"tuic":    subscriptionTestProfile(C.TypeTUIC, `{"congestion_control":"bbr"}`, "tuic.example.com", 8444),
 				"pending": {Kind: adminServerKindInbound, Type: C.TypeHysteria2, Revision: 2, AppliedRevision: 1, Advertise: adminServerAdvertise{Server: "pending.example.com", ServerPort: 443}, Config: json.RawMessage(`{}`)},
@@ -94,8 +100,19 @@ func TestSubscriptionEndpointGroupsExactNameAndProductionProfiles(t *testing.T) 
 	require.Contains(t, string(decoded), "tuic://")
 	require.Contains(t, string(decoded), base64.RawURLEncoding.EncodeToString(privateKey.PublicKey().Bytes()))
 	require.NotContains(t, string(decoded), privateEncoded)
+	require.NotContains(t, string(decoded), encryptionPrivateEncoded)
 	require.NotContains(t, string(decoded), "wrong-case")
 	require.NotContains(t, string(decoded), "pending.example.com")
+	var vlessLink string
+	for _, link := range links {
+		if strings.HasPrefix(link, "vless://") {
+			vlessLink = link
+			break
+		}
+	}
+	parsedVLESS, err := url.Parse(vlessLink)
+	require.NoError(t, err)
+	require.Equal(t, expectedEncryption, parsedVLESS.Query().Get("encryption"))
 
 	head := adminRequest(a, http.MethodHead, "/sub/sidera/subscription-token", nil)
 	require.Equal(t, http.StatusOK, head.Code)
@@ -133,6 +150,14 @@ func TestSubscriptionProfilePageSupportsNativeAndLegacyIdentifiers(t *testing.T)
 		require.Contains(t, response.Body.String(), "HYSTERIA2")
 		require.NotContains(t, response.Body.String(), "secret")
 	}
+	legacySubscription := adminRequest(a, http.MethodGet, externalSubscriptionRoutePrefix+"legacy_Sub-ID", nil)
+	require.Equal(t, http.StatusOK, legacySubscription.Code, legacySubscription.Body.String())
+	require.Equal(t, "https://panel.example.com/api/list/nodes/legacy_Sub-ID", legacySubscription.Header().Get("Profile-Web-Page-Url"))
+	decoded, err := base64.StdEncoding.DecodeString(legacySubscription.Body.String())
+	require.NoError(t, err)
+	require.Contains(t, string(decoded), "hysteria2://")
+	a.store.ExternalSubscriptions["Bob"] = "legacy_Sub-ID"
+	require.Equal(t, http.StatusNotFound, adminRequest(a, http.MethodGet, externalSubscriptionRoutePrefix+"legacy_Sub-ID", nil).Code)
 }
 
 func TestSubscriptionURLOnlyInUserDetail(t *testing.T) {
@@ -155,11 +180,76 @@ func TestExternalSubscriptionURLTakesPriority(t *testing.T) {
 	a := newAdminTestAPI(t, managed, false)
 	a.publicBaseURL = "https://panel.example.com"
 	a.store.ExternalSubscriptions["Alice"] = "legacy_Sub-ID"
-	a.store.Inbounds[managed.tag] = &adminInboundStore{Users: []*adminUser{{ID: "id", Inbound: managed.tag, Type: C.TypeHysteria2, Name: "Alice", Enabled: true}}}
+	a.store.Inbounds[managed.tag] = &adminInboundStore{Users: []*adminUser{{ID: "id", Inbound: managed.tag, Type: C.TypeHysteria2, Name: "Alice", Password: "secret", Enabled: true}}}
+	a.store.Servers[managed.tag] = subscriptionTestProfile(C.TypeHysteria2, `{}`, "hy2.example.com", 443)
 	a.router = a.buildRouter()
 
 	detail := adminRequest(a, http.MethodGet, adminRoutePrefix+"/users/id", nil)
 	require.Contains(t, detail.Body.String(), `"subscription_url":"https://panel.example.com/sub/legacy_Sub-ID"`)
+}
+
+func TestExternalSubscriptionURLRequiresUsableUniqueEndpoint(t *testing.T) {
+	managed := &adminTestManagedService{tag: "users", type_: C.TypeHysteria2}
+	a := newAdminTestAPI(t, managed, false)
+	a.publicBaseURL = "https://panel.example.com"
+	a.store.ExternalSubscriptions["Alice"] = "legacy_Sub-ID"
+	a.store.Subscriptions["Alice"] = "native-token"
+	a.store.Inbounds[managed.tag] = &adminInboundStore{Users: []*adminUser{{ID: "id", Inbound: managed.tag, Type: C.TypeHysteria2, Name: "Alice", Password: "secret", Enabled: false}}}
+	a.store.Servers[managed.tag] = subscriptionTestProfile(C.TypeHysteria2, `{}`, "hy2.example.com", 443)
+	a.router = a.buildRouter()
+
+	detail := adminRequest(a, http.MethodGet, adminRoutePrefix+"/users/id", nil)
+	require.NotContains(t, detail.Body.String(), "subscription_url")
+
+	a.store.Inbounds[managed.tag].Users[0].Enabled = true
+	a.store.ExternalSubscriptions["Bob"] = "legacy_Sub-ID"
+	detail = adminRequest(a, http.MethodGet, adminRoutePrefix+"/users/id", nil)
+	require.Contains(t, detail.Body.String(), `"subscription_url":"https://panel.example.com/sub/sidera/native-token"`)
+	require.NotContains(t, detail.Body.String(), "/sub/legacy_Sub-ID")
+}
+
+func TestSubscriptionOmitsMalformedVLESSEncryptionAndKeepsOthers(t *testing.T) {
+	privateKey, err := ecdh.X25519().NewPrivateKey(bytesOf(1, 32))
+	require.NoError(t, err)
+	privateEncoded := base64.RawURLEncoding.EncodeToString(privateKey.Bytes())
+	mlkemPrivate, err := mlkem.GenerateKey768()
+	require.NoError(t, err)
+	mlkemEncoded := base64.RawURLEncoding.EncodeToString(mlkemPrivate.Bytes())
+	expectedEncryption := "mlkem768x25519plus.xorpub.1rtt." + base64.RawURLEncoding.EncodeToString(mlkemPrivate.EncapsulationKey().Bytes())
+
+	a := &adminAPI{
+		publicBaseURL: "https://panel.example.com",
+		runtimes: map[string]*adminInboundRuntime{
+			"good": {Tag: "good", Type: C.TypeVLESS},
+			"bad":  {Tag: "bad", Type: C.TypeVLESS},
+			"hy2":  {Tag: "hy2", Type: C.TypeHysteria2},
+		},
+		store: adminStore{
+			Version:       4,
+			Subscriptions: map[string]string{"Alice": "subscription-token"},
+			Inbounds: map[string]*adminInboundStore{
+				"good": {Users: []*adminUser{{Name: "Alice", UUID: "11111111-1111-1111-1111-111111111111", Enabled: true}}},
+				"bad":  {Users: []*adminUser{{Name: "Alice", UUID: "22222222-2222-2222-2222-222222222222", Enabled: true}}},
+				"hy2":  {Users: []*adminUser{{Name: "Alice", Password: "hy2 secret", Enabled: true}}},
+			},
+			Servers: map[string]*adminServerStore{
+				"good": subscriptionTestProfile(C.TypeVLESS, `{"decryption":"mlkem768x25519plus.xorpub.0s.`+mlkemEncoded+`","tls":{"enabled":true,"reality":{"enabled":true,"private_key":"`+privateEncoded+`","short_id":["aa"]}}}`, "good.example.com", 443),
+				"bad":  subscriptionTestProfile(C.TypeVLESS, `{"decryption":"mlkem768x25519plus.unknown.0s.`+mlkemEncoded+`","tls":{"enabled":true,"reality":{"enabled":true,"private_key":"`+privateEncoded+`"}}}`, "bad.example.com", 443),
+				"hy2":  subscriptionTestProfile(C.TypeHysteria2, `{}`, "hy2.example.com", 443),
+			},
+		},
+	}
+	a.router = a.buildRouter()
+	response := adminRequest(a, http.MethodGet, "/sub/sidera/subscription-token", nil)
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	decoded, err := base64.StdEncoding.DecodeString(response.Body.String())
+	require.NoError(t, err)
+	body := string(decoded)
+	require.Contains(t, body, "vless://")
+	require.Contains(t, body, "hysteria2://")
+	require.Contains(t, body, "good.example.com")
+	require.NotContains(t, body, "bad.example.com")
+	require.Contains(t, body, expectedEncryption)
 }
 
 func TestSubscriptionRejectsNonTCPReality(t *testing.T) {
@@ -179,6 +269,10 @@ func TestWebBridgeDispatchesPublicSubscription(t *testing.T) {
 	bridge.ServeHTTP(response, request)
 	require.Equal(t, http.StatusNotFound, response.Code)
 	require.Equal(t, "404 page not found\n", response.Body.String())
+	legacyResponse := httptest.NewRecorder()
+	bridge.ServeHTTP(legacyResponse, httptest.NewRequest(http.MethodGet, externalSubscriptionRoutePrefix+"missing-id", nil))
+	require.Equal(t, http.StatusNotFound, legacyResponse.Code)
+	require.Equal(t, "404 page not found\n", legacyResponse.Body.String())
 }
 
 func TestWebBridgeDispatchesSubscriptionProfile(t *testing.T) {

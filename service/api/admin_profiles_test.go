@@ -24,10 +24,11 @@ import (
 type adminTestOptionsRegistry map[string]func() any
 
 type adminTestManagedService struct {
-	tag       string
-	type_     string
-	users     []adapter.ManagedUser
-	updateErr error
+	tag         string
+	type_       string
+	users       []adapter.ManagedUser
+	updateErr   error
+	updateCalls int
 }
 
 func (s *adminTestManagedService) Tag() string { return s.tag }
@@ -35,6 +36,14 @@ func (s *adminTestManagedService) Tag() string { return s.tag }
 func (s *adminTestManagedService) Type() string { return s.type_ }
 
 func (s *adminTestManagedService) ManagedUserSchema() adapter.ManagedUserSchema {
+	switch s.type_ {
+	case C.TypeVLESS:
+		return adapter.ManagedUserSchema{Credential: adapter.ManagedUserCredentialUUID, Flow: true}
+	case C.TypeVMess:
+		return adapter.ManagedUserSchema{Credential: adapter.ManagedUserCredentialUUID, AlterID: true}
+	case C.TypeTUIC:
+		return adapter.ManagedUserSchema{Credential: adapter.ManagedUserCredentialUUIDPassword}
+	}
 	return adapter.ManagedUserSchema{Credential: adapter.ManagedUserCredentialPassword}
 }
 
@@ -43,6 +52,7 @@ func (s *adminTestManagedService) ManagedUsers() []adapter.ManagedUser {
 }
 
 func (s *adminTestManagedService) UpdateManagedUsers(users []adapter.ManagedUser) error {
+	s.updateCalls++
 	if s.updateErr != nil {
 		return s.updateErr
 	}
@@ -212,6 +222,61 @@ func TestLoadVersionOneAdminStore(t *testing.T) {
 	require.NoError(t, a.loadStore())
 	require.Equal(t, adminStoreVersion, a.store.Version)
 	require.NotNil(t, a.store.Servers)
+}
+
+func TestLoadVersionFiveAdminStoreMigratesAccountsWithoutChangingMembershipPolicy(t *testing.T) {
+	dataPath := filepath.Join(t.TempDir(), "dashboard.json")
+	store := `{
+  "version": 5,
+  "inbounds": {
+    "first": {"type":"socks","users":[{"id":"one","name":"Alice","enabled":true,"quota_bytes":100,"upload_bytes":10,"created_at":10,"updated_at":20}]},
+    "second": {"type":"socks","users":[{"id":"two","name":"Alice","enabled":false,"quota_bytes":200,"download_bytes":30,"created_at":11,"updated_at":21}]},
+    "third": {"type":"socks","users":[{"id":"three","name":"alice","enabled":true,"created_at":12,"updated_at":22}]}
+  }
+}`
+	require.NoError(t, os.WriteFile(dataPath, []byte(store), 0o600))
+	a := &adminAPI{ctx: context.Background(), dataPath: dataPath}
+	require.NoError(t, a.loadStore())
+	require.Equal(t, adminStoreVersion, a.store.Version)
+	require.Len(t, a.store.Accounts, 2)
+	first := a.store.Inbounds["first"].Users[0]
+	second := a.store.Inbounds["second"].Users[0]
+	third := a.store.Inbounds["third"].Users[0]
+	require.NotEmpty(t, first.AccountID)
+	require.Equal(t, first.AccountID, second.AccountID)
+	require.NotEqual(t, first.AccountID, third.AccountID)
+	require.Equal(t, adminAccountPolicyMembership, a.store.Accounts[first.AccountID].PolicyScope)
+	require.EqualValues(t, 100, first.QuotaBytes)
+	require.EqualValues(t, 200, second.QuotaBytes)
+	require.True(t, first.Enabled)
+	require.False(t, second.Enabled)
+	require.EqualValues(t, 10, first.UploadBytes)
+	require.EqualValues(t, 30, second.DownloadBytes)
+}
+
+func TestEnsureAdminAccountsPreservesIdentityAcrossGroupRenameAndSplit(t *testing.T) {
+	now := int64(100)
+	store := adminStore{
+		Version: adminStoreVersion,
+		Accounts: map[string]*adminAccount{
+			"account": {ID: "account", Name: "Alice", PolicyScope: adminAccountPolicyMembership, Enabled: true},
+		},
+		Inbounds: map[string]*adminInboundStore{
+			"first":  {Users: []*adminUser{{ID: "one", AccountID: "account", Name: "Bob"}}},
+			"second": {Users: []*adminUser{{ID: "two", AccountID: "account", Name: "Bob"}}},
+		},
+	}
+	require.NoError(t, ensureAdminAccounts(&store, now))
+	require.Len(t, store.Accounts, 1)
+	require.Equal(t, "Bob", store.Accounts["account"].Name)
+	require.Equal(t, "account", store.Inbounds["first"].Users[0].AccountID)
+
+	store.Inbounds["second"].Users[0].Name = "Carol"
+	require.NoError(t, ensureAdminAccounts(&store, now+1))
+	require.Len(t, store.Accounts, 2)
+	require.Equal(t, "account", store.Inbounds["first"].Users[0].AccountID)
+	require.NotEqual(t, "account", store.Inbounds["second"].Users[0].AccountID)
+	require.Equal(t, "Carol", store.Accounts[store.Inbounds["second"].Users[0].AccountID].Name)
 }
 
 func TestManagedBase64PasswordSchema(t *testing.T) {

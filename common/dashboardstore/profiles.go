@@ -16,7 +16,7 @@ import (
 )
 
 const (
-	StoreVersion    = 5
+	StoreVersion    = 6
 	DefaultDataPath = "sidera-dashboard.json"
 )
 
@@ -154,7 +154,7 @@ func loadStore(ctx context.Context, dataPath string) (storedStore, error) {
 	if err = stdjson.Unmarshal(content, &stored); err != nil {
 		return storedStore{}, E.Cause(err, "decode dashboard data")
 	}
-	if stored.Version != 1 && stored.Version != 2 && stored.Version != 3 && stored.Version != 4 && stored.Version != StoreVersion {
+	if stored.Version != 1 && stored.Version != 2 && stored.Version != 3 && stored.Version != 4 && stored.Version != 5 && stored.Version != StoreVersion {
 		return storedStore{}, E.New("unsupported dashboard data version: ", stored.Version)
 	}
 	return stored, nil

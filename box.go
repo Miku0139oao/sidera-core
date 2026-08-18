@@ -63,6 +63,7 @@ type Box struct {
 	httpClientService   adapter.LifecycleService
 	internalService     []adapter.LifecycleService
 	done                chan struct{}
+	beforeRuntimeCommit func() (func() error, error)
 }
 
 type Options struct {
@@ -71,6 +72,7 @@ type Options struct {
 	PlatformLogWriter          log.PlatformWriter
 	NetworkNamespaceHolderArgs []string
 	ValidationOnly             bool
+	BeforeRuntimeCommit        func() (func() error, error)
 }
 
 func Context(
@@ -492,6 +494,7 @@ func New(options Options) (*Box, error) {
 		logger:              logFactory.Logger(),
 		internalService:     internalServices,
 		done:                make(chan struct{}),
+		beforeRuntimeCommit: options.BeforeRuntimeCommit,
 	}, nil
 }
 
@@ -553,6 +556,9 @@ func (s *Box) PreStart() (result error) {
 
 func (s *Box) Start() (result error) {
 	err := s.start()
+	if err == nil {
+		err = s.service.CommitRuntime(s.beforeRuntimeCommit)
+	}
 	if err != nil {
 		defer func() {
 			v := recover()

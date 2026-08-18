@@ -47,8 +47,9 @@ func (a *adminAPI) getSubscriptionProfile(writer http.ResponseWriter, request *h
 
 	active := a.activeUsage()
 	a.storeAccess.RLock()
-	links := a.subscriptionLinksLocked(name, time.Now().UnixMilli(), active)
-	upload, download, total, expire := a.subscriptionUsageLocked(name, active)
+	accountUsage := a.accountUsageLocked(active)
+	links := a.subscriptionLinksWithAccountsLocked(name, time.Now().UnixMilli(), active, accountUsage)
+	upload, download, total, expire := a.subscriptionUsageWithAccountsLocked(name, active, accountUsage)
 	a.storeAccess.RUnlock()
 	sort.Strings(links)
 	nodes := make([]subscriptionProfileNode, 0, len(links))
@@ -78,10 +79,8 @@ func (a *adminAPI) subscriptionProfileIdentityLocked(identifier string) (name st
 	if name, found = a.subscriptionNameLocked(identifier); found {
 		return name, a.subscriptionPathLocked() + url.PathEscape(identifier), true
 	}
-	for candidateName, externalID := range a.store.ExternalSubscriptions {
-		if externalID == identifier && validExternalSubscriptionID(externalID) {
-			return candidateName, "/sub/" + url.PathEscape(externalID), true
-		}
+	if name, found = a.externalSubscriptionNameLocked(identifier); found {
+		return name, externalSubscriptionRoutePrefix + url.PathEscape(identifier), true
 	}
 	return "", "", false
 }

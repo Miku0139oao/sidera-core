@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"maps"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -38,10 +39,17 @@ import (
 )
 
 const (
-	adminRoutePrefix        = "/api/admin"
-	subscriptionRoutePrefix = "/sub/sidera/"
-	profilePageRoutePrefix  = "/api/list/nodes/"
-	adminStoreVersion       = dashboardstore.StoreVersion
+	adminRoutePrefix                = "/api/admin"
+	externalSubscriptionRoutePrefix = "/sub/"
+	subscriptionRoutePrefix         = "/sub/sidera/"
+	profilePageRoutePrefix          = "/api/list/nodes/"
+	adminStoreVersion               = dashboardstore.StoreVersion
+	adminAccountPolicyMembership    = "membership_local"
+	adminAccountPolicyGlobal        = "account_global"
+	adminDayMilliseconds            = int64(24 * time.Hour / time.Millisecond)
+	adminMaintenanceInterval        = 2 * time.Second
+	adminTrafficCheckpointInterval  = 30 * time.Second
+	adminOverviewCacheDuration      = time.Second
 )
 
 // ContextWithValidation disables runtime and persistent dashboard mutations
@@ -86,6 +94,9 @@ type adminAPI struct {
 	handlerAccess         sync.Mutex
 	handlers              sync.WaitGroup
 	closing               bool
+	overviewAccess        sync.Mutex
+	overviewContent       []byte
+	overviewExpires       time.Time
 	removeTrafficOpenHook func()
 	removeTrafficHook     func()
 	dirty                 atomic.Bool
@@ -106,11 +117,29 @@ type adminManagedRuntime struct {
 
 type adminStore struct {
 	Version               int                           `json:"version"`
+	Accounts              map[string]*adminAccount      `json:"accounts,omitempty"`
 	Inbounds              map[string]*adminInboundStore `json:"inbounds"`
 	Servers               map[string]*adminServerStore  `json:"servers,omitempty"`
 	Subscriptions         map[string]string             `json:"subscriptions,omitempty"`
 	ExternalSubscriptions map[string]string             `json:"external_subscriptions,omitempty"`
 	Settings              adminSettings                 `json:"settings,omitempty"`
+}
+
+type adminAccount struct {
+	ID                string `json:"id"`
+	Name              string `json:"name"`
+	PolicyScope       string `json:"policy_scope"`
+	Enabled           bool   `json:"enabled"`
+	QuotaBytes        int64  `json:"quota_bytes"`
+	ExpiresAt         int64  `json:"expires_at"`
+	MaxIPs            int    `json:"max_ips,omitempty"`
+	ResetDays         int    `json:"reset_days,omitempty"`
+	BaseUploadBytes   int64  `json:"base_upload_bytes,omitempty"`
+	BaseDownloadBytes int64  `json:"base_download_bytes,omitempty"`
+	LastOnline        int64  `json:"last_online,omitempty"`
+	Revision          int64  `json:"revision"`
+	CreatedAt         int64  `json:"created_at"`
+	UpdatedAt         int64  `json:"updated_at"`
 }
 
 type adminServerStore struct {
@@ -144,6 +173,7 @@ type adminInboundStore struct {
 
 type adminUser struct {
 	ID                string `json:"id"`
+	AccountID         string `json:"account_id"`
 	Inbound           string `json:"inbound"`
 	Type              string `json:"type"`
 	Name              string `json:"name"`
@@ -169,6 +199,14 @@ type adminUserView struct {
 	Revision          int64           `json:"revision"`
 	AppliedRevision   int64           `json:"applied_revision"`
 	SubscriptionURL   string          `json:"subscription_url,omitempty"`
+}
+
+type adminAccountView struct {
+	adminAccount
+	UploadBytes       int64           `json:"upload_bytes"`
+	DownloadBytes     int64           `json:"download_bytes"`
+	ActiveConnections int             `json:"active_connections"`
+	OnlineIPs         []adminOnlineIP `json:"online_ips,omitempty"`
 }
 
 type adminOnlineIP struct {
@@ -255,6 +293,7 @@ func newAdminAPI(ctx context.Context, logger log.ContextLogger, secret string, d
 		trafficBaselines:    make(map[uuid.UUID]adminTrafficBaseline),
 		store: adminStore{
 			Version:               adminStoreVersion,
+			Accounts:              make(map[string]*adminAccount),
 			Inbounds:              make(map[string]*adminInboundStore),
 			Servers:               make(map[string]*adminServerStore),
 			Subscriptions:         make(map[string]string),
@@ -373,25 +412,48 @@ func (a *adminAPI) addRuntime(tag string, inboundType string, kind string, candi
 }
 
 func (a *adminAPI) loadStore() error {
-	content, err := filemanager.ReadFile(a.ctx, a.dataPath)
-	if errors.Is(err, os.ErrNotExist) {
-		content, err = filemanager.ReadFile(a.ctx, a.dataPath+".bak")
+	var result error
+	found := false
+	for _, candidatePath := range []string{a.dataPath, a.dataPath + ".bak"} {
+		content, err := filemanager.ReadFile(a.ctx, candidatePath)
 		if errors.Is(err, os.ErrNotExist) {
-			return nil
+			continue
 		}
+		found = true
+		if err == nil {
+			var stored adminStore
+			stored, err = decodeAdminStore(content, time.Now().UnixMilli())
+			if err == nil {
+				a.store = stored
+				if candidatePath != a.dataPath {
+					a.logger.Warn("dashboard: recovered data from backup after primary store failed")
+				}
+				return nil
+			}
+		}
+		result = errors.Join(result, E.Cause(err, "load dashboard data at ", candidatePath))
 	}
-	if err != nil {
-		return E.Cause(err, "read dashboard data")
+	if !found {
+		return nil
 	}
+	return result
+}
+
+func decodeAdminStore(content []byte, now int64) (adminStore, error) {
 	var stored adminStore
-	if err = json.Unmarshal(content, &stored); err != nil {
-		return E.Cause(err, "decode dashboard data")
+	if err := json.Unmarshal(content, &stored); err != nil {
+		return adminStore{}, E.Cause(err, "decode dashboard data")
 	}
-	if stored.Version == 1 || stored.Version == 2 || stored.Version == 3 || stored.Version == 4 {
-		stored.Version = adminStoreVersion
+	sourceVersion := stored.Version
+	if sourceVersion == 1 || sourceVersion == 2 || sourceVersion == 3 || sourceVersion == 4 {
 		stored.Settings = defaultAdminSettings()
-	} else if stored.Version != adminStoreVersion {
-		return E.New("unsupported dashboard data version: ", stored.Version)
+	}
+	if sourceVersion < 1 || sourceVersion > adminStoreVersion {
+		return adminStore{}, E.New("unsupported dashboard data version: ", stored.Version)
+	}
+	stored.Version = adminStoreVersion
+	if stored.Accounts == nil {
+		stored.Accounts = make(map[string]*adminAccount)
 	}
 	if stored.Inbounds == nil {
 		stored.Inbounds = make(map[string]*adminInboundStore)
@@ -407,16 +469,18 @@ func (a *adminAPI) loadStore() error {
 	}
 	for tag, record := range stored.Inbounds {
 		if record == nil {
-			return E.New("invalid null dashboard inbound: ", tag)
+			return adminStore{}, E.New("invalid null dashboard inbound: ", tag)
 		}
 		for index, user := range record.Users {
 			if user == nil {
-				return E.New("invalid null dashboard user in ", tag, " at index ", index)
+				return adminStore{}, E.New("invalid null dashboard user in ", tag, " at index ", index)
 			}
 		}
 	}
-	a.store = stored
-	return nil
+	if err := ensureAdminAccounts(&stored, now); err != nil {
+		return adminStore{}, err
+	}
+	return stored, nil
 }
 
 func (a *adminAPI) synchronizeStore() error {
@@ -464,6 +528,120 @@ func (a *adminAPI) synchronizeStore() error {
 	for tag, profile := range a.store.Servers {
 		if profile == nil {
 			return E.New("invalid null dashboard server: ", tag)
+		}
+	}
+	return ensureAdminAccounts(&a.store, now)
+}
+
+func ensureAdminAccounts(store *adminStore, now int64) error {
+	if store.Accounts == nil {
+		store.Accounts = make(map[string]*adminAccount)
+	}
+	byName := make(map[string]*adminAccount, len(store.Accounts))
+	for identifier, account := range store.Accounts {
+		if account == nil || identifier == "" || account.ID != identifier || account.Name == "" {
+			return E.New("invalid dashboard account: ", identifier)
+		}
+		if account.PolicyScope != adminAccountPolicyMembership && account.PolicyScope != adminAccountPolicyGlobal {
+			return E.New("invalid dashboard account policy: ", identifier)
+		}
+		if account.QuotaBytes < 0 || account.ExpiresAt < 0 || account.MaxIPs < 0 || account.ResetDays < 0 || int64(account.ResetDays) > math.MaxInt64/adminDayMilliseconds || account.BaseUploadBytes < 0 || account.BaseDownloadBytes < 0 || account.LastOnline < 0 {
+			return E.New("invalid dashboard account limits: ", identifier)
+		}
+		if byName[account.Name] != nil {
+			return E.New("duplicate dashboard account name: ", account.Name)
+		}
+		byName[account.Name] = account
+	}
+
+	type accountReference struct {
+		users []*adminUser
+		names map[string]bool
+	}
+	references := make(map[string]*accountReference)
+	for _, inbound := range store.Inbounds {
+		if inbound == nil {
+			continue
+		}
+		for _, user := range inbound.Users {
+			if user == nil || user.AccountID == "" {
+				continue
+			}
+			if store.Accounts[user.AccountID] == nil {
+				return E.New("dashboard user references missing account: ", user.AccountID)
+			}
+			reference := references[user.AccountID]
+			if reference == nil {
+				reference = &accountReference{names: make(map[string]bool)}
+				references[user.AccountID] = reference
+			}
+			reference.users = append(reference.users, user)
+			reference.names[user.Name] = true
+		}
+	}
+	for identifier, reference := range references {
+		account := store.Accounts[identifier]
+		if len(reference.names) == 1 {
+			for name := range reference.names {
+				if name == account.Name {
+					break
+				}
+				if existing := byName[name]; existing == nil {
+					delete(byName, account.Name)
+					account.Name = name
+					account.UpdatedAt = now
+					account.Revision = nextAdminRevision(account.Revision, now)
+					byName[name] = account
+				} else {
+					for _, user := range reference.users {
+						user.AccountID = existing.ID
+					}
+				}
+			}
+			continue
+		}
+		for _, user := range reference.users {
+			if user.Name != account.Name {
+				user.AccountID = ""
+			}
+		}
+	}
+
+	used := make(map[string]bool)
+	for _, inbound := range store.Inbounds {
+		if inbound == nil {
+			continue
+		}
+		for _, user := range inbound.Users {
+			if user == nil {
+				continue
+			}
+			if user.AccountID == "" {
+				account := byName[user.Name]
+				if account == nil {
+					identifier, err := newAdminID()
+					if err != nil {
+						return err
+					}
+					createdAt := user.CreatedAt
+					if createdAt == 0 {
+						createdAt = now
+					}
+					account = &adminAccount{
+						ID: identifier, Name: user.Name, PolicyScope: adminAccountPolicyMembership, Enabled: true,
+						Revision: nextAdminRevision(0, now), CreatedAt: createdAt, UpdatedAt: max(user.UpdatedAt, createdAt),
+					}
+					store.Accounts[identifier] = account
+					byName[user.Name] = account
+				}
+				user.AccountID = account.ID
+			}
+			used[user.AccountID] = true
+		}
+	}
+	for identifier := range store.Accounts {
+		if !used[identifier] {
+			delete(store.Accounts, identifier)
 		}
 	}
 	return nil
@@ -560,9 +738,6 @@ func (a *adminAPI) start() error {
 	if a.validationOnly {
 		return nil
 	}
-	if err := a.markServerProfilesApplied(); err != nil {
-		return err
-	}
 	a.startedAt = time.Now()
 	if a.traffic != nil {
 		a.removeTrafficOpenHook = a.traffic.AddOpenHook(a.recordTrafficOpen)
@@ -579,9 +754,13 @@ func (a *adminAPI) start() error {
 	return nil
 }
 
-func (a *adminAPI) markServerProfilesApplied() error {
+func (a *adminAPI) markServerProfilesApplied() (func() error, error) {
+	a.mutation.Lock()
+	defer a.unlockMutation()
 	changed := false
 	a.storeAccess.Lock()
+	previousServers := cloneAdminServerStores(a.store.Servers)
+	previousInbounds := cloneAdminInboundStores(a.store.Inbounds)
 	for tag, profile := range a.store.Servers {
 		expectedRevision, expected := a.serverRevisions[tag]
 		if !expected || expectedRevision != profile.Revision {
@@ -602,10 +781,26 @@ func (a *adminAPI) markServerProfilesApplied() error {
 		}
 	}
 	a.storeAccess.Unlock()
-	if changed {
-		return a.saveStore()
+	if !changed {
+		return nil, nil
 	}
-	return nil
+	if err := a.saveStore(); err != nil {
+		a.restoreAppliedServerProfiles(previousServers, previousInbounds)
+		return nil, err
+	}
+	return func() error {
+		a.mutation.Lock()
+		defer a.unlockMutation()
+		a.restoreAppliedServerProfiles(previousServers, previousInbounds)
+		return a.saveStore()
+	}, nil
+}
+
+func (a *adminAPI) restoreAppliedServerProfiles(servers map[string]*adminServerStore, inbounds map[string]*adminInboundStore) {
+	a.storeAccess.Lock()
+	a.store.Servers = servers
+	a.store.Inbounds = inbounds
+	a.storeAccess.Unlock()
 }
 
 func (a *adminAPI) close() {
@@ -681,23 +876,82 @@ func (a *adminAPI) recordTraffic(metadata *trafficcontrol.TrackerMetadata) {
 }
 
 func (a *adminAPI) applyTrafficEventsLocked(events []adminTrafficEvent) {
+	if len(events) == 0 {
+		return
+	}
 	a.storeAccess.Lock()
+	defer a.storeAccess.Unlock()
+	if len(events) == 1 {
+		a.applyTrafficEventLocked(events[0])
+		return
+	}
+	type trafficEventKey struct {
+		identity   string
+		generation int64
+		byID       bool
+	}
+	aggregated := make(map[string]map[trafficEventKey]adminTrafficEvent)
 	for _, event := range events {
-		record := a.store.Inbounds[event.Inbound]
-		if record != nil {
-			for _, user := range record.Users {
-				matches := (event.UserID != "" && user.ID == event.UserID) || (event.UserID == "" && user.Name == event.User)
-				if matches && user.TrafficGeneration == event.Generation {
-					user.UploadBytes += event.Upload
-					user.DownloadBytes += event.Download
-					user.UpdatedAt = event.UpdatedAt
-					a.dirty.Store(true)
-					break
-				}
+		identity := event.User
+		byID := event.UserID != ""
+		if byID {
+			identity = event.UserID
+		}
+		byIdentity := aggregated[event.Inbound]
+		if byIdentity == nil {
+			byIdentity = make(map[trafficEventKey]adminTrafficEvent)
+			aggregated[event.Inbound] = byIdentity
+		}
+		key := trafficEventKey{identity: identity, generation: event.Generation, byID: byID}
+		current := byIdentity[key]
+		current.Inbound = event.Inbound
+		current.User = event.User
+		current.UserID = event.UserID
+		current.Generation = event.Generation
+		current.Upload = saturatingAdminTrafficAdd(current.Upload, event.Upload)
+		current.Download = saturatingAdminTrafficAdd(current.Download, event.Download)
+		current.UpdatedAt = max(current.UpdatedAt, event.UpdatedAt)
+		byIdentity[key] = current
+	}
+	for inbound, byIdentity := range aggregated {
+		record := a.store.Inbounds[inbound]
+		if record == nil {
+			continue
+		}
+		for _, user := range record.Users {
+			if event, exists := byIdentity[trafficEventKey{identity: user.ID, generation: user.TrafficGeneration, byID: true}]; exists {
+				a.applyTrafficToUserLocked(user, event)
+			}
+			if event, exists := byIdentity[trafficEventKey{identity: user.Name, generation: user.TrafficGeneration}]; exists {
+				a.applyTrafficToUserLocked(user, event)
 			}
 		}
 	}
-	a.storeAccess.Unlock()
+}
+
+func (a *adminAPI) applyTrafficEventLocked(event adminTrafficEvent) {
+	record := a.store.Inbounds[event.Inbound]
+	if record == nil {
+		return
+	}
+	for _, user := range record.Users {
+		matches := (event.UserID != "" && user.ID == event.UserID) || (event.UserID == "" && user.Name == event.User)
+		if matches && user.TrafficGeneration == event.Generation {
+			a.applyTrafficToUserLocked(user, event)
+			return
+		}
+	}
+}
+
+func (a *adminAPI) applyTrafficToUserLocked(user *adminUser, event adminTrafficEvent) {
+	user.UploadBytes = saturatingAdminTrafficAdd(user.UploadBytes, event.Upload)
+	user.DownloadBytes = saturatingAdminTrafficAdd(user.DownloadBytes, event.Download)
+	user.UpdatedAt = event.UpdatedAt
+	if account := a.store.Accounts[user.AccountID]; account != nil && account.PolicyScope == adminAccountPolicyGlobal && event.UpdatedAt > account.LastOnline {
+		account.LastOnline = event.UpdatedAt
+		account.UpdatedAt = event.UpdatedAt
+	}
+	a.dirty.Store(true)
 }
 
 func (a *adminAPI) managedUserIdentity(tag string, name string) (string, int64) {
@@ -736,60 +990,173 @@ func (a *adminAPI) unlockMutation() {
 }
 
 func (a *adminAPI) maintenanceLoop() {
-	ticker := time.NewTicker(2 * time.Second)
-	defer ticker.Stop()
+	maintenanceTicker := time.NewTicker(adminMaintenanceInterval)
+	checkpointTicker := time.NewTicker(adminTrafficCheckpointInterval)
+	defer maintenanceTicker.Stop()
+	defer checkpointTicker.Stop()
 	for {
 		select {
 		case <-a.runCtx.Done():
 			return
-		case <-ticker.C:
+		case <-checkpointTicker.C:
+			a.checkpointTraffic()
+			continue
+		case <-maintenanceTicker.C:
 		}
 		a.flushPendingTraffic()
+		if err := a.renewExpiredAccounts(time.Now().UnixMilli()); err != nil {
+			a.logger.Error("dashboard: renew accounts: ", err)
+		}
 		if err := a.reconcile(); err != nil {
 			a.logger.Error("dashboard: reconcile users: ", err)
-		}
-		if a.dirty.Swap(false) {
-			if err := a.saveStore(); err != nil {
-				a.logger.Error("dashboard: save data: ", err)
-				a.dirty.Store(true)
-			}
 		}
 	}
 }
 
+func (a *adminAPI) checkpointTraffic() {
+	a.flushPendingTraffic()
+	if !a.dirty.Swap(false) {
+		return
+	}
+	if err := a.saveTrafficStore(); err != nil {
+		a.logger.Error("dashboard: save data: ", err)
+		a.dirty.Store(true)
+	}
+}
+
+func (a *adminAPI) renewExpiredAccounts(now int64) error {
+	a.mutation.Lock()
+	defer a.unlockMutation()
+	a.flushPendingTrafficLocked()
+
+	a.storeAccess.Lock()
+	accountIDs := make(map[string]bool)
+	previousAccounts := cloneAdminAccounts(a.store.Accounts)
+	for identifier, account := range a.store.Accounts {
+		if account == nil || account.PolicyScope != adminAccountPolicyGlobal || account.ResetDays <= 0 || account.ExpiresAt <= 0 || account.ExpiresAt > now {
+			continue
+		}
+		period := int64(account.ResetDays) * adminDayMilliseconds
+		steps := (now-account.ExpiresAt)/period + 1
+		if steps > (math.MaxInt64-account.ExpiresAt)/period {
+			a.store.Accounts = previousAccounts
+			a.storeAccess.Unlock()
+			return E.New("account renewal expiry overflow: ", identifier)
+		}
+		account.ExpiresAt += steps * period
+		account.Enabled = true
+		account.BaseUploadBytes = 0
+		account.BaseDownloadBytes = 0
+		account.Revision = nextAdminRevision(account.Revision, now)
+		account.UpdatedAt = now
+		accountIDs[identifier] = true
+	}
+	if len(accountIDs) == 0 {
+		a.storeAccess.Unlock()
+		return nil
+	}
+
+	previous := make(map[string]*adminInboundStore)
+	baselines := make(map[string][]string)
+	for tag, record := range a.store.Inbounds {
+		updated := cloneInboundStore(record)
+		changed := false
+		for _, user := range updated.Users {
+			if !accountIDs[user.AccountID] {
+				continue
+			}
+			user.UploadBytes = 0
+			user.DownloadBytes = 0
+			user.TrafficGeneration++
+			user.UpdatedAt = now
+			baselines[tag] = append(baselines[tag], user.Name)
+			changed = true
+		}
+		if changed {
+			previous[tag] = cloneInboundStore(record)
+			updated.Revision = nextAdminRevision(updated.Revision, now)
+			a.store.Inbounds[tag] = updated
+		}
+	}
+	tags := make([]string, 0, len(previous))
+	for tag := range previous {
+		tags = append(tags, tag)
+	}
+	sort.Strings(tags)
+	a.storeAccess.Unlock()
+
+	a.trafficAccess.Lock()
+	previousTrafficBaselines := maps.Clone(a.trafficBaselines)
+	for tag, names := range baselines {
+		for _, name := range names {
+			a.baselineUserTrafficLocked(tag, name, false)
+		}
+	}
+	a.trafficAccess.Unlock()
+	if err := a.commitInboundBatch(tags, previous); err != nil {
+		a.storeAccess.Lock()
+		a.store.Accounts = previousAccounts
+		a.storeAccess.Unlock()
+		a.trafficAccess.Lock()
+		a.trafficBaselines = previousTrafficBaselines
+		a.trafficAccess.Unlock()
+		var restoreErr error
+		for _, tag := range tags {
+			restoreErr = errors.Join(restoreErr, a.applyInbound(tag, true))
+		}
+		restoreErr = errors.Join(restoreErr, a.saveStore())
+		return errors.Join(err, restoreErr)
+	}
+	return nil
+}
+
 func (a *adminAPI) reconcile() error {
-	if err := a.applyAll(false); err != nil {
+	now := time.Now().UnixMilli()
+	usage := a.activeUsage()
+	a.storeAccess.RLock()
+	accountUsage := a.accountUsageLocked(usage)
+	a.storeAccess.RUnlock()
+	if err := a.applyAllWithUsage(false, now, usage, accountUsage); err != nil {
 		return err
 	}
 	if a.traffic == nil {
 		return nil
 	}
-	now := time.Now().UnixMilli()
-	usage := a.activeUsage()
-	for _, metadata := range a.traffic.Connections() {
+	connections := a.traffic.Connections()
+	a.trafficAccess.Lock()
+	baselines := make(map[uuid.UUID]adminTrafficBaseline, len(connections))
+	for _, metadata := range connections {
+		baselines[metadata.ID] = a.trafficBaselines[metadata.ID]
+	}
+	a.trafficAccess.Unlock()
+	toClose := make([]uuid.UUID, 0)
+	a.storeAccess.RLock()
+	for _, metadata := range connections {
 		if metadata.Metadata.User == "" {
 			continue
 		}
-		a.trafficAccess.Lock()
-		baseline := a.trafficBaselines[metadata.ID]
-		a.trafficAccess.Unlock()
-		a.storeAccess.RLock()
 		sourceIP := ""
 		if metadata.Metadata.Source.Addr.IsValid() {
 			sourceIP = metadata.Metadata.Source.Addr.String()
 		}
-		allowed := a.userConnectionAllowedLocked(metadata.Metadata.Inbound, metadata.Metadata.User, baseline.UserID, sourceIP, now, usage)
-		a.storeAccess.RUnlock()
-		if !allowed {
-			if connection := a.traffic.Connection(metadata.ID); connection != nil {
-				_ = connection.Close()
-			}
+		if !a.userConnectionAllowedWithAccountsLocked(metadata.Metadata.Inbound, metadata.Metadata.User, baselines[metadata.ID].UserID, sourceIP, now, usage, accountUsage) {
+			toClose = append(toClose, metadata.ID)
+		}
+	}
+	a.storeAccess.RUnlock()
+	for _, identifier := range toClose {
+		if connection := a.traffic.Connection(identifier); connection != nil {
+			_ = connection.Close()
 		}
 	}
 	return nil
 }
 
 func (a *adminAPI) userConnectionAllowedLocked(inboundTag string, userName string, userID string, sourceIP string, now int64, usage map[string]adminUsage) bool {
+	return a.userConnectionAllowedWithAccountsLocked(inboundTag, userName, userID, sourceIP, now, usage, a.accountUsageLocked(usage))
+}
+
+func (a *adminAPI) userConnectionAllowedWithAccountsLocked(inboundTag string, userName string, userID string, sourceIP string, now int64, usage map[string]adminUsage, accountUsage map[string]adminUsage) bool {
 	record := a.store.Inbounds[inboundTag]
 	if record == nil || !record.Authoritative {
 		return true
@@ -797,61 +1164,173 @@ func (a *adminAPI) userConnectionAllowedLocked(inboundTag string, userName strin
 	if userID != "" {
 		for _, user := range record.Users {
 			if user.ID == userID {
-				return adminUserConnectionAllowed(user, sourceIP, now, usage[adminUserKey(inboundTag, user.Name)])
+				return a.adminUserConnectionAllowedLocked(user, sourceIP, now, usage[adminUserKey(inboundTag, user.Name)], accountUsage[user.AccountID])
 			}
 		}
 		return false
 	}
-	return a.userAllowedLocked(inboundTag, userName, sourceIP, now, usage[adminUserKey(inboundTag, userName)])
+	return a.userAllowedLocked(inboundTag, userName, sourceIP, now, usage, accountUsage)
 }
 
-func (a *adminAPI) userAllowedLocked(inboundTag string, userName string, sourceIP string, now int64, usage adminUsage) bool {
+func (a *adminAPI) userAllowedLocked(inboundTag string, userName string, sourceIP string, now int64, usage map[string]adminUsage, accountUsage map[string]adminUsage) bool {
 	record := a.store.Inbounds[inboundTag]
 	if record == nil || !record.Authoritative {
 		return true
 	}
 	for _, user := range record.Users {
 		if user.Name == userName {
-			return adminUserConnectionAllowed(user, sourceIP, now, usage)
+			return a.adminUserConnectionAllowedLocked(user, sourceIP, now, usage[adminUserKey(inboundTag, userName)], accountUsage[user.AccountID])
 		}
 	}
 	return false
+}
+
+func (a *adminAPI) adminUserConnectionAllowedLocked(user *adminUser, sourceIP string, now int64, membershipUsage adminUsage, accountUsage adminUsage) bool {
+	account := a.store.Accounts[user.AccountID]
+	usage := membershipUsage
+	maxIPs := user.MaxIPs
+	if account != nil && account.PolicyScope == adminAccountPolicyGlobal {
+		usage = accountUsage
+		maxIPs = account.MaxIPs
+	}
+	if !adminUserEnabledWithAccount(user, account, now, membershipUsage, accountUsage) {
+		return false
+	}
+	return adminSourceIPAllowed(maxIPs, sourceIP, usage.SourceSince)
 }
 
 func adminUserConnectionAllowed(user *adminUser, sourceIP string, now int64, usage adminUsage) bool {
 	if !adminUserEnabled(user, now, usage) {
 		return false
 	}
-	if user.MaxIPs <= 0 || len(usage.SourceSince) <= user.MaxIPs {
+	return adminSourceIPAllowed(user.MaxIPs, sourceIP, usage.SourceSince)
+}
+
+func adminSourceIPAllowed(maxIPs int, sourceIP string, sourceSince map[string]int64) bool {
+	if maxIPs <= 0 || len(sourceSince) <= maxIPs {
 		return true
 	}
-	connectedAt, exists := usage.SourceSince[sourceIP]
+	connectedAt, exists := sourceSince[sourceIP]
 	if !exists {
 		return false
 	}
 	rank := 0
-	for otherIP, otherConnectedAt := range usage.SourceSince {
+	for otherIP, otherConnectedAt := range sourceSince {
 		if otherConnectedAt < connectedAt || otherConnectedAt == connectedAt && otherIP < sourceIP {
 			rank++
 		}
 	}
-	return rank < user.MaxIPs
+	return rank < maxIPs
 }
 
 func adminUserEnabled(user *adminUser, now int64, active adminUsage) bool {
 	if !user.Enabled || user.ExpiresAt > 0 && user.ExpiresAt <= now {
 		return false
 	}
-	used := user.UploadBytes + user.DownloadBytes + active.Upload + active.Download
+	used := saturatingAdminTrafficAdd(user.UploadBytes, user.DownloadBytes, active.Upload, active.Download)
 	return user.QuotaBytes <= 0 || used < user.QuotaBytes
 }
 
+func adminUserEnabledWithAccount(user *adminUser, account *adminAccount, now int64, membershipUsage adminUsage, accountUsage adminUsage) bool {
+	if account == nil || account.PolicyScope != adminAccountPolicyGlobal {
+		return adminUserEnabled(user, now, membershipUsage)
+	}
+	if !user.Enabled || !account.Enabled || account.ExpiresAt > 0 && account.ExpiresAt <= now {
+		return false
+	}
+	used := saturatingAdminTrafficAdd(accountUsage.Upload, accountUsage.Download)
+	return account.QuotaBytes <= 0 || used < account.QuotaBytes
+}
+
+func (a *adminAPI) accountUsageLocked(active map[string]adminUsage) map[string]adminUsage {
+	return a.aggregateAccountUsageLocked(active, false)
+}
+
+func (a *adminAPI) allAccountUsageLocked(active map[string]adminUsage) map[string]adminUsage {
+	return a.aggregateAccountUsageLocked(active, true)
+}
+
+func (a *adminAPI) aggregateAccountUsageLocked(active map[string]adminUsage, includeMembership bool) map[string]adminUsage {
+	var result map[string]adminUsage
+	if includeMembership {
+		result = make(map[string]adminUsage, len(a.store.Accounts))
+	}
+	for identifier, account := range a.store.Accounts {
+		if account == nil || !includeMembership && account.PolicyScope != adminAccountPolicyGlobal {
+			continue
+		}
+		usage := adminUsage{}
+		if account.PolicyScope == adminAccountPolicyGlobal {
+			usage.Upload = account.BaseUploadBytes
+			usage.Download = account.BaseDownloadBytes
+		}
+		if result == nil {
+			result = make(map[string]adminUsage)
+		}
+		result[identifier] = usage
+	}
+	if len(result) == 0 {
+		return result
+	}
+	for tag, inbound := range a.store.Inbounds {
+		if inbound == nil {
+			continue
+		}
+		for _, user := range inbound.Users {
+			if user == nil {
+				continue
+			}
+			usage, exists := result[user.AccountID]
+			if !exists {
+				continue
+			}
+			membershipUsage := active[adminUserKey(tag, user.Name)]
+			usage.Upload = saturatingAdminTrafficAdd(usage.Upload, user.UploadBytes, membershipUsage.Upload)
+			usage.Download = saturatingAdminTrafficAdd(usage.Download, user.DownloadBytes, membershipUsage.Download)
+			usage.Connections += membershipUsage.Connections
+			for address, since := range membershipUsage.SourceSince {
+				if usage.SourceSince == nil {
+					usage.SourceSince = make(map[string]int64)
+				}
+				if previous, found := usage.SourceSince[address]; !found || since < previous {
+					usage.SourceSince[address] = since
+				}
+			}
+			result[user.AccountID] = usage
+		}
+	}
+	return result
+}
+
+func saturatingAdminTrafficAdd(values ...int64) int64 {
+	var result int64
+	for _, value := range values {
+		if value <= 0 {
+			continue
+		}
+		if value > math.MaxInt64-result {
+			return math.MaxInt64
+		}
+		result += value
+	}
+	return result
+}
+
 func (a *adminAPI) applyAll(force bool) error {
+	active := a.activeUsage()
+	now := time.Now().UnixMilli()
+	a.storeAccess.RLock()
+	accountUsage := a.accountUsageLocked(active)
+	a.storeAccess.RUnlock()
+	return a.applyAllWithUsage(force, now, active, accountUsage)
+}
+
+func (a *adminAPI) applyAllWithUsage(force bool, now int64, active map[string]adminUsage, accountUsage map[string]adminUsage) error {
 	for tag, runtimeInbound := range a.runtimes {
 		if runtimeInbound.Manager == nil {
 			continue
 		}
-		if err := a.applyInbound(tag, force); err != nil {
+		if err := a.applyInboundWithUsage(tag, force, now, active, accountUsage); err != nil {
 			return E.Cause(err, "update inbound ", tag)
 		}
 	}
@@ -859,6 +1338,15 @@ func (a *adminAPI) applyAll(force bool) error {
 }
 
 func (a *adminAPI) applyInbound(tag string, force bool) error {
+	active := a.activeUsage()
+	now := time.Now().UnixMilli()
+	a.storeAccess.RLock()
+	accountUsage := a.accountUsageLocked(active)
+	a.storeAccess.RUnlock()
+	return a.applyInboundWithUsage(tag, force, now, active, accountUsage)
+}
+
+func (a *adminAPI) applyInboundWithUsage(tag string, force bool, now int64, active map[string]adminUsage, accountUsage map[string]adminUsage) error {
 	runtimeInbound := a.runtimes[tag]
 	if runtimeInbound == nil || runtimeInbound.Manager == nil {
 		return os.ErrNotExist
@@ -866,8 +1354,6 @@ func (a *adminAPI) applyInbound(tag string, force bool) error {
 	manager := runtimeInbound.Manager
 	manager.applyAccess.Lock()
 	defer manager.applyAccess.Unlock()
-	active := a.activeUsage()
-	now := time.Now().UnixMilli()
 	a.storeAccess.RLock()
 	record := a.store.Inbounds[tag]
 	if record == nil {
@@ -877,7 +1363,8 @@ func (a *adminAPI) applyInbound(tag string, force bool) error {
 	revision := record.Revision
 	users := make([]adapter.ManagedUser, 0, len(record.Users))
 	for _, user := range record.Users {
-		if adminUserEnabled(user, now, active[adminUserKey(tag, user.Name)]) {
+		membershipUsage := active[adminUserKey(tag, user.Name)]
+		if adminUserEnabledWithAccount(user, a.store.Accounts[user.AccountID], now, membershipUsage, accountUsage[user.AccountID]) {
 			users = append(users, adapter.ManagedUser{
 				Name:     user.Name,
 				UUID:     user.UUID,
@@ -929,20 +1416,51 @@ func (a *adminAPI) activeUsage() map[string]adminUsage {
 	if a.traffic == nil {
 		return result
 	}
+	connections := a.traffic.Connections()
+	var identities map[string]adminManagedUserIdentity
+	var names map[string]string
+	if len(connections) > 16 {
+		identities = make(map[string]adminManagedUserIdentity)
+		names = make(map[string]string)
+		a.storeAccess.RLock()
+		for tag, inbound := range a.store.Inbounds {
+			if inbound == nil {
+				continue
+			}
+			for _, user := range inbound.Users {
+				if user == nil {
+					continue
+				}
+				identities[adminUserKey(tag, user.Name)] = adminManagedUserIdentity{ID: user.ID, Generation: user.TrafficGeneration}
+				names[adminUserKey(tag, user.ID)] = user.Name
+			}
+		}
+		a.storeAccess.RUnlock()
+	}
 	a.trafficAccess.Lock()
 	defer a.trafficAccess.Unlock()
-	for _, metadata := range a.traffic.Connections() {
+	for _, metadata := range connections {
 		if metadata.Metadata.User == "" {
 			continue
 		}
 		baseline := a.trafficBaselines[metadata.ID]
 		if baseline.UserID == "" {
-			baseline.UserID, baseline.Generation = a.managedUserIdentity(metadata.Metadata.Inbound, metadata.Metadata.User)
+			if identities != nil {
+				identity := identities[adminUserKey(metadata.Metadata.Inbound, metadata.Metadata.User)]
+				baseline.UserID, baseline.Generation = identity.ID, identity.Generation
+			} else {
+				baseline.UserID, baseline.Generation = a.managedUserIdentity(metadata.Metadata.Inbound, metadata.Metadata.User)
+			}
 			a.trafficBaselines[metadata.ID] = baseline
 		}
 		accountingName := metadata.Metadata.User
 		if baseline.UserID != "" {
-			currentName := a.managedUserName(metadata.Metadata.Inbound, baseline.UserID)
+			currentName := ""
+			if names != nil {
+				currentName = names[adminUserKey(metadata.Metadata.Inbound, baseline.UserID)]
+			} else {
+				currentName = a.managedUserName(metadata.Metadata.Inbound, baseline.UserID)
+			}
 			if currentName == "" {
 				continue
 			}
@@ -950,8 +1468,8 @@ func (a *adminAPI) activeUsage() map[string]adminUsage {
 		}
 		key := adminUserKey(metadata.Metadata.Inbound, accountingName)
 		usage := result[key]
-		usage.Upload += max(metadata.Upload.Load()-baseline.Upload, 0)
-		usage.Download += max(metadata.Download.Load()-baseline.Download, 0)
+		usage.Upload = saturatingAdminTrafficAdd(usage.Upload, max(metadata.Upload.Load()-baseline.Upload, 0))
+		usage.Download = saturatingAdminTrafficAdd(usage.Download, max(metadata.Download.Load()-baseline.Download, 0))
 		usage.Connections++
 		sourceIP := ""
 		if metadata.Metadata.Source.Addr.IsValid() {
@@ -1024,8 +1542,8 @@ func (a *adminAPI) baselineUserTrafficForIdentityLocked(tag string, userName str
 	if record := a.store.Inbounds[tag]; record != nil {
 		for _, user := range record.Users {
 			if user.Name == userName {
-				user.UploadBytes += settledUpload
-				user.DownloadBytes += settledDownload
+				user.UploadBytes = saturatingAdminTrafficAdd(user.UploadBytes, settledUpload)
+				user.DownloadBytes = saturatingAdminTrafficAdd(user.DownloadBytes, settledDownload)
 				user.UpdatedAt = time.Now().UnixMilli()
 				break
 			}
@@ -1068,8 +1586,8 @@ func (a *adminAPI) snapshotActiveTraffic() {
 		for _, user := range record.Users {
 			matches := (baseline.UserID != "" && user.ID == baseline.UserID) || (baseline.UserID == "" && user.Name == userName)
 			if matches && user.TrafficGeneration == baseline.Generation {
-				user.UploadBytes += upload
-				user.DownloadBytes += download
+				user.UploadBytes = saturatingAdminTrafficAdd(user.UploadBytes, upload)
+				user.DownloadBytes = saturatingAdminTrafficAdd(user.DownloadBytes, download)
 				user.UpdatedAt = time.Now().UnixMilli()
 				break
 			}
@@ -1091,6 +1609,7 @@ func (a *adminAPI) buildRouter() http.Handler {
 		router.Use(a.authenticate)
 		router.Get(adminRoutePrefix+"/settings", a.getSettings)
 		router.Put(adminRoutePrefix+"/settings", a.updateSettings)
+		a.register3XUIImportRoutes(router)
 		router.Get(adminRoutePrefix+"/overview", a.getOverview)
 		router.Get(adminRoutePrefix+"/protocols", a.listProtocols)
 		router.Get(adminRoutePrefix+"/servers", a.listServers)
@@ -1200,27 +1719,54 @@ func requestFromLoopback(request *http.Request) bool {
 	return address != nil && address.IsLoopback()
 }
 
-func (a *adminAPI) getOverview(writer http.ResponseWriter, request *http.Request) {
+func (a *adminAPI) getOverview(writer http.ResponseWriter, _ *http.Request) {
 	now := time.Now()
+	a.overviewAccess.Lock()
+	content := a.overviewContent
+	if len(content) == 0 || !now.Before(a.overviewExpires) {
+		var err error
+		content, err = json.Marshal(a.buildOverview(now))
+		if err != nil {
+			a.overviewAccess.Unlock()
+			writeAdminError(writer, http.StatusInternalServerError, "無法建立 Core 狀態")
+			return
+		}
+		content = append(content, '\n')
+		a.overviewContent = content
+		a.overviewExpires = now.Add(adminOverviewCacheDuration)
+	}
+	a.overviewAccess.Unlock()
+	writeAdminJSONContent(writer, http.StatusOK, content)
+}
+
+func (a *adminAPI) buildOverview(now time.Time) map[string]any {
+	nowMilliseconds := now.UnixMilli()
 	active := a.activeUsage()
-	summaries := a.inboundSummaries(now.UnixMilli(), active)
 	var memory runtime.MemStats
 	runtime.ReadMemStats(&memory)
 	var totalUsers, enabledUsers, disabledUsers, expiredUsers int
 	a.storeAccess.RLock()
+	accountUsage := a.accountUsageLocked(active)
+	summaries := a.inboundSummariesLocked(nowMilliseconds, active, accountUsage)
 	for tag, record := range a.store.Inbounds {
 		if a.runtimes[tag] == nil || a.runtimes[tag].Manager == nil {
 			continue
 		}
 		for _, user := range record.Users {
 			totalUsers++
-			if !user.Enabled {
+			account := a.store.Accounts[user.AccountID]
+			if !user.Enabled || account != nil && account.PolicyScope == adminAccountPolicyGlobal && !account.Enabled {
 				disabledUsers++
 			}
-			if user.ExpiresAt > 0 && user.ExpiresAt <= now.UnixMilli() {
+			expiresAt := user.ExpiresAt
+			if account != nil && account.PolicyScope == adminAccountPolicyGlobal {
+				expiresAt = account.ExpiresAt
+			}
+			if expiresAt > 0 && expiresAt <= nowMilliseconds {
 				expiredUsers++
 			}
-			if adminUserEnabled(user, now.UnixMilli(), active[adminUserKey(tag, user.Name)]) {
+			membershipUsage := active[adminUserKey(tag, user.Name)]
+			if adminUserEnabledWithAccount(user, account, nowMilliseconds, membershipUsage, accountUsage[user.AccountID]) {
 				enabledUsers++
 			}
 		}
@@ -1236,7 +1782,7 @@ func (a *adminAPI) getOverview(writer http.ResponseWriter, request *http.Request
 	if !a.startedAt.IsZero() {
 		uptime = now.Sub(a.startedAt)
 	}
-	writeAdminJSON(writer, http.StatusOK, map[string]any{
+	return map[string]any{
 		"version":        C.Version,
 		"api_version":    daemon.APIVersion,
 		"status":         "running",
@@ -1262,13 +1808,14 @@ func (a *adminAPI) getOverview(writer http.ResponseWriter, request *http.Request
 		},
 		"authentication_enabled": a.secret != "",
 		"inbounds":               summaries,
-	})
+		"features": map[string]bool{
+			"three_x_ui_import": admin3XUIImportAvailable,
+		},
+	}
 }
 
-func (a *adminAPI) inboundSummaries(now int64, active map[string]adminUsage) []adminInboundSummary {
+func (a *adminAPI) inboundSummariesLocked(now int64, active map[string]adminUsage, accountUsage map[string]adminUsage) []adminInboundSummary {
 	summaries := make([]adminInboundSummary, 0, len(a.inbounds))
-	a.storeAccess.RLock()
-	defer a.storeAccess.RUnlock()
 	for _, runtimeInbound := range a.inbounds {
 		summary := adminInboundSummary{Tag: runtimeInbound.Tag, Type: runtimeInbound.Type}
 		if runtimeInbound.Manager != nil {
@@ -1286,7 +1833,8 @@ func (a *adminAPI) inboundSummaries(now int64, active map[string]adminUsage) []a
 				summary.AppliedRevision = record.AppliedRevision
 				summary.Pending = record.Revision != record.AppliedRevision
 				for _, user := range record.Users {
-					if adminUserEnabled(user, now, active[adminUserKey(runtimeInbound.Tag, user.Name)]) {
+					membershipUsage := active[adminUserKey(runtimeInbound.Tag, user.Name)]
+					if adminUserEnabledWithAccount(user, a.store.Accounts[user.AccountID], now, membershipUsage, accountUsage[user.AccountID]) {
 						summary.EnabledUserCount++
 					}
 				}
@@ -1300,8 +1848,10 @@ func (a *adminAPI) inboundSummaries(now int64, active map[string]adminUsage) []a
 func (a *adminAPI) listUsers(writer http.ResponseWriter, request *http.Request) {
 	filterInbound := request.URL.Query().Get("inbound")
 	active := a.activeUsage()
+	now := time.Now().UnixMilli()
 	views := make([]adminUserView, 0)
 	a.storeAccess.RLock()
+	accountUsage := a.allAccountUsageLocked(active)
 	for tag, record := range a.store.Inbounds {
 		if filterInbound != "" && tag != filterInbound {
 			continue
@@ -1314,6 +1864,8 @@ func (a *adminAPI) listUsers(writer http.ResponseWriter, request *http.Request) 
 			views = append(views, makeAdminUserView(user, record, usage, false))
 		}
 	}
+	accounts := a.accountViewsLocked(accountUsage)
+	summaries := a.inboundSummariesLocked(now, active, accountUsage)
 	a.storeAccess.RUnlock()
 	sort.Slice(views, func(i, j int) bool {
 		if views[i].Name == views[j].Name {
@@ -1323,8 +1875,45 @@ func (a *adminAPI) listUsers(writer http.ResponseWriter, request *http.Request) 
 	})
 	writeAdminJSON(writer, http.StatusOK, map[string]any{
 		"users":    views,
-		"inbounds": a.inboundSummaries(time.Now().UnixMilli(), active),
+		"accounts": accounts,
+		"inbounds": summaries,
 	})
+}
+
+func (a *adminAPI) accountViews(active map[string]adminUsage, accountUsage map[string]adminUsage) []adminAccountView {
+	a.storeAccess.RLock()
+	defer a.storeAccess.RUnlock()
+	if len(accountUsage) < len(a.store.Accounts) {
+		accountUsage = a.allAccountUsageLocked(active)
+	}
+	return a.accountViewsLocked(accountUsage)
+}
+
+func (a *adminAPI) accountViewsLocked(accountUsage map[string]adminUsage) []adminAccountView {
+	views := make([]adminAccountView, 0, len(a.store.Accounts))
+	for _, account := range a.store.Accounts {
+		if account == nil {
+			continue
+		}
+		usage := accountUsage[account.ID]
+		views = append(views, makeAdminAccountView(account, usage))
+	}
+	sort.Slice(views, func(left, right int) bool {
+		return strings.ToLower(views[left].Name) < strings.ToLower(views[right].Name)
+	})
+	return views
+}
+
+func makeAdminAccountView(account *adminAccount, usage adminUsage) adminAccountView {
+	view := adminAccountView{adminAccount: *account, UploadBytes: usage.Upload, DownloadBytes: usage.Download, ActiveConnections: usage.Connections}
+	if len(usage.SourceSince) > 0 {
+		view.OnlineIPs = make([]adminOnlineIP, 0, len(usage.SourceSince))
+		for address, since := range usage.SourceSince {
+			view.OnlineIPs = append(view.OnlineIPs, adminOnlineIP{Address: address, Since: since})
+		}
+		sort.Slice(view.OnlineIPs, func(left, right int) bool { return view.OnlineIPs[left].Address < view.OnlineIPs[right].Address })
+	}
+	return view
 }
 
 func (a *adminAPI) getUser(writer http.ResponseWriter, request *http.Request) {
@@ -1339,11 +1928,7 @@ func (a *adminAPI) getUser(writer http.ResponseWriter, request *http.Request) {
 		for _, user := range record.Users {
 			if user.ID == id {
 				view := makeAdminUserView(user, record, active[adminUserKey(tag, user.Name)], true)
-				if externalID := a.store.ExternalSubscriptions[user.Name]; validExternalSubscriptionID(externalID) && a.publicBaseURL != "" {
-					view.SubscriptionURL = a.publicBaseURL + "/sub/" + url.PathEscape(externalID)
-				} else if token := a.store.Subscriptions[user.Name]; token != "" && a.publicBaseURL != "" && len(a.subscriptionLinksLocked(user.Name, time.Now().UnixMilli(), active)) > 0 {
-					view.SubscriptionURL = a.publicBaseURL + a.subscriptionPathLocked() + token
-				}
+				view.SubscriptionURL = a.subscriptionURLLocked(user.Name, active)
 				writeAdminJSON(writer, http.StatusOK, view)
 				return
 			}
@@ -1358,13 +1943,16 @@ func makeAdminUserView(user *adminUser, record *adminInboundStore, usage adminUs
 		copyUser.UUID = ""
 		copyUser.Password = ""
 	}
-	copyUser.UploadBytes += usage.Upload
-	copyUser.DownloadBytes += usage.Download
-	onlineIPs := make([]adminOnlineIP, 0, len(usage.SourceSince))
-	for address, since := range usage.SourceSince {
-		onlineIPs = append(onlineIPs, adminOnlineIP{Address: address, Since: since})
+	copyUser.UploadBytes = saturatingAdminTrafficAdd(copyUser.UploadBytes, usage.Upload)
+	copyUser.DownloadBytes = saturatingAdminTrafficAdd(copyUser.DownloadBytes, usage.Download)
+	var onlineIPs []adminOnlineIP
+	if len(usage.SourceSince) > 0 {
+		onlineIPs = make([]adminOnlineIP, 0, len(usage.SourceSince))
+		for address, since := range usage.SourceSince {
+			onlineIPs = append(onlineIPs, adminOnlineIP{Address: address, Since: since})
+		}
+		sort.Slice(onlineIPs, func(i, j int) bool { return onlineIPs[i].Address < onlineIPs[j].Address })
 	}
-	sort.Slice(onlineIPs, func(i, j int) bool { return onlineIPs[i].Address < onlineIPs[j].Address })
 	return adminUserView{
 		adminUser: copyUser, ActiveConnections: usage.Connections,
 		OnlineIPs: onlineIPs,
@@ -1680,20 +2268,33 @@ func requestedAdminRevision(request *http.Request) (int64, error) {
 }
 
 func (a *adminAPI) commitMutation(tag string, previous *adminInboundStore) error {
+	a.storeAccess.RLock()
+	previousAccounts := cloneAdminAccounts(a.store.Accounts)
+	previousSubscriptions := maps.Clone(a.store.Subscriptions)
+	previousExternalSubscriptions := maps.Clone(a.store.ExternalSubscriptions)
+	a.storeAccess.RUnlock()
 	if err := a.applyInbound(tag, true); err != nil {
-		rollbackErr := a.rollbackMutation(tag, previous, false)
+		rollbackErr := a.rollbackMutation(tag, previous, previousAccounts, previousSubscriptions, previousExternalSubscriptions, false)
 		return errors.Join(E.Cause(err, "更新核心用戶失敗"), rollbackErr)
 	}
 	if err := a.saveStore(); err != nil {
-		rollbackErr := a.rollbackMutation(tag, previous, true)
+		rollbackErr := a.rollbackMutation(tag, previous, previousAccounts, previousSubscriptions, previousExternalSubscriptions, true)
 		return errors.Join(E.Cause(err, "儲存用戶資料失敗"), rollbackErr)
+	}
+	// Persistence can reassign accounts after a legacy single-user rename.
+	if err := a.applyInbound(tag, true); err != nil {
+		rollbackErr := a.rollbackMutation(tag, previous, previousAccounts, previousSubscriptions, previousExternalSubscriptions, true)
+		return errors.Join(E.Cause(err, "更新核心帳戶政策失敗"), rollbackErr)
 	}
 	return nil
 }
 
-func (a *adminAPI) rollbackMutation(tag string, previous *adminInboundStore, persist bool) error {
+func (a *adminAPI) rollbackMutation(tag string, previous *adminInboundStore, accounts map[string]*adminAccount, subscriptions map[string]string, externalSubscriptions map[string]string, persist bool) error {
 	a.storeAccess.Lock()
 	a.store.Inbounds[tag] = previous
+	a.store.Accounts = accounts
+	a.store.Subscriptions = subscriptions
+	a.store.ExternalSubscriptions = externalSubscriptions
 	a.storeAccess.Unlock()
 	applyErr := a.applyInbound(tag, true)
 	var saveErr error
@@ -1714,6 +2315,47 @@ func cloneInboundStore(record *adminInboundStore) *adminInboundStore {
 		copyRecord.Users[index] = &copyUser
 	}
 	return &copyRecord
+}
+
+func cloneAdminInboundStores(inbounds map[string]*adminInboundStore) map[string]*adminInboundStore {
+	cloned := make(map[string]*adminInboundStore, len(inbounds))
+	for tag, record := range inbounds {
+		cloned[tag] = cloneInboundStore(record)
+	}
+	return cloned
+}
+
+func cloneAdminServerStores(servers map[string]*adminServerStore) map[string]*adminServerStore {
+	cloned := make(map[string]*adminServerStore, len(servers))
+	for tag, profile := range servers {
+		cloned[tag] = cloneAdminServerStore(profile)
+	}
+	return cloned
+}
+
+func cloneAdminAccounts(accounts map[string]*adminAccount) map[string]*adminAccount {
+	result := make(map[string]*adminAccount, len(accounts))
+	for identifier, account := range accounts {
+		if account == nil {
+			result[identifier] = nil
+			continue
+		}
+		copyAccount := *account
+		result[identifier] = &copyAccount
+	}
+	return result
+}
+
+func cloneAdminStore(store adminStore) adminStore {
+	return adminStore{
+		Version:               store.Version,
+		Accounts:              cloneAdminAccounts(store.Accounts),
+		Inbounds:              cloneAdminInboundStores(store.Inbounds),
+		Servers:               cloneAdminServerStores(store.Servers),
+		Subscriptions:         maps.Clone(store.Subscriptions),
+		ExternalSubscriptions: maps.Clone(store.ExternalSubscriptions),
+		Settings:              store.Settings,
+	}
 }
 
 func (a *adminAPI) findUser(id string) (string, *adminUser) {
@@ -1870,22 +2512,37 @@ func (a *adminAPI) closeAllConnections(writer http.ResponseWriter, request *http
 }
 
 func (a *adminAPI) saveStore() error {
+	return a.saveStoreNormalized(true)
+}
+
+func (a *adminAPI) saveTrafficStore() error {
+	return a.saveStoreNormalized(false)
+}
+
+func (a *adminAPI) saveStoreNormalized(normalize bool) error {
 	if a.validationOnly {
 		return nil
 	}
 	a.saveAccess.Lock()
 	defer a.saveAccess.Unlock()
 	a.storeAccess.Lock()
-	if err := a.ensureSubscriptionTokensLocked(); err != nil {
-		a.storeAccess.Unlock()
-		return err
+	if normalize {
+		if err := ensureAdminAccounts(&a.store, time.Now().UnixMilli()); err != nil {
+			a.storeAccess.Unlock()
+			return err
+		}
+		if err := a.ensureSubscriptionTokensLocked(); err != nil {
+			a.storeAccess.Unlock()
+			return err
+		}
+		if err := a.scrubAuthoritativeProfileUsersLocked(); err != nil {
+			a.storeAccess.Unlock()
+			return err
+		}
 	}
-	if err := a.scrubAuthoritativeProfileUsersLocked(); err != nil {
-		a.storeAccess.Unlock()
-		return err
-	}
-	content, err := json.MarshalIndent(a.store, "", "  ")
+	store := cloneAdminStore(a.store)
 	a.storeAccess.Unlock()
+	content, err := json.MarshalIndent(store, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -1897,31 +2554,53 @@ func (a *adminAPI) saveStore() error {
 	}
 	tempPath := a.dataPath + ".tmp"
 	backupPath := a.dataPath + ".bak"
-	if err = filemanager.WriteFile(a.ctx, tempPath, append(content, '\n'), 0o600); err != nil {
+	if err = filemanager.Remove(a.ctx, tempPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	_ = filemanager.Remove(a.ctx, backupPath)
+	temporary, err := filemanager.OpenFile(a.ctx, tempPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return err
+	}
+	defer filemanager.Remove(a.ctx, tempPath)
+	content = append(content, '\n')
+	if err = temporary.Chmod(0o600); err == nil {
+		_, err = temporary.Write(content)
+	}
+	if err == nil {
+		err = temporary.Sync()
+	}
+	closeErr := temporary.Close()
+	if err != nil || closeErr != nil {
+		return errors.Join(err, closeErr)
+	}
+	if err = secureAdminStateFile(a.ctx, tempPath); err != nil {
+		return err
+	}
+
 	_, statErr := filemanager.Stat(a.ctx, a.dataPath)
 	hasCurrent := statErr == nil
 	if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
-		_ = filemanager.Remove(a.ctx, tempPath)
 		return statErr
 	}
 	if hasCurrent {
+		if err = secureAdminStateFile(a.ctx, a.dataPath); err != nil {
+			return err
+		}
+		if err = filemanager.Remove(a.ctx, backupPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
 		if err = filemanager.Rename(a.ctx, a.dataPath, backupPath); err != nil {
-			_ = filemanager.Remove(a.ctx, tempPath)
 			return err
 		}
 	}
-	if err = filemanager.Rename(a.ctx, tempPath, a.dataPath); err != nil {
+	if err = replaceAdminStateFile(a.ctx, tempPath, a.dataPath); err != nil {
 		if hasCurrent {
-			_ = filemanager.Rename(a.ctx, backupPath, a.dataPath)
+			err = errors.Join(err, replaceAdminStateFile(a.ctx, backupPath, a.dataPath))
 		}
-		_ = filemanager.Remove(a.ctx, tempPath)
 		return err
 	}
-	if hasCurrent {
-		_ = filemanager.Remove(a.ctx, backupPath)
+	if err = syncAdminStateDirectory(a.ctx, parent); err != nil {
+		return E.Cause(err, "sync dashboard data directory")
 	}
 	return nil
 }
@@ -1941,6 +2620,12 @@ func writeAdminJSON(writer http.ResponseWriter, status int, value any) {
 	writer.Header().Set("Content-Type", "application/json; charset=utf-8")
 	writer.WriteHeader(status)
 	_ = json.NewEncoder(writer).Encode(value)
+}
+
+func writeAdminJSONContent(writer http.ResponseWriter, status int, content []byte) {
+	writer.Header().Set("Content-Type", "application/json; charset=utf-8")
+	writer.WriteHeader(status)
+	_, _ = writer.Write(content)
 }
 
 func writeAdminError(writer http.ResponseWriter, status int, message string) {

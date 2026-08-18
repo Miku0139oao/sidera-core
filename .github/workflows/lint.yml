@@ -62,13 +62,10 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: ^1.25
-      - name: Cache go module
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/go/pkg/mod
-          key: go-${{ hashFiles('**/go.sum') }}
+          go-version: 1.26.5
+          cache-dependency-path: |
+            go.sum
+            test/go.sum
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v8
         env:

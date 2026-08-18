@@ -1,12 +1,12 @@
 ---
-description: 欢迎来到该 sing-box 项目的文档页。
+description: Sidera Core 文件。
 ---
 
 # :material-home: 开始
 
-欢迎来到该 sing-box 项目的文档页。
+欢迎阅读 Sidera Core 文件。
 
-通用代理平台。
+独立的代理核心。下方 GPL 声明保留自 sing-box 來源。
 
 ## 授权
 

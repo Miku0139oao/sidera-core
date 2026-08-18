@@ -1,7 +1,10 @@
 package xrayencryption
 
 import (
+	"bytes"
+	"crypto/ecdh"
 	"crypto/mlkem"
+	"crypto/rand"
 	"encoding/base64"
 	"io"
 	"net"
@@ -183,6 +186,119 @@ func TestParseConfigs(t *testing.T) {
 				t.Fatalf("accepted invalid config %q", test.value)
 			}
 		})
+	}
+}
+
+func TestClientEncryptionFromDecryption(t *testing.T) {
+	x25519Private, err := ecdh.X25519().NewPrivateKey(bytes.Repeat([]byte{1}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mlkemPrivate, err := mlkem.GenerateKey768()
+	if err != nil {
+		t.Fatal(err)
+	}
+	x25519ServerKey := base64.RawURLEncoding.EncodeToString(x25519Private.Bytes())
+	x25519ClientKey := base64.RawURLEncoding.EncodeToString(x25519Private.PublicKey().Bytes())
+	mlkemServerKey := base64.RawURLEncoding.EncodeToString(mlkemPrivate.Bytes())
+	mlkemClientKey := base64.RawURLEncoding.EncodeToString(mlkemPrivate.EncapsulationKey().Bytes())
+
+	clientConfig, err := ClientEncryptionFromDecryption(
+		methodName + ".xorpub.120-300s." + testPadding + "." + x25519ServerKey + "." + mlkemServerKey,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := methodName + ".xorpub.0rtt." + testPadding + "." + x25519ClientKey + "." + mlkemClientKey
+	if clientConfig != expected {
+		t.Fatalf("ClientEncryptionFromDecryption() = %q, want %q", clientConfig, expected)
+	}
+
+	clientConfig, err = ClientEncryptionFromDecryption(methodName + ".native.0s." + x25519ServerKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected = methodName + ".native.1rtt." + x25519ClientKey
+	if clientConfig != expected {
+		t.Fatalf("ClientEncryptionFromDecryption() = %q, want %q", clientConfig, expected)
+	}
+
+	clientConfig, err = ClientEncryptionFromDecryption("none")
+	if err != nil || clientConfig != "none" {
+		t.Fatalf("ClientEncryptionFromDecryption(none) = %q, %v", clientConfig, err)
+	}
+	if _, err = ClientEncryptionFromDecryption(""); err == nil {
+		t.Fatal("ClientEncryptionFromDecryption accepted an empty config")
+	}
+}
+
+func TestClientEncryptionFromDecryptionRoundTrip(t *testing.T) {
+	x25519Private, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mlkemPrivate, err := mlkem.GenerateKey768()
+	if err != nil {
+		t.Fatal(err)
+	}
+	x25519Server := base64.RawURLEncoding.EncodeToString(x25519Private.Bytes())
+	mlkemServer := base64.RawURLEncoding.EncodeToString(mlkemPrivate.Bytes())
+
+	cases := []struct {
+		name    string
+		server  string
+		wantRTT string
+	}{
+		{"0s", "0s", "1rtt"},
+		{"0-0s", "0-0s", "1rtt"},
+		{"0-1s", "0-1s", "0rtt"},
+		{"60-61s", "60-61s", "0rtt"},
+	}
+	orders := []struct {
+		name string
+		keys string
+	}{
+		{"mlkem", mlkemServer},
+		{"x25519-mlkem", x25519Server + "." + mlkemServer},
+		{"mlkem-x25519", mlkemServer + "." + x25519Server},
+	}
+	for _, mode := range []string{"native", "xorpub", "random"} {
+		for _, padding := range []string{"", testPadding} {
+			for _, lifetime := range cases {
+				for _, order := range orders {
+					name := mode + "/" + lifetime.name + "/" + order.name
+					if padding != "" {
+						name += "/padding"
+					}
+					t.Run(name, func(t *testing.T) {
+						decryption := methodName + "." + mode + "." + lifetime.server + "."
+						if padding != "" {
+							decryption += padding + "."
+						}
+						decryption += order.keys
+						clientConfig, deriveErr := ClientEncryptionFromDecryption(decryption)
+						if deriveErr != nil {
+							t.Fatal(deriveErr)
+						}
+						if !strings.Contains(clientConfig, "."+lifetime.wantRTT+".") {
+							t.Fatalf("derived %q, want handshake %s", clientConfig, lifetime.wantRTT)
+						}
+						server, parseErr := ParseDecryption(decryption)
+						if parseErr != nil {
+							t.Fatal(parseErr)
+						}
+						defer server.Close()
+						client, parseErr := ParseEncryption(clientConfig)
+						if parseErr != nil {
+							t.Fatal(parseErr)
+						}
+						serverConn, clientConn := handshakePair(t, server, client)
+						exchange(t, clientConn, serverConn, []byte("client to server"))
+						exchange(t, serverConn, clientConn, []byte("server to client"))
+					})
+				}
+			}
+		}
 	}
 }
 

@@ -19,7 +19,7 @@ on:
       - unstable
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}-${{ inputs.build }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
 jobs:
@@ -33,9 +33,12 @@ jobs:
           - windows-latest
           - macos-latest
         go:
-          - ~1.24
-          - ~1.25
+          - 1.24.7
+          - 1.25.7
+          - 1.26.5
     runs-on: ${{ matrix.os }}
+    env:
+      GOTOOLCHAIN: local
     steps:
       - name: Checkout
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
@@ -49,16 +52,143 @@ jobs:
       - name: Set build tags and ldflags
         shell: bash
         run: |
-          echo "BUILD_TAGS=$(cat release/DEFAULT_BUILD_TAGS_OTHERS)" >> "$GITHUB_ENV"
+          echo "BUILD_TAGS=$(cat release/DEFAULT_BUILD_TAGS_OTHERS),with_3xui_import" >> "$GITHUB_ENV"
+          echo "DEFAULT_TAGS=$(cat release/DEFAULT_BUILD_TAGS_OTHERS)" >> "$GITHUB_ENV"
           echo "LDFLAGS_SHARED=$(cat release/LDFLAGS)" >> "$GITHUB_ENV"
+      - name: Compile default profile without 3x-ui
+        shell: bash
+        run: go test -c -o "$RUNNER_TEMP/sidera-default.test" -tags "$DEFAULT_TAGS" -ldflags "$LDFLAGS_SHARED" ./cmd/sidera
+      - name: Compile Windows release profile
+        if: matrix.os == 'windows-latest'
+        shell: bash
+        run: go test -c -o "$RUNNER_TEMP/sidera-windows.test" -tags "$(cat release/DEFAULT_BUILD_TAGS_WINDOWS)" -ldflags "$LDFLAGS_SHARED" ./cmd/sidera
       - name: Test (unix)
         if: matrix.os != 'windows-latest'
         run: go test -v -exec sudo -tags "$BUILD_TAGS" -ldflags "$LDFLAGS_SHARED" ./...
       - name: Test (windows)
         if: matrix.os == 'windows-latest'
         shell: bash
-        run: go test -v -tags "$BUILD_TAGS" -ldflags "$LDFLAGS_SHARED" ./...
+        run: go test -p 1 -v -tags "$BUILD_TAGS" -ldflags "$LDFLAGS_SHARED" ./...
       - name: Compile integration tests
         shell: bash
         working-directory: test
         run: go test -mod=readonly -c -o "$RUNNER_TEMP/sidera-integration.test" -tags "$BUILD_TAGS" -ldflags "$LDFLAGS_SHARED" .
+
+  vet:
+    name: Vet (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+    runs-on: ${{ matrix.os }}
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 1.26.5
+          cache-dependency-path: go.sum
+      - name: Set build flags
+        shell: bash
+        run: |
+          echo "BUILD_TAGS=$(cat release/DEFAULT_BUILD_TAGS_OTHERS),with_3xui_import" >> "$GITHUB_ENV"
+          echo "LDFLAGS_SHARED=$(cat release/LDFLAGS)" >> "$GITHUB_ENV"
+      - name: Verify generated Windows syscall wrappers
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          go generate ./experimental/boxdd
+          git diff --exit-code -- experimental/boxdd/zsyscall_authenticode_windows.go
+      - name: Vet
+        shell: bash
+        run: go vet -tags "$BUILD_TAGS" -ldflags "$LDFLAGS_SHARED" ./...
+
+  race:
+    name: Race detector
+    runs-on: ubuntu-latest
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 1.26.5
+          cache-dependency-path: go.sum
+      - name: Set build flags
+        shell: bash
+        run: |
+          echo "BUILD_TAGS=$(cat release/DEFAULT_BUILD_TAGS_OTHERS),with_3xui_import" >> "$GITHUB_ENV"
+          echo "LDFLAGS_SHARED=$(cat release/LDFLAGS)" >> "$GITHUB_ENV"
+      - name: Test race-sensitive packages
+        run: go test -count=1 -race -tags "$BUILD_TAGS" -ldflags "$LDFLAGS_SHARED" ./adapter/service ./service/api ./cmd/sidera .
+
+  fuzz:
+    name: Fuzz smoke tests
+    runs-on: ubuntu-latest
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 1.26.5
+          cache-dependency-path: go.sum
+      - name: Fuzz QUIC sniffer
+        run: go test ./common/sniff -run '^$' -fuzz '^FuzzSniffQUIC$' -fuzztime=20s
+      - name: Fuzz STUN sniffer
+        run: go test ./common/sniff -run '^$' -fuzz '^FuzzSniffSTUN$' -fuzztime=20s
+
+  benchmark:
+    name: Dashboard benchmark
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 1.26.5
+          cache-dependency-path: go.sum
+      - name: Run repeatable dashboard benchmarks
+        shell: bash
+        run: |
+          set -o pipefail
+          go test ./service/api -run '^TestAdminAccountViewsAllocationBudget$' \
+            -bench '^BenchmarkAdmin(AccountViews|MembershipPolicyUsage)$' \
+            -benchmem -benchtime=1s -count=5 | tee benchmark.txt
+      - name: Upload benchmark result
+        uses: actions/upload-artifact@v4
+        with:
+          name: dashboard-benchmark
+          path: benchmark.txt
+
+  windows-integration:
+    name: Windows privileged integration
+    runs-on: windows-latest
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 1.26.5
+          cache-dependency-path: go.sum
+      - name: Set build flags
+        shell: bash
+        run: |
+          echo "BUILD_TAGS=$(cat release/DEFAULT_BUILD_TAGS_OTHERS),integration" >> "$GITHUB_ENV"
+          echo "LDFLAGS_SHARED=$(cat release/LDFLAGS)" >> "$GITHUB_ENV"
+      - name: Test WinDivert and TLS spoofing
+        shell: bash
+        run: go test -count=1 -v -tags "$BUILD_TAGS" -ldflags "$LDFLAGS_SHARED" ./common/windivert ./common/tlsspoof

@@ -1,4 +1,4 @@
-//go:build linux || darwin || (windows && (amd64 || 386))
+//go:build linux || darwin || (windows && integration && (amd64 || 386))
 
 package tlsspoof
 

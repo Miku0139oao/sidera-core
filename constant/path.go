@@ -7,7 +7,7 @@ import (
 	"github.com/sagernet/sing/common/rw"
 )
 
-const dirName = "sing-box"
+var resourceDirNames = []string{"sidera", "sing-box"}
 
 var resourcePaths []string
 
@@ -17,8 +17,10 @@ func FindPath(name string) (string, bool) {
 		return name, true
 	}
 	for _, dir := range resourcePaths {
-		if path := filepath.Join(dir, dirName, name); rw.IsFile(path) {
-			return path, true
+		for _, folder := range resourceDirNames {
+			if path := filepath.Join(dir, folder, name); rw.IsFile(path) {
+				return path, true
+			}
 		}
 		if path := filepath.Join(dir, name); rw.IsFile(path) {
 			return path, true

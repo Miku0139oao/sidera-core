@@ -18,9 +18,11 @@ else
 fi
 
 _workdir=${SIDERA_WORKDIR:-${workdir:-"/var/lib/sidera"}}
+_runtime_config=${SIDERA_RUNTIME_CONFIG:-"$_workdir/runtime.json"}
 
 command_args="run --disable-color
 	-D $_workdir
+	--runtime-config $_runtime_config
 	$_config_opt"
 
 depend() {
@@ -29,7 +31,7 @@ depend() {
 
 checkconfig() {
 	ebegin "Checking $RC_SVCNAME configuration"
-	sidera check -D "$_workdir" $_config_opt
+	sidera check -D "$_workdir" --runtime-config "$_runtime_config" $_config_opt
 	eend $?
 }
 
