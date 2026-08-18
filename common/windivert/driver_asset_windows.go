@@ -24,7 +24,7 @@ func extractVerified() (string, *os.File, error) {
 	if err != nil {
 		return "", nil, E.Cause(err, "windivert: locate user cache dir")
 	}
-	dir := filepath.Join(base, "sing-box", "windivert", "v"+AssetVersion)
+	dir := filepath.Join(base, "sidera", "windivert", "v"+AssetVersion)
 	err = os.MkdirAll(dir, 0o755)
 	if err != nil {
 		return "", nil, E.Cause(err, "windivert: mkdir ", dir)

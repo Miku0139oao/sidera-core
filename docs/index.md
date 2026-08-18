@@ -1,12 +1,12 @@
 ---
-description: Welcome to the wiki page for the sing-box project.
+description: Documentation for Sidera Core.
 ---
 
 # :material-home: Home
 
-Welcome to the wiki page for the sing-box project.
+Welcome to the Sidera Core documentation.
 
-The universal proxy platform.
+An independent proxy core. The GNU GPL license notice below is preserved from the sing-box heritage.
 
 ## License
 

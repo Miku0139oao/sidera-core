@@ -10,6 +10,9 @@ Sidera Core pins upstream revisions so compatibility targets remain reproducible
 | --- | --- | --- | --- |
 | SagerNet/sing-box | Initial architecture and implementation base | v1.13.14 | `f60f3728ce618d97abb59ead8d7059df984ea1a0` |
 | XTLS/Xray-core | Interoperability reference and selected MPL-2.0 ports | v26.3.27 | `6e3322d219140a025285ded1114fe17a5edb74d8` |
+| sagernet/cronet-go | Naive outbound native library builder | pin in `.github/CRONET_GO_VERSION` | `617d38f41f935b46a68f550d9add2e38abb3f168` |
+
+Naive/musl release jobs clone that Cronet pin and its `naiveproxy` submodule. That is a build dependency, not a parent project. A Sidera-owned mirror can be added later; do not drop naive outbound without a product decision.
 
 ## Porting Rules
 
