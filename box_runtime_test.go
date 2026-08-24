@@ -10,6 +10,7 @@ import (
 
 	box "github.com/Miku0139oao/sidera-core"
 	"github.com/Miku0139oao/sidera-core/adapter"
+	boxInbound "github.com/Miku0139oao/sidera-core/adapter/inbound"
 	boxService "github.com/Miku0139oao/sidera-core/adapter/service"
 	"github.com/Miku0139oao/sidera-core/include"
 	"github.com/Miku0139oao/sidera-core/log"
@@ -41,7 +42,7 @@ func TestRuntimeCommitIsSkippedWhenSnapshotFails(t *testing.T) {
 	require.Equal(t, []string{"started", "validate", "snapshot"}, events)
 }
 
-func TestConcurrentCloseWaitsForOwnerAndDoesNotPanic(t *testing.T) {
+func TestConcurrentCloseReturnsWithoutWaitingForOwner(t *testing.T) {
 	startedClose := make(chan struct{})
 	releaseClose := make(chan struct{})
 	registry := boxService.NewRegistry()
@@ -73,15 +74,15 @@ func TestConcurrentCloseWaitsForOwnerAndDoesNotPanic(t *testing.T) {
 	go func() { secondResult <- instance.Close() }()
 	select {
 	case err := <-secondResult:
-		t.Fatalf("second close returned before teardown completed: %v", err)
-	case <-time.After(50 * time.Millisecond):
+		require.ErrorIs(t, err, os.ErrClosed)
+	case <-time.After(time.Second):
+		t.Fatal("second close waited for the teardown owner")
 	}
 	close(releaseClose)
 	require.NoError(t, <-firstResult)
-	require.ErrorIs(t, <-secondResult, os.ErrClosed)
 }
 
-func TestCloseReentryDoesNotDeadlock(t *testing.T) {
+func TestAsyncCloseReentryDoesNotDeadlock(t *testing.T) {
 	registry := boxService.NewRegistry()
 	var reentrant *reentrantCloseTestService
 	boxService.Register[option.StubOptions](registry, "reentrant-close-test", func(ctx context.Context, logger log.ContextLogger, tag string, options option.StubOptions) (adapter.Service, error) {
@@ -110,6 +111,77 @@ func TestCloseReentryDoesNotDeadlock(t *testing.T) {
 		t.Fatal("reentrant Close deadlocked")
 	}
 	require.ErrorIs(t, <-reentrant.result, os.ErrClosed)
+}
+
+func TestLateConstructorFailureClosesPreviouslyCreatedChild(t *testing.T) {
+	expected := errors.New("late constructor failure")
+	closed := make(chan struct{})
+	registry := boxService.NewRegistry()
+	boxService.Register[option.StubOptions](registry, "constructor-cleanup-test", func(context.Context, log.ContextLogger, string, option.StubOptions) (adapter.Service, error) {
+		return &closeTrackingTestService{
+			Adapter: boxService.NewAdapter("constructor-cleanup-test", "first"),
+			closed:  closed,
+		}, nil
+	})
+	boxService.Register[option.StubOptions](registry, "constructor-failure-test", func(context.Context, log.ContextLogger, string, option.StubOptions) (adapter.Service, error) {
+		return nil, expected
+	})
+	ctx := include.Context(context.Background())
+	ctx = service.ContextWith[adapter.ServiceRegistry](ctx, registry)
+	ctx = service.ContextWith[option.ServiceOptionsRegistry](ctx, registry)
+	instance, err := box.New(box.Options{
+		Context: ctx,
+		Options: option.Options{Services: []option.Service{
+			{Type: "constructor-cleanup-test", Tag: "first", Options: &option.StubOptions{}},
+			{Type: "constructor-failure-test", Tag: "second", Options: &option.StubOptions{}},
+		}},
+	})
+	require.Nil(t, instance)
+	require.ErrorIs(t, err, expected)
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("previously constructed service was not closed")
+	}
+}
+
+func TestChildClosePanicStillClosesLaterBoxChildren(t *testing.T) {
+	serviceRegistry := boxService.NewRegistry()
+	boxService.Register[option.StubOptions](serviceRegistry, "panic-close-test", func(ctx context.Context, logger log.ContextLogger, tag string, options option.StubOptions) (adapter.Service, error) {
+		return &panicCloseTestService{Adapter: boxService.NewAdapter("panic-close-test", tag)}, nil
+	})
+	inboundClosed := make(chan struct{})
+	inboundRegistry := boxInbound.NewRegistry()
+	boxInbound.Register[option.StubOptions](inboundRegistry, "tracking-close-test", func(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.StubOptions) (adapter.Inbound, error) {
+		return &closeTrackingTestInbound{
+			Adapter: boxInbound.NewAdapter("tracking-close-test", tag),
+			closed:  inboundClosed,
+		}, nil
+	})
+	ctx := include.Context(context.Background())
+	ctx = service.ContextWith[adapter.ServiceRegistry](ctx, serviceRegistry)
+	ctx = service.ContextWith[option.ServiceOptionsRegistry](ctx, serviceRegistry)
+	ctx = service.ContextWith[adapter.InboundRegistry](ctx, inboundRegistry)
+	ctx = service.ContextWith[option.InboundOptionsRegistry](ctx, inboundRegistry)
+	instance, err := box.New(box.Options{
+		Context: ctx,
+		Options: option.Options{
+			Inbounds: []option.Inbound{{Type: "tracking-close-test", Tag: "later", Options: &option.StubOptions{}}},
+			Services: []option.Service{{Type: "panic-close-test", Tag: "panic", Options: &option.StubOptions{}}},
+		},
+	})
+	require.NoError(t, err)
+	var panicValue any
+	func() {
+		defer func() { panicValue = recover() }()
+		_ = instance.Close()
+	}()
+	require.NotNil(t, panicValue)
+	select {
+	case <-inboundClosed:
+	case <-time.After(time.Second):
+		t.Fatal("inbound after panicking service manager was not closed")
+	}
 }
 
 func TestClosePanicDoesNotWedgeLaterCallers(t *testing.T) {
@@ -182,7 +254,9 @@ type reentrantCloseTestService struct {
 
 func (s *reentrantCloseTestService) Start(adapter.StartStage) error { return nil }
 func (s *reentrantCloseTestService) Close() error {
-	s.result <- s.instance.Close()
+	result := make(chan error, 1)
+	go func() { result <- s.instance.Close() }()
+	s.result <- <-result
 	return nil
 }
 
@@ -192,6 +266,30 @@ type panicCloseTestService struct {
 
 func (s *panicCloseTestService) Start(adapter.StartStage) error { return nil }
 func (s *panicCloseTestService) Close() error                   { panic("close panic") }
+
+type closeTrackingTestService struct {
+	boxService.Adapter
+	closed    chan struct{}
+	closeOnce sync.Once
+}
+
+func (s *closeTrackingTestService) Start(adapter.StartStage) error { return nil }
+func (s *closeTrackingTestService) Close() error {
+	s.closeOnce.Do(func() { close(s.closed) })
+	return nil
+}
+
+type closeTrackingTestInbound struct {
+	boxInbound.Adapter
+	closed    chan struct{}
+	closeOnce sync.Once
+}
+
+func (i *closeTrackingTestInbound) Start(adapter.StartStage) error { return nil }
+func (i *closeTrackingTestInbound) Close() error {
+	i.closeOnce.Do(func() { close(i.closed) })
+	return nil
+}
 
 type blockingCloseTestService struct {
 	boxService.Adapter

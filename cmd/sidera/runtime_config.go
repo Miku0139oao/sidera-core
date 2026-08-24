@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	stdjson "encoding/json"
@@ -172,7 +173,16 @@ func writeRuntimeConfig(path string, options option.Options) error {
 	if err != nil {
 		return err
 	}
-	return writeRuntimeConfigFile(path, document)
+	rotateCurrent := true
+	if _, primaryErr := readRuntimeConfigAt(path); primaryErr != nil {
+		if _, backupErr := readRuntimeConfigAt(path + ".bak"); backupErr == nil {
+			// A corrupt or incomplete primary must never displace the validated
+			// fallback generation. The new durable primary is sufficient until a
+			// later validated commit can rotate it normally.
+			rotateCurrent = false
+		}
+	}
+	return writeRuntimeConfigFileWithBackup(path, document, rotateCurrent)
 }
 
 func encodeRuntimeDocument(options option.Options) ([]byte, error) {
@@ -361,66 +371,123 @@ func ensureJSONEOF(decoder *stdjson.Decoder) error {
 }
 
 func writeRuntimeConfigFile(path string, content []byte) error {
+	return writeRuntimeConfigFileWithBackup(path, content, true)
+}
+
+func writeRuntimeConfigFileWithBackup(path string, content []byte, rotateCurrent bool) error {
 	parent := filepath.Dir(path)
 	if err := filemanager.MkdirAll(globalCtx, parent, 0o700); err != nil {
 		return err
 	}
-	temporaryPath := path + ".tmp"
-	if err := filemanager.Remove(globalCtx, temporaryPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	temporary, err := filemanager.OpenFile(globalCtx, temporaryPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	candidatePath, err := writeStateTempFile(path, "candidate", content, 0o600)
 	if err != nil {
 		return err
 	}
-	defer filemanager.Remove(globalCtx, temporaryPath)
-	if err = temporary.Chmod(0o600); err == nil {
+	defer filemanager.Remove(globalCtx, candidatePath)
+
+	_, statErr := filemanager.Stat(globalCtx, path)
+	hasCurrent := statErr == nil
+	if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
+		return statErr
+	}
+	var stagedBackupPath string
+	if hasCurrent && rotateCurrent {
+		if err = secureStateFile(path); err != nil {
+			return err
+		}
+		currentContent, readErr := filemanager.ReadFile(globalCtx, path)
+		if readErr != nil {
+			return readErr
+		}
+		stagedBackupPath, err = writeStateTempFile(path+".bak", "backup", currentContent, 0o600)
+		if err != nil {
+			return err
+		}
+		defer filemanager.Remove(globalCtx, stagedBackupPath)
+	}
+
+	// Install the validated candidate before rotating the previous primary.
+	// A crash at every point before the second rename therefore retains the
+	// existing backup generation.
+	if err = replaceStateFile(candidatePath, path); err != nil {
+		return err
+	}
+	if err = syncStateDirectory(parent); err != nil {
+		return err
+	}
+	if stagedBackupPath != "" {
+		if err = replaceStateFile(stagedBackupPath, path+".bak"); err != nil {
+			return err
+		}
+		if err = syncStateDirectory(parent); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func writeStateTempFile(destination string, purpose string, content []byte, mode os.FileMode) (string, error) {
+	temporary, temporaryPath, err := createExclusiveStateTempFile(destination, purpose, mode)
+	if err != nil {
+		return "", err
+	}
+	closed := false
+	defer func() {
+		if !closed {
+			_ = temporary.Close()
+		}
+		if err != nil {
+			_ = filemanager.Remove(globalCtx, temporaryPath)
+		}
+	}()
+	if err = temporary.Chmod(mode); err == nil {
 		_, err = temporary.Write(content)
 	}
 	if err == nil {
 		err = temporary.Sync()
 	}
 	closeErr := temporary.Close()
+	closed = true
 	if err != nil || closeErr != nil {
-		return errors.Join(err, closeErr)
+		err = errors.Join(err, closeErr)
+		return "", err
 	}
 	if err = secureStateFile(temporaryPath); err != nil {
-		return err
+		return "", err
 	}
+	return temporaryPath, nil
+}
 
-	backupPath := path + ".bak"
-	if err = filemanager.Remove(globalCtx, backupPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+func createExclusiveStateTempFile(destination string, purpose string, mode os.FileMode) (*os.File, string, error) {
+	parent := filepath.Dir(destination)
+	prefix := "." + filepath.Base(destination) + "." + purpose + "-"
+	var randomBytes [16]byte
+	for attempt := 0; attempt < 128; attempt++ {
+		if _, err := rand.Read(randomBytes[:]); err != nil {
+			return nil, "", err
+		}
+		temporaryPath := filepath.Join(parent, prefix+hex.EncodeToString(randomBytes[:]))
+		temporary, err := filemanager.OpenFile(globalCtx, temporaryPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
+		if errors.Is(err, os.ErrExist) {
+			continue
+		}
+		if err != nil {
+			return nil, "", err
+		}
+		return temporary, temporaryPath, nil
+	}
+	return nil, "", E.New("allocate exclusive state temporary file for ", destination)
+}
+
+func syncStateDirectory(path string) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	directory, err := filemanager.Open(globalCtx, path)
+	if err != nil {
 		return err
 	}
-	_, statErr := filemanager.Stat(globalCtx, path)
-	hasCurrent := statErr == nil
-	if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
-		return statErr
-	}
-	if hasCurrent {
-		if err = secureStateFile(path); err != nil {
-			return err
-		}
-		if err = filemanager.Rename(globalCtx, path, backupPath); err != nil {
-			return err
-		}
-	}
-	if err = filemanager.Rename(globalCtx, temporaryPath, path); err != nil {
-		if hasCurrent {
-			err = errors.Join(err, filemanager.Rename(globalCtx, backupPath, path))
-		}
-		return err
-	}
-	if runtime.GOOS != "windows" {
-		directory, openErr := filemanager.Open(globalCtx, parent)
-		if openErr != nil {
-			return openErr
-		}
-		syncErr := directory.Sync()
-		closeErr = directory.Close()
-		if syncErr != nil || closeErr != nil {
-			return errors.Join(syncErr, closeErr)
-		}
-	}
-	return nil
+	syncErr := directory.Sync()
+	closeErr := directory.Close()
+	return errors.Join(syncErr, closeErr)
 }

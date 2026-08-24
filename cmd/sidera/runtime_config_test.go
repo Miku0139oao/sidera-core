@@ -53,6 +53,24 @@ func TestRuntimeConfigFallsBackToRetainedBackup(t *testing.T) {
 	require.EqualValues(t, 1, dashboard.AppliedServerRevisions["managed"])
 }
 
+func TestRuntimeConfigWritePreservesValidatedBackupWhenPrimaryIsCorrupt(t *testing.T) {
+	setRuntimeTestContext(t)
+	path := filepath.Join(t.TempDir(), "runtime.json")
+	require.NoError(t, writeRuntimeConfig(path, runtimeTestOptions("dashboard.json", 1)))
+	require.NoError(t, writeRuntimeConfig(path, runtimeTestOptions("dashboard.json", 2)))
+	require.NoError(t, os.WriteFile(path, []byte("corrupt primary"), 0o600))
+
+	require.NoError(t, writeRuntimeConfig(path, runtimeTestOptions("dashboard.json", 3)))
+	backup, err := readRuntimeConfigAt(path + ".bak")
+	require.NoError(t, err)
+	backupDashboard := backup.Services[0].Options.(*option.APIServiceOptions).Dashboard
+	require.EqualValues(t, 1, backupDashboard.AppliedServerRevisions["managed"])
+	primary, err := readRuntimeConfigAt(path)
+	require.NoError(t, err)
+	primaryDashboard := primary.Services[0].Options.(*option.APIServiceOptions).Dashboard
+	require.EqualValues(t, 3, primaryDashboard.AppliedServerRevisions["managed"])
+}
+
 func TestRuntimeDocumentChecksumCoversCompatibilityMetadata(t *testing.T) {
 	setRuntimeTestContext(t)
 	content, err := encodeRuntimeDocument(runtimeTestOptions("dashboard.json", 1))
