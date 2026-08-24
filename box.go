@@ -7,7 +7,6 @@ import (
 	"maps"
 	"net/http"
 	"os"
-	"runtime"
 	"sync"
 	"time"
 
@@ -66,8 +65,6 @@ type Box struct {
 	internalService     []adapter.LifecycleService
 	done                chan struct{}
 	closeAccess         sync.Mutex
-	closeDone           chan struct{}
-	closeOwner          uint64
 	closeErr            error
 	closing             bool
 	closed              bool
@@ -122,7 +119,7 @@ func Context(
 	return ctx
 }
 
-func New(options Options) (*Box, error) {
+func New(options Options) (result *Box, resultErr error) {
 	createdAt := time.Now()
 	ctx := options.Context
 	if ctx == nil {
@@ -207,9 +204,28 @@ func New(options Options) (*Box, error) {
 	if err != nil {
 		return nil, E.Cause(err, "create log factory")
 	}
+	instance := &Box{
+		createdAt:           createdAt,
+		debugOptions:        debugOptions,
+		logFactory:          logFactory,
+		logger:              logFactory.Logger(),
+		done:                make(chan struct{}),
+		beforeRuntimeCommit: options.BeforeRuntimeCommit,
+	}
+	constructionComplete := false
+	defer func() {
+		if constructionComplete {
+			return
+		}
+		cleanupErr, cleanupPanic := instance.closeResources()
+		if cleanupPanic != nil {
+			cleanupErr = errors.Join(cleanupErr, E.New("panic while rolling back Box construction: ", cleanupPanic))
+		}
+		result = nil
+		resultErr = errors.Join(resultErr, cleanupErr)
+	}()
 	service.MustRegister[log.Factory](ctx, logFactory)
 
-	var internalServices []adapter.LifecycleService
 	routeOptions := common.PtrValueOrDefault(options.Route)
 	certificateOptions := common.PtrValueOrDefault(options.Certificate)
 	if C.IsAndroid || certificateOptions.Store != "" && certificateOptions.Store != C.CertificateStoreSystem ||
@@ -221,14 +237,14 @@ func New(options Options) (*Box, error) {
 			return nil, err
 		}
 		service.MustRegister[adapter.CertificateStore](ctx, certificateStore)
-		internalServices = append(internalServices, certificateStore)
+		instance.internalService = append(instance.internalService, certificateStore)
 	}
 	netnsManager, err := netns.NewManager(logFactory.NewLogger("netns"), options.NetworkNamespaces, options.NetworkNamespaceHolderArgs)
 	if err != nil {
 		return nil, err
 	}
 	service.MustRegister[adapter.NetworkNamespaceManager](ctx, netnsManager)
-	internalServices = append(internalServices, netnsManager)
+	instance.internalService = append(instance.internalService, netnsManager)
 	dnsOptions := common.PtrValueOrDefault(options.DNS)
 	endpointManager := endpoint.NewManager(logFactory.NewLogger("endpoint"), endpointRegistry)
 	inboundManager := inbound.NewManager(logFactory.NewLogger("inbound"), inboundRegistry, endpointManager)
@@ -236,6 +252,12 @@ func New(options Options) (*Box, error) {
 	dnsTransportManager := dns.NewTransportManager(logFactory.NewLogger("dns/transport"), dnsTransportRegistry, outboundManager, dnsOptions.Final)
 	serviceManager := boxService.NewManager(logFactory.NewLogger("service"), serviceRegistry)
 	certificateProviderManager := boxCertificate.NewManager(logFactory.NewLogger("certificate-provider"), certificateProviderRegistry)
+	instance.endpoint = endpointManager
+	instance.inbound = inboundManager
+	instance.outbound = outboundManager
+	instance.dnsTransport = dnsTransportManager
+	instance.service = serviceManager
+	instance.certificateProvider = certificateProviderManager
 	service.MustRegister[adapter.EndpointManager](ctx, endpointManager)
 	service.MustRegister[adapter.InboundManager](ctx, inboundManager)
 	service.MustRegister[adapter.OutboundManager](ctx, outboundManager)
@@ -246,20 +268,25 @@ func New(options Options) (*Box, error) {
 	if err != nil {
 		return nil, E.Cause(err, "initialize DNS router")
 	}
+	instance.dnsRouter = dnsRouter
 	service.MustRegister[adapter.DNSRouter](ctx, dnsRouter)
 	service.MustRegister[adapter.DNSRuleSetUpdateValidator](ctx, dnsRouter)
 	networkManager, err := route.NewNetworkManager(ctx, logFactory.NewLogger("network"), routeOptions, dnsOptions)
 	if err != nil {
 		return nil, E.Cause(err, "initialize network manager")
 	}
+	instance.network = networkManager
 	service.MustRegister[adapter.NetworkManager](ctx, networkManager)
 	connectionManager := route.NewConnectionManager(logFactory.NewLogger("connection"))
+	instance.connection = connectionManager
 	service.MustRegister[adapter.ConnectionManager](ctx, connectionManager)
 	// Must register after ConnectionManager: the Apple HTTP engine's proxy bridge reads it from the context when Manager.Start resolves the default client.
 	httpClientManager := httpclient.NewManager(ctx, logFactory.NewLogger("httpclient"), options.HTTPClients, routeOptions.DefaultHTTPClient)
 	service.MustRegister[adapter.HTTPClientManager](ctx, httpClientManager)
 	httpClientService := adapter.LifecycleService(httpClientManager)
+	instance.httpClientService = httpClientService
 	router := route.NewRouter(ctx, logFactory, routeOptions, dnsOptions)
+	instance.router = router
 	service.MustRegister[adapter.Router](ctx, router)
 	err = router.Initialize(routeOptions.Rules, routeOptions.RuleSet)
 	if err != nil {
@@ -269,7 +296,7 @@ func New(options Options) (*Box, error) {
 		trafficManager := trafficcontrol.NewManager(outboundManager)
 		service.MustRegisterPtr(ctx, trafficManager)
 		router.AppendTracker(trafficManager)
-		internalServices = append(internalServices, trafficManager)
+		instance.internalService = append(instance.internalService, trafficManager)
 	}
 	ntpOptions := common.PtrValueOrDefault(options.NTP)
 	var timeService *tls.TimeServiceWrapper
@@ -439,7 +466,7 @@ func New(options Options) (*Box, error) {
 	if needCacheFile {
 		cacheFile := cachefile.New(ctx, logFactory.NewLogger("cache-file"), common.PtrValueOrDefault(experimentalOptions.CacheFile))
 		service.MustRegister[adapter.CacheFile](ctx, cacheFile)
-		internalServices = append(internalServices, cacheFile)
+		instance.internalService = append(instance.internalService, cacheFile)
 	}
 	if needClashAPI {
 		clashAPIOptions := common.PtrValueOrDefault(experimentalOptions.ClashAPI)
@@ -449,7 +476,7 @@ func New(options Options) (*Box, error) {
 			return nil, E.Cause(err, "create clash-server")
 		}
 		service.MustRegister[adapter.ClashServer](ctx, clashServer)
-		internalServices = append(internalServices, clashServer)
+		instance.internalService = append(instance.internalService, clashServer)
 	}
 	if needV2RayAPI {
 		v2rayServer, err := experimental.NewV2RayServer(logFactory.NewLogger("v2ray-api"), common.PtrValueOrDefault(experimentalOptions.V2RayAPI))
@@ -459,7 +486,7 @@ func New(options Options) (*Box, error) {
 		if v2rayServer.StatsService() != nil {
 			router.AppendTracker(v2rayServer.StatsService())
 		}
-		internalServices = append(internalServices, v2rayServer)
+		instance.internalService = append(instance.internalService, v2rayServer)
 		service.MustRegister[adapter.V2RayServer](ctx, v2rayServer)
 	}
 	if ntpOptions.Enabled {
@@ -482,29 +509,10 @@ func New(options Options) (*Box, error) {
 			WriteToSystem: ntpOptions.WriteToSystem,
 		})
 		timeService.TimeService = ntpService
-		internalServices = append(internalServices, adapter.NewLifecycleService(ntpService, "ntp service"))
+		instance.internalService = append(instance.internalService, adapter.NewLifecycleService(ntpService, "ntp service"))
 	}
-	return &Box{
-		network:             networkManager,
-		endpoint:            endpointManager,
-		inbound:             inboundManager,
-		outbound:            outboundManager,
-		dnsTransport:        dnsTransportManager,
-		service:             serviceManager,
-		certificateProvider: certificateProviderManager,
-		dnsRouter:           dnsRouter,
-		connection:          connectionManager,
-		router:              router,
-		httpClientService:   httpClientService,
-		createdAt:           createdAt,
-		debugOptions:        debugOptions,
-		logFactory:          logFactory,
-		logger:              logFactory.Logger(),
-		internalService:     internalServices,
-		done:                make(chan struct{}),
-		closeDone:           make(chan struct{}),
-		beforeRuntimeCommit: options.BeforeRuntimeCommit,
-	}, nil
+	constructionComplete = true
+	return instance, nil
 }
 
 func cloneDashboardOptions(options option.Options) option.Options {
@@ -658,7 +666,6 @@ func (s *Box) start() error {
 }
 
 func (s *Box) Close() (err error) {
-	owner := boxGoroutineID()
 	s.closeAccess.Lock()
 	if s.closed {
 		closeErr := s.closeErr
@@ -666,20 +673,12 @@ func (s *Box) Close() (err error) {
 		return errors.Join(os.ErrClosed, closeErr)
 	}
 	if s.closing {
-		if owner != 0 && owner == s.closeOwner {
-			s.closeAccess.Unlock()
-			return os.ErrClosed
-		}
-		closeDone := s.closeDone
 		s.closeAccess.Unlock()
-		<-closeDone
-		s.closeAccess.Lock()
-		closeErr := s.closeErr
-		s.closeAccess.Unlock()
-		return errors.Join(os.ErrClosed, closeErr)
+		// A child can re-enter Close from another goroutine and wait for that
+		// call. Waiting here would make the owning teardown wait on itself.
+		return os.ErrClosed
 	}
 	s.closing = true
-	s.closeOwner = owner
 	s.closeAccess.Unlock()
 
 	defer func() {
@@ -688,86 +687,93 @@ func (s *Box) Close() (err error) {
 		s.closeErr = err
 		s.closing = false
 		s.closed = true
-		s.closeOwner = 0
-		close(s.closeDone)
 		s.closeAccess.Unlock()
 		if panicValue != nil {
 			panic(panicValue)
 		}
 	}()
-	err = s.close()
+	var closePanic any
+	err, closePanic = s.closeResources()
+	if closePanic != nil {
+		panic(closePanic)
+	}
 	return err
 }
 
-func (s *Box) close() error {
-	close(s.done)
-	var err error
+func (s *Box) closeResources() (err error, firstPanic any) {
+	if s.done != nil {
+		close(s.done)
+		s.done = nil
+	}
+	closeResource := func(name string, closeFunc func() error) {
+		done := adapter.LogElapsed(s.logger, "close ", name)
+		childErr, panicValue := closeBoxResource(closeFunc)
+		done()
+		if childErr != nil {
+			err = errors.Join(err, E.Cause(childErr, "close ", name))
+		}
+		if panicValue != nil {
+			if firstPanic == nil {
+				firstPanic = panicValue
+			} else {
+				err = errors.Join(err, E.New("additional panic while closing ", name, ": ", panicValue))
+			}
+		}
+	}
 	if s.debugHTTPServer != nil {
-		err = E.Append(err, s.debugHTTPServer.Close(), func(err error) error {
-			return E.Cause(err, "close debug HTTP server")
-		})
+		closeResource("debug HTTP server", s.debugHTTPServer.Close)
 		s.debugHTTPServer = nil
 	}
-	for _, closeItem := range []struct {
-		name    string
-		service adapter.Lifecycle
-	}{
-		{"service", s.service},
-		{"inbound", s.inbound},
-		{"certificate-provider", s.certificateProvider},
-		{"endpoint", s.endpoint},
-		{"outbound", s.outbound},
-		{"router", s.router},
-		{"connection", s.connection},
-		{"dns-router", s.dnsRouter},
-		{"dns-transport", s.dnsTransport},
-		{"network", s.network},
-	} {
-		done := adapter.LogElapsed(s.logger, "close ", closeItem.name)
-		err = E.Append(err, closeItem.service.Close(), func(err error) error {
-			return E.Cause(err, "close ", closeItem.name)
-		})
-		done()
+	if s.service != nil {
+		closeResource("service", s.service.Close)
+	}
+	if s.inbound != nil {
+		closeResource("inbound", s.inbound.Close)
+	}
+	if s.certificateProvider != nil {
+		closeResource("certificate-provider", s.certificateProvider.Close)
+	}
+	if s.endpoint != nil {
+		closeResource("endpoint", s.endpoint.Close)
+	}
+	if s.outbound != nil {
+		closeResource("outbound", s.outbound.Close)
+	}
+	if s.router != nil {
+		closeResource("router", s.router.Close)
+	}
+	if s.connection != nil {
+		closeResource("connection", s.connection.Close)
+	}
+	if s.dnsRouter != nil {
+		closeResource("dns-router", s.dnsRouter.Close)
+	}
+	if s.dnsTransport != nil {
+		closeResource("dns-transport", s.dnsTransport.Close)
+	}
+	if s.network != nil {
+		closeResource("network", s.network.Close)
 	}
 	if s.httpClientService != nil {
-		s.logger.Trace("close ", s.httpClientService.Name())
-		startTime := time.Now()
-		err = E.Append(err, s.httpClientService.Close(), func(err error) error {
-			return E.Cause(err, "close ", s.httpClientService.Name())
-		})
-		s.logger.Trace("close ", s.httpClientService.Name(), " completed (", F.Seconds(time.Since(startTime).Seconds()), "s)")
+		closeResource("http-client", s.httpClientService.Close)
 	}
-	for _, lifecycleService := range s.internalService {
-		done := adapter.LogElapsed(s.logger, "close ", lifecycleService.Name())
-		err = E.Append(err, lifecycleService.Close(), func(err error) error {
-			return E.Cause(err, "close ", lifecycleService.Name())
-		})
-		done()
+	for index, lifecycleService := range s.internalService {
+		if lifecycleService != nil {
+			closeResource(F.ToString("internal service[", index, "]"), lifecycleService.Close)
+		}
 	}
-	done := adapter.LogElapsed(s.logger, "close logger")
-	err = E.Append(err, s.logFactory.Close(), func(err error) error {
-		return E.Cause(err, "close logger")
-	})
-	done()
-	return err
+	if s.logFactory != nil {
+		closeResource("logger", s.logFactory.Close)
+	}
+	return err, firstPanic
 }
 
-func boxGoroutineID() uint64 {
-	var buffer [64]byte
-	length := runtime.Stack(buffer[:], false)
-	const prefix = "goroutine "
-	if length <= len(prefix) {
-		return 0
-	}
-	var id uint64
-	for index := len(prefix); index < length; index++ {
-		value := buffer[index]
-		if value < '0' || value > '9' {
-			break
-		}
-		id = id*10 + uint64(value-'0')
-	}
-	return id
+func closeBoxResource(closeFunc func() error) (err error, panicValue any) {
+	defer func() {
+		panicValue = recover()
+	}()
+	err = closeFunc()
+	return err, nil
 }
 
 func (s *Box) Network() adapter.NetworkManager {

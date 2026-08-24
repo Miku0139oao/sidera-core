@@ -288,6 +288,90 @@ func causeRuntimeCommitError(err error, message string) error {
 	return E.Cause(err, message)
 }
 
+type reloadOperations struct {
+	close   func(*box.Box, context.CancelFunc) error
+	capture func(...option.Options) ([]dashboardFileSnapshot, error)
+	create  func(context.Context, option.Options, string, bool) (*box.Box, context.CancelFunc, error)
+	restore func([]dashboardFileSnapshot) error
+	verify  func([]dashboardFileSnapshot) error
+}
+
+type reloadOutcome struct {
+	instance   *box.Box
+	cancel     context.CancelFunc
+	options    option.Options
+	warning    error
+	terminated bool
+}
+
+func reloadInstance(
+	terminationContext context.Context,
+	instance *box.Box,
+	cancel context.CancelFunc,
+	options option.Options,
+	candidate option.Options,
+	runtimePath string,
+	operations reloadOperations,
+) (reloadOutcome, error) {
+	if err := operations.close(instance, cancel); err != nil {
+		return reloadOutcome{}, E.Cause(err, "close previous service during reload")
+	}
+	if terminationContext.Err() != nil {
+		return reloadOutcome{terminated: true}, nil
+	}
+
+	storeSnapshot, snapshotErr := operations.capture(options, candidate)
+	if snapshotErr != nil {
+		if terminationContext.Err() != nil {
+			return reloadOutcome{terminated: true}, nil
+		}
+		restoredInstance, restoredCancel, restoreErr := operations.create(terminationContext, options, "", false)
+		if restoreErr != nil {
+			if terminationContext.Err() != nil {
+				return reloadOutcome{terminated: true}, nil
+			}
+			return reloadOutcome{}, errors.Join(E.Cause(snapshotErr, "snapshot dashboard store"), E.Cause(restoreErr, "restore previous service"))
+		}
+		return reloadOutcome{
+			instance: restoredInstance,
+			cancel:   restoredCancel,
+			options:  options,
+			warning:  E.Cause(snapshotErr, "reload service; previous service restored"),
+		}, nil
+	}
+
+	candidateInstance, candidateCancel, candidateErr := operations.create(terminationContext, candidate, runtimePath, true)
+	if candidateErr == nil {
+		return reloadOutcome{instance: candidateInstance, cancel: candidateCancel, options: candidate}, nil
+	}
+	// Once termination wins, the process is fail-closed. In particular, do not
+	// rewrite activation files or start the previous generation again.
+	if terminationContext.Err() != nil {
+		return reloadOutcome{terminated: true}, nil
+	}
+
+	restoreStoreErr := operations.restore(storeSnapshot)
+	verifyStoreErr := operations.verify(storeSnapshot)
+	if verifyStoreErr != nil {
+		return reloadOutcome{}, errors.Join(E.Cause(candidateErr, "start reloaded service"), restoreStoreErr, E.Cause(verifyStoreErr, "verify restored dashboard store"))
+	}
+	if terminationContext.Err() != nil {
+		return reloadOutcome{terminated: true}, nil
+	}
+	restoredInstance, restoredCancel, restoreErr := operations.create(terminationContext, options, "", false)
+	if restoreErr != nil {
+		if terminationContext.Err() != nil {
+			return reloadOutcome{terminated: true}, nil
+		}
+		return reloadOutcome{}, errors.Join(E.Cause(candidateErr, "start reloaded service"), restoreStoreErr, E.Cause(restoreErr, "restore previous service"))
+	}
+	var warning error = E.Cause(candidateErr, "reload service; previous service restored")
+	if restoreStoreErr != nil {
+		warning = errors.Join(warning, E.Cause(restoreStoreErr, "restore dashboard store"))
+	}
+	return reloadOutcome{instance: restoredInstance, cancel: restoredCancel, options: options, warning: warning}, nil
+}
+
 func run() error {
 	runtimePath := resolvedRuntimeConfigPath()
 	optionsList, err := readConfig()
@@ -329,6 +413,9 @@ func run() error {
 		instance, cancel, options, err = startDesiredOrRuntimeFallback(terminationContext, options, runtimePath)
 	}
 	if err != nil {
+		if terminationContext.Err() != nil {
+			return nil
+		}
 		return err
 	}
 	shutdown := func() {
@@ -362,44 +449,29 @@ func run() error {
 			return nil
 		}
 
-		closeErr := closeInstance(instance, cancel)
-		if closeErr != nil {
-			log.Error(E.Cause(closeErr, "close previous service during reload"))
+		outcome, reloadErr := reloadInstance(
+			terminationContext,
+			instance,
+			cancel,
+			options,
+			candidate,
+			runtimePath,
+			reloadOperations{
+				close: closeInstance, capture: captureDashboardStoreFiles, create: create,
+				restore: restoreDashboardStoreFiles, verify: verifyDashboardStoreFiles,
+			},
+		)
+		if reloadErr != nil {
+			return reloadErr
 		}
-		if terminationContext.Err() != nil {
+		if outcome.terminated {
 			return nil
 		}
-		storeSnapshot, snapshotErr := captureDashboardStoreFiles(options, candidate)
-		if snapshotErr != nil {
-			instance, cancel, err = create(terminationContext, options, "", false)
-			if err != nil {
-				return errors.Join(E.Cause(snapshotErr, "snapshot dashboard store"), E.Cause(err, "restore previous service"))
-			}
-			log.Error(E.Cause(snapshotErr, "reload service; previous service restored"))
-			continue
-		}
-
-		candidateInstance, candidateCancel, candidateErr := create(terminationContext, candidate, runtimePath, true)
-		if candidateErr == nil {
-			options = candidate
-			instance = candidateInstance
-			cancel = candidateCancel
-			continue
-		}
-
-		restoreStoreErr := restoreDashboardStoreFiles(storeSnapshot)
-		verifyStoreErr := verifyDashboardStoreFiles(storeSnapshot)
-		if verifyStoreErr != nil {
-			return errors.Join(E.Cause(candidateErr, "start reloaded service"), restoreStoreErr, E.Cause(verifyStoreErr, "verify restored dashboard store"))
-		}
-		instance, cancel, err = create(terminationContext, options, "", false)
-		if err != nil {
-			return errors.Join(E.Cause(candidateErr, "start reloaded service"), restoreStoreErr, E.Cause(err, "restore previous service"))
-		}
-		if restoreStoreErr != nil {
-			log.Error(errors.Join(E.Cause(candidateErr, "reload service; previous service restored"), E.Cause(restoreStoreErr, "restore dashboard store")))
-		} else {
-			log.Error(E.Cause(candidateErr, "reload service; previous service restored"))
+		instance = outcome.instance
+		cancel = outcome.cancel
+		options = outcome.options
+		if outcome.warning != nil {
+			log.Error(outcome.warning)
 		}
 	}
 }
@@ -426,6 +498,9 @@ func startDesiredOrRuntimeFallback(ctx context.Context, options option.Options, 
 	instance, cancel, desiredErr := create(ctx, options, runtimePath, true)
 	if desiredErr == nil {
 		return instance, cancel, options, nil
+	}
+	if ctx.Err() != nil {
+		return nil, nil, option.Options{}, ctx.Err()
 	}
 
 	restoreErr := restoreDashboardStoreFiles(storeSnapshot)
@@ -467,6 +542,9 @@ func startRuntimeFallback(ctx context.Context, runtimePath string) (*box.Box, co
 		instance, cancel, startErr := create(ctx, options, "", false)
 		if startErr == nil {
 			return instance, cancel, options, candidatePath, attemptErrors, nil
+		}
+		if ctx.Err() != nil {
+			return nil, nil, option.Options{}, "", nil, ctx.Err()
 		}
 		restoreErr := restoreDashboardStoreFiles(storeSnapshot)
 		verifyErr := verifyDashboardStoreFiles(storeSnapshot)
@@ -586,29 +664,15 @@ func restoreDashboardStoreFile(snapshot dashboardFileSnapshot) error {
 	if err := filemanager.MkdirAll(globalCtx, parent, 0o700); err != nil {
 		return err
 	}
-	tempPath := snapshot.path + ".restore.tmp"
-	if err := filemanager.Remove(globalCtx, tempPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	tempFile, err := filemanager.OpenFile(globalCtx, tempPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, snapshot.mode)
+	temporaryPath, err := writeStateTempFile(snapshot.path, "restore", snapshot.content, snapshot.mode)
 	if err != nil {
 		return err
 	}
-	defer filemanager.Remove(globalCtx, tempPath)
-	if err = tempFile.Chmod(snapshot.mode); err == nil {
-		_, err = tempFile.Write(snapshot.content)
-	}
-	if err == nil {
-		err = tempFile.Sync()
-	}
-	closeErr := tempFile.Close()
-	if err != nil || closeErr != nil {
-		return errors.Join(err, closeErr)
-	}
-	if err = secureStateFile(tempPath); err != nil {
+	defer filemanager.Remove(globalCtx, temporaryPath)
+	if err = replaceStateFile(temporaryPath, snapshot.path); err != nil {
 		return err
 	}
-	return replaceStateFile(tempPath, snapshot.path)
+	return syncStateDirectory(parent)
 }
 
 func closeMonitor(ctx context.Context) {

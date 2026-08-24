@@ -46,16 +46,17 @@ func check() error {
 
 func validateConfigOptions(options option.Options) error {
 	ctx, cancel := context.WithCancel(globalCtx)
+	defer cancel()
 	instance, err := box.New(box.Options{
 		Context:        ctx,
 		Options:        options,
 		ValidationOnly: true,
 	})
 	if err != nil {
-		cancel()
 		return err
 	}
-	closeErr := instance.Close()
+	// Validation-only constructors may own workers whose Close waits for the
+	// validation context. Cancel admission before asking those workers to join.
 	cancel()
-	return closeErr
+	return instance.Close()
 }
