@@ -9,6 +9,7 @@ import (
 	"time"
 
 	coreLog "github.com/Miku0139oao/sidera-core/log"
+
 	"google.golang.org/grpc/metadata"
 )
 
@@ -42,12 +43,12 @@ func (s *boundedLogTestServer) SendMsg(any) error            { return nil }
 func (s *boundedLogTestServer) RecvMsg(any) error            { return nil }
 
 func TestSubscribeLogBoundsEachDrainUnderContinuousProduction(t *testing.T) {
-	serviceContext, cancelService := context.WithCancel(context.Background())
+	serviceContext, cancelService := context.WithCancel(t.Context())
 	defer cancelService()
 	startedService := NewStartedService(ServiceOptions{Context: serviceContext})
 	defer startedService.Close()
 
-	streamContext, cancelStream := context.WithCancel(context.Background())
+	streamContext, cancelStream := context.WithCancel(t.Context())
 	defer cancelStream()
 	server := &boundedLogTestServer{ctx: streamContext}
 	result := make(chan error, 1)

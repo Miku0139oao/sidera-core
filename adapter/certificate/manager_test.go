@@ -25,12 +25,14 @@ func (p *managerTestProvider) Tag() string  { return p.tag }
 func (p *managerTestProvider) GetCertificate(*tls.ClientHelloInfo) (*tls.Certificate, error) {
 	return nil, nil
 }
+
 func (p *managerTestProvider) Start(stage adapter.StartStage) error {
 	if p.startFunc != nil {
 		return p.startFunc(stage)
 	}
 	return nil
 }
+
 func (p *managerTestProvider) Close() error {
 	p.closed++
 	if p.closeFunc != nil {

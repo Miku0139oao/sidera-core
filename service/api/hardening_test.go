@@ -185,7 +185,7 @@ func TestPendingTrafficHundredThousandClosesIsBoundedAndLossless(t *testing.T) {
 	}
 
 	a.mutation.Lock()
-	for index := 0; index < 100_000; index++ {
+	for index := range 100_000 {
 		var identifier uuid.UUID
 		binary.LittleEndian.PutUint64(identifier[:8], uint64(index+1))
 		upload := new(atomic.Int64)
@@ -217,7 +217,7 @@ func TestPendingTrafficHundredThousandClosesIsBoundedAndLossless(t *testing.T) {
 
 func TestPendingTrafficCardinalityHasHardLimit(t *testing.T) {
 	a := &adminAPI{}
-	for index := 0; index < adminPendingTrafficLimit; index++ {
+	for index := range adminPendingTrafficLimit {
 		require.True(t, a.queuePendingTraffic(adminTrafficEvent{Inbound: "in", UserID: string(rune(index + 1)), Upload: 1}))
 	}
 	require.False(t, a.queuePendingTraffic(adminTrafficEvent{Inbound: "in", UserID: "overflow", Upload: 1}))
@@ -232,7 +232,7 @@ func TestPendingTrafficOverflowBackpressuresWithoutLoss(t *testing.T) {
 		}},
 	}
 	a.mutation.Lock()
-	for index := 0; index < adminPendingTrafficLimit; index++ {
+	for index := range adminPendingTrafficLimit {
 		identifier := strconv.Itoa(index)
 		a.store.Inbounds["in"].Users = append(a.store.Inbounds["in"].Users, &adminUser{ID: identifier, Name: identifier, Enabled: true})
 		require.True(t, a.queuePendingTraffic(adminTrafficEvent{Inbound: "in", UserID: identifier, Upload: 1}))
@@ -544,7 +544,7 @@ func TestReloadStormUsesOneCoalescedWorker(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("reload worker did not run")
 	}
-	for index := 0; index < 10_000; index++ {
+	for range 10_000 {
 		a.requestCoreReload()
 	}
 	close(release)

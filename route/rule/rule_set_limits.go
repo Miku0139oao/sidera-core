@@ -195,7 +195,7 @@ func validateBinaryRules(reader *bufio.Reader, count uint64, depth int, budget *
 	if err := budget.addRules(count); err != nil {
 		return err
 	}
-	for index := uint64(0); index < count; index++ {
+	for range count {
 		ruleType, err := reader.ReadByte()
 		if err != nil {
 			return err
@@ -293,7 +293,7 @@ func skipStringList(reader *bufio.Reader, budget *ruleSetLimitBudget) error {
 	if err = budget.addEntries(count); err != nil {
 		return err
 	}
-	for index := uint64(0); index < count; index++ {
+	for range count {
 		length, readErr := binary.ReadUvarint(reader)
 		if readErr != nil {
 			return readErr
@@ -344,7 +344,7 @@ func skipIPSet(reader *bufio.Reader, budget *ruleSetLimitBudget) error {
 	if err = budget.addEntries(count); err != nil {
 		return err
 	}
-	for index := uint64(0); index < count; index++ {
+	for range count {
 		if err = skipIPAddress(reader); err != nil {
 			return err
 		}
@@ -382,7 +382,7 @@ func skipPrefixList(reader *bufio.Reader, budget *ruleSetLimitBudget) error {
 	if err = budget.addEntries(count); err != nil {
 		return err
 	}
-	for index := uint64(0); index < count; index++ {
+	for range count {
 		if err = skipPrefix(reader); err != nil {
 			return err
 		}
@@ -398,7 +398,7 @@ func skipInterfaceAddressMap(reader *bufio.Reader, budget *ruleSetLimitBudget) e
 	if err = budget.addEntries(count); err != nil {
 		return err
 	}
-	for index := uint64(0); index < count; index++ {
+	for range count {
 		if _, err = reader.ReadByte(); err != nil {
 			return err
 		}

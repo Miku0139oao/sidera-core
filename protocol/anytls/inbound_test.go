@@ -11,9 +11,10 @@ import (
 
 	"github.com/Miku0139oao/sidera-core/adapter"
 	"github.com/Miku0139oao/sidera-core/common/listener"
-	"github.com/anytls/sing-anytls/padding"
 	"github.com/sagernet/sing/common/logger"
 	N "github.com/sagernet/sing/common/network"
+
+	"github.com/anytls/sing-anytls/padding"
 )
 
 type blockingStreamRouter struct {

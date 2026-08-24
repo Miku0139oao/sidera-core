@@ -462,7 +462,7 @@ func createExclusiveStateTempFile(destination string, purpose string, mode os.Fi
 	parent := filepath.Dir(destination)
 	prefix := "." + filepath.Base(destination) + "." + purpose + "-"
 	var randomBytes [16]byte
-	for attempt := 0; attempt < 128; attempt++ {
+	for range 128 {
 		if _, err := rand.Read(randomBytes[:]); err != nil {
 			return nil, "", err
 		}

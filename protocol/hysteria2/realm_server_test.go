@@ -80,7 +80,7 @@ func TestRealmConcurrentAdmissionIsBounded(t *testing.T) {
 	var admitted atomic.Int32
 	var overloaded atomic.Int32
 	var waitGroup sync.WaitGroup
-	for index := 0; index < 32; index++ {
+	for index := range 32 {
 		waitGroup.Add(1)
 		go func() {
 			defer waitGroup.Done()
@@ -113,7 +113,7 @@ func TestRealmDefaultPerUserLimitIsFinite(t *testing.T) {
 	server := newServer(logger.NOP(), nil)
 	server.maxSessions = defaultMaxRealmsPerUser + 1
 	defer server.closeAll()
-	for index := 0; index < defaultMaxRealmsPerUser; index++ {
+	for index := range defaultMaxRealmsPerUser {
 		response := registerRealmForTest(t, server, user, "realm-"+strings.Repeat("a", index%8)+string(rune('A'+index%26)))
 		if response.Code != http.StatusOK {
 			t.Fatalf("registration %d status = %d, body=%s", index, response.Code, response.Body.String())

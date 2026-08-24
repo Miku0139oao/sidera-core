@@ -30,15 +30,18 @@ func (t *managerTestTransport) Reset() {}
 func (t *managerTestTransport) Exchange(context.Context, *MDNS.Msg) (*MDNS.Msg, error) {
 	return nil, nil
 }
+
 func (t *managerTestTransport) ExchangeAsync(_ context.Context, _ *MDNS.Msg, callback func(*MDNS.Msg, error)) {
 	callback(nil, nil)
 }
+
 func (t *managerTestTransport) Start(stage adapter.StartStage) error {
 	if t.startFunc != nil {
 		return t.startFunc(stage)
 	}
 	return nil
 }
+
 func (t *managerTestTransport) Close() error {
 	t.closed++
 	if t.closeFunc != nil {

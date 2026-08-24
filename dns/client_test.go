@@ -28,6 +28,7 @@ func (t *clientTestTransport) Exchange(_ context.Context, message *mDNS.Msg) (*m
 	t.calls.Add(1)
 	return t.response(message), nil
 }
+
 func (t *clientTestTransport) ExchangeAsync(ctx context.Context, message *mDNS.Msg, callback func(*mDNS.Msg, error)) {
 	callback(t.Exchange(ctx, message))
 }

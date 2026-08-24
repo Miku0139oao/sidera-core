@@ -365,7 +365,7 @@ func reloadInstance(
 		}
 		return reloadOutcome{}, errors.Join(E.Cause(candidateErr, "start reloaded service"), restoreStoreErr, E.Cause(restoreErr, "restore previous service"))
 	}
-	var warning error = E.Cause(candidateErr, "reload service; previous service restored")
+	warning := E.Cause(candidateErr, "reload service; previous service restored")
 	if restoreStoreErr != nil {
 		warning = errors.Join(warning, E.Cause(restoreStoreErr, "restore dashboard store"))
 	}

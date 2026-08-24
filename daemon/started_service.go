@@ -337,10 +337,7 @@ func (s *StartedService) SubscribeLog(empty *emptypb.Empty, server grpc.ServerSt
 					Message: message.Message,
 				})
 			}
-			drainLimit := cap(subscription)
-			if drainLimit < 1 {
-				drainLimit = 1
-			}
+			drainLimit := max(cap(subscription), 1)
 		fetch:
 			for drained := 1; drained < drainLimit; drained++ {
 				select {
@@ -764,10 +761,7 @@ func (s *StartedService) SubscribeConnections(request *SubscribeConnectionsReque
 			if protoEvent := s.applyConnectionEvent(event, connectionSnapshots); protoEvent != nil {
 				pendingEvents = append(pendingEvents, protoEvent)
 			}
-			drainLimit := cap(subscription)
-			if drainLimit < 1 {
-				drainLimit = 1
-			}
+			drainLimit := max(cap(subscription), 1)
 		drain:
 			for drained := 1; drained < drainLimit; drained++ {
 				select {

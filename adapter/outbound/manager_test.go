@@ -27,12 +27,14 @@ func (o *managerTestOutbound) Network() []string { return nil }
 func (o *managerTestOutbound) Dependencies() []string {
 	return append([]string(nil), o.dependencies...)
 }
+
 func (o *managerTestOutbound) Start(stage adapter.StartStage) error {
 	if o.startFunc != nil {
 		return o.startFunc(stage)
 	}
 	return nil
 }
+
 func (o *managerTestOutbound) Close() error {
 	o.closed++
 	if o.closeFunc != nil {

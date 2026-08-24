@@ -52,6 +52,7 @@ func (s *tunLifecycleRuleSet) RegisterCallback(callback adapter.RuleSetUpdateCal
 	defer s.access.Unlock()
 	return s.callbacks.PushBack(callback)
 }
+
 func (s *tunLifecycleRuleSet) UnregisterCallback(element *list.Element[adapter.RuleSetUpdateCallback]) {
 	s.access.Lock()
 	s.callbacks.Remove(element)
@@ -65,6 +66,7 @@ func (s *tunLifecycleRuleSet) callbackCount() int {
 	defer s.access.Unlock()
 	return s.callbacks.Len()
 }
+
 func (s *tunLifecycleRuleSet) fire() {
 	s.access.Lock()
 	callbacks := s.callbacks.Array()

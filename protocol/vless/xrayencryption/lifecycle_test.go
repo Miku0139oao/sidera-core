@@ -463,11 +463,13 @@ func (c *paddingGapConn) Read([]byte) (int, error) {
 	<-c.closed
 	return 0, net.ErrClosed
 }
+
 func (c *paddingGapConn) Write(b []byte) (int, error) {
 	c.writeCount.Add(1)
 	c.writeOnce.Do(func() { close(c.firstWrite) })
 	return len(b), nil
 }
+
 func (c *paddingGapConn) Close() error {
 	c.closeOnce.Do(func() { close(c.closed) })
 	return nil
@@ -497,6 +499,7 @@ func (c *shortWriteConn) Write(b []byte) (int, error) {
 	}
 	return n, nil
 }
+
 func (c *shortWriteConn) Bytes() []byte {
 	c.access.Lock()
 	defer c.access.Unlock()
