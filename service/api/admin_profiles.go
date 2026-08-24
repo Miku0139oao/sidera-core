@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	stdjson "encoding/json"
+	"errors"
 	"net/http"
 	"os"
 	"runtime"
@@ -409,7 +410,8 @@ func (a *adminAPI) createServer(writer http.ResponseWriter, request *http.Reques
 		a.storeAccess.Lock()
 		delete(a.store.Servers, decoded.Tag)
 		a.storeAccess.Unlock()
-		writeAdminError(writer, http.StatusInternalServerError, E.Cause(err, "儲存入站失敗").Error())
+		restoreErr := a.saveStorePreservingBackup()
+		writeAdminError(writer, http.StatusInternalServerError, errors.Join(E.Cause(err, "儲存入站失敗"), restoreErr).Error())
 		return
 	}
 	writeAdminJSON(writer, http.StatusCreated, a.serverListResponse())
@@ -466,7 +468,8 @@ func (a *adminAPI) updateServer(writer http.ResponseWriter, request *http.Reques
 		a.storeAccess.Lock()
 		a.store.Servers[tag] = current
 		a.storeAccess.Unlock()
-		writeAdminError(writer, http.StatusInternalServerError, E.Cause(err, "儲存入站失敗").Error())
+		restoreErr := a.saveStorePreservingBackup()
+		writeAdminError(writer, http.StatusInternalServerError, errors.Join(E.Cause(err, "儲存入站失敗"), restoreErr).Error())
 		return
 	}
 	writeAdminJSON(writer, http.StatusOK, a.serverListResponse())
@@ -483,6 +486,7 @@ func (a *adminAPI) deleteServer(writer http.ResponseWriter, request *http.Reques
 	defer a.unlockMutation()
 	a.storeAccess.Lock()
 	current := cloneAdminServerStore(a.store.Servers[tag])
+	currentInbound := cloneInboundStore(a.store.Inbounds[tag])
 	if current == nil {
 		a.storeAccess.Unlock()
 		writeAdminError(writer, http.StatusNotFound, "只能刪除由面板建立的入站")
@@ -507,8 +511,14 @@ func (a *adminAPI) deleteServer(writer http.ResponseWriter, request *http.Reques
 	if err := a.saveStore(); err != nil {
 		a.storeAccess.Lock()
 		a.store.Servers[tag] = current
+		if currentInbound == nil {
+			delete(a.store.Inbounds, tag)
+		} else {
+			a.store.Inbounds[tag] = currentInbound
+		}
 		a.storeAccess.Unlock()
-		writeAdminError(writer, http.StatusInternalServerError, E.Cause(err, "儲存入站失敗").Error())
+		restoreErr := a.saveStorePreservingBackup()
+		writeAdminError(writer, http.StatusInternalServerError, errors.Join(E.Cause(err, "儲存入站失敗"), restoreErr).Error())
 		return
 	}
 	writeAdminJSON(writer, http.StatusOK, a.serverListResponse())
@@ -681,16 +691,74 @@ func (a *adminAPI) reloadCore(writer http.ResponseWriter, request *http.Request)
 		writeAdminError(writer, http.StatusNotImplemented, "Windows 目前需要由服務管理器重新啟動 Core")
 		return
 	}
+	a.requestCoreReload()
 	writer.Header().Set("Connection", "close")
 	writeAdminJSON(writer, http.StatusAccepted, map[string]any{"reloading": true})
-	go func() {
-		time.Sleep(300 * time.Millisecond)
-		process, err := os.FindProcess(os.Getpid())
-		if err == nil {
-			err = process.Signal(syscall.SIGHUP)
+}
+
+func (a *adminAPI) requestCoreReload() {
+	a.startReloadWorker()
+	if !a.reloadPending.CompareAndSwap(false, true) {
+		return
+	}
+	a.reloadRequests <- struct{}{}
+}
+
+func (a *adminAPI) startReloadWorker() {
+	a.reloadWorkerOnce.Do(func() {
+		if a.runCtx == nil {
+			base := a.ctx
+			if base == nil {
+				base = context.Background()
+			}
+			a.runCtx, a.cancel = context.WithCancel(base)
 		}
-		if err != nil {
+		if a.reloadRequests == nil {
+			a.reloadRequests = make(chan struct{}, 1)
+		}
+		if a.reloadDelay <= 0 {
+			a.reloadDelay = adminReloadDelay
+		}
+		a.workers.Add(1)
+		go func() {
+			defer a.workers.Done()
+			a.reloadLoop()
+		}()
+	})
+}
+
+func (a *adminAPI) reloadLoop() {
+	for {
+		select {
+		case <-a.runCtx.Done():
+			return
+		case <-a.reloadRequests:
+		}
+		timer := time.NewTimer(a.reloadDelay)
+		select {
+		case <-a.runCtx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			a.reloadPending.Store(false)
+			return
+		case <-timer.C:
+		}
+		err := a.signalCoreReload()
+		a.reloadPending.Store(false)
+		if err != nil && a.logger != nil {
 			a.logger.Error("dashboard: request core reload: ", err)
 		}
-	}()
+	}
+}
+
+func (a *adminAPI) signalCoreReload() error {
+	if a.reloadSignal != nil {
+		return a.reloadSignal()
+	}
+	process, err := os.FindProcess(os.Getpid())
+	if err != nil {
+		return err
+	}
+	return process.Signal(syscall.SIGHUP)
 }

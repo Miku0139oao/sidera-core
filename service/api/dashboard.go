@@ -3,11 +3,17 @@ package api
 import (
 	"archive/zip"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Miku0139oao/sidera-core/adapter"
@@ -19,9 +25,13 @@ import (
 )
 
 const (
-	dashboardRoutePrefix  = "/dashboard/"
-	dashboardEtagFileName = ".etag"
-	defaultDashboardURL   = "https://github.com/SagerNet/sing-box-dashboard/archive/refs/heads/gh-pages.zip"
+	dashboardRoutePrefix               = "/dashboard/"
+	dashboardEtagFileName              = ".etag"
+	defaultDashboardURL                = "https://github.com/SagerNet/sing-box-dashboard/archive/refs/heads/gh-pages.zip"
+	dashboardArchiveMaxCompressedBytes = int64(32 << 20)
+	dashboardArchiveMaxEntries         = 4096
+	dashboardArchiveMaxEntryBytes      = uint64(16 << 20)
+	dashboardArchiveMaxExtractedBytes  = uint64(128 << 20)
 )
 
 type dashboardStatus int
@@ -31,6 +41,13 @@ const (
 	dashboardManaged
 	dashboardUserProvided
 )
+
+var dashboardGenerationCounter atomic.Uint64
+
+var dashboardPublicationOwners = struct {
+	sync.Mutex
+	paths map[string]uint64
+}{paths: make(map[string]uint64)}
 
 type dashboard struct {
 	ctx            context.Context
@@ -45,10 +62,15 @@ type dashboard struct {
 	httpClient     *http.Client
 	lastEtag       string
 	lastUpdated    time.Time
+	generation     uint64
+	workers        sync.WaitGroup
+	closeOnce      sync.Once
+	claimed        bool
 }
 
 func newDashboard(ctx context.Context, logger log.ContextLogger, options option.APIDashboardOptions) *dashboard {
 	ctx, cancel := context.WithCancel(ctx)
+	generation := dashboardGenerationCounter.Add(1)
 	builtIn := options.Path == "" && options.DownloadURL == ""
 	if builtIn {
 		return &dashboard{
@@ -58,13 +80,14 @@ func newDashboard(ctx context.Context, logger log.ContextLogger, options option.
 			options:    options,
 			fileServer: http.StripPrefix(dashboardRoutePrefix, newBuiltInDashboardHandler()),
 			builtIn:    true,
+			generation: generation,
 		}
 	}
 	path := options.Path
 	if path == "" {
 		path = "dashboard"
 	}
-	path = filemanager.BasePath(ctx, os.ExpandEnv(path))
+	path = filepath.Clean(filemanager.BasePath(ctx, os.ExpandEnv(path)))
 	url := options.DownloadURL
 	if url == "" {
 		url = defaultDashboardURL
@@ -82,6 +105,7 @@ func newDashboard(ctx context.Context, logger log.ContextLogger, options option.
 		url:            url,
 		updateInterval: updateInterval,
 		fileServer:     http.StripPrefix(dashboardRoutePrefix, http.FileServer(dashboardDir(path))),
+		generation:     generation,
 	}
 }
 
@@ -98,16 +122,47 @@ func (d *dashboard) start() error {
 		return E.Cause(err, "create dashboard http client")
 	}
 	d.httpClient = &http.Client{Transport: transport}
-	go d.loopUpdate()
+	d.claimPublication()
+	d.workers.Add(1)
+	go func() {
+		defer d.workers.Done()
+		d.loopUpdate()
+	}()
 	return nil
 }
 
 func (d *dashboard) close() error {
-	d.cancel()
-	if d.httpClient != nil {
-		d.httpClient.CloseIdleConnections()
-	}
+	d.closeOnce.Do(func() {
+		d.cancel()
+		if d.httpClient != nil {
+			d.httpClient.CloseIdleConnections()
+		}
+		d.workers.Wait()
+		d.releasePublication()
+	})
 	return nil
+}
+
+func (d *dashboard) claimPublication() {
+	if d.builtIn {
+		return
+	}
+	dashboardPublicationOwners.Lock()
+	dashboardPublicationOwners.paths[d.path] = d.generation
+	d.claimed = true
+	dashboardPublicationOwners.Unlock()
+}
+
+func (d *dashboard) releasePublication() {
+	if d.builtIn {
+		return
+	}
+	dashboardPublicationOwners.Lock()
+	if d.claimed && dashboardPublicationOwners.paths[d.path] == d.generation {
+		delete(dashboardPublicationOwners.paths, d.path)
+	}
+	d.claimed = false
+	dashboardPublicationOwners.Unlock()
 }
 
 func (d *dashboard) resolveTransport() (adapter.HTTPTransport, error) {
@@ -155,6 +210,9 @@ func (d *dashboard) loopUpdate() {
 		if !now.Before(nextUpdate) {
 			err := d.fetch(d.ctx)
 			if err != nil {
+				if d.ctx.Err() != nil || errors.Is(err, os.ErrClosed) {
+					return
+				}
 				d.logger.Error(E.Cause(err, "update dashboard"))
 				nextUpdate = now.Add(d.updateInterval)
 			} else {
@@ -205,9 +263,12 @@ func (d *dashboard) fetch(ctx context.Context) error {
 	case http.StatusOK:
 	case http.StatusNotModified:
 		d.lastUpdated = time.Now()
-		err = filemanager.WriteFile(d.ctx, filepath.Join(d.path, dashboardEtagFileName), []byte(d.lastEtag), 0o644)
+		err = d.writeUpdateTime()
 		if err != nil {
 			d.logger.Warn(E.Cause(err, "save dashboard update time"))
+			if errors.Is(err, os.ErrClosed) || d.ctx.Err() != nil {
+				return err
+			}
 		}
 		d.logger.Info("dashboard: not modified")
 		return nil
@@ -215,8 +276,7 @@ func (d *dashboard) fetch(ctx context.Context) error {
 		return E.New("unexpected status: ", response.Status)
 	}
 	etag := response.Header.Get("Etag")
-	err = d.extract(response.Body, etag)
-	if err != nil {
+	if err = d.extract(response.Body, etag); err != nil {
 		return err
 	}
 	d.lastEtag = etag
@@ -226,34 +286,45 @@ func (d *dashboard) fetch(ctx context.Context) error {
 }
 
 func (d *dashboard) extract(body io.Reader, etag string) error {
-	tempFile, err := filemanager.CreateTemp(d.ctx, "sing-box-dashboard-*.zip")
+	tempFile, err := filemanager.CreateTemp(d.ctx, fmt.Sprintf("sidera-dashboard-%d-*.zip", d.generation))
 	if err != nil {
 		return err
 	}
 	tempZipPath := tempFile.Name()
-	defer filemanager.Remove(d.ctx, tempZipPath)
-	_, err = io.Copy(tempFile, body)
-	tempFile.Close()
-	if err != nil {
-		return err
+	defer filemanager.Remove(context.WithoutCancel(d.ctx), tempZipPath)
+	written, copyErr := copyWithContext(d.ctx, tempFile, io.LimitReader(body, dashboardArchiveMaxCompressedBytes+1))
+	if copyErr == nil && written > dashboardArchiveMaxCompressedBytes {
+		copyErr = E.New("dashboard archive exceeds compressed size limit")
 	}
+	if copyErr == nil {
+		copyErr = tempFile.Sync()
+	}
+	closeErr := tempFile.Close()
+	if copyErr != nil || closeErr != nil {
+		return errors.Join(copyErr, closeErr)
+	}
+
 	reader, err := zip.OpenReader(tempZipPath)
 	if err != nil {
 		return err
 	}
 	defer reader.Close()
+	if err = validateDashboardArchive(reader.File); err != nil {
+		return err
+	}
 
-	tempDir := d.path + ".tmp"
-	err = filemanager.RemoveAll(d.ctx, tempDir)
+	tempDir, err := d.createGenerationDirectory("extract")
 	if err != nil {
 		return err
 	}
-	err = filemanager.MkdirAll(d.ctx, tempDir, 0o755)
-	if err != nil {
-		return err
-	}
+	defer filemanager.RemoveAll(context.WithoutCancel(d.ctx), tempDir)
 	trimDir := zipIsInSingleDirectory(reader.File)
+	seenPaths := make(map[string]bool, len(reader.File))
+	var extractedBytes uint64
 	for _, file := range reader.File {
+		if err = d.ctx.Err(); err != nil {
+			return err
+		}
 		if file.FileInfo().IsDir() {
 			continue
 		}
@@ -266,28 +337,113 @@ func (d *dashboard) extract(body io.Reader, etag string) error {
 		}
 		relativePath := filepath.Join(pathElements...)
 		if !filepath.IsLocal(relativePath) {
-			filemanager.RemoveAll(d.ctx, tempDir)
 			return E.New("invalid dashboard archive entry: ", file.Name)
 		}
+		if seenPaths[relativePath] {
+			return E.New("duplicate dashboard archive entry: ", file.Name)
+		}
+		seenPaths[relativePath] = true
 		savePath := filepath.Join(tempDir, relativePath)
-		err = filemanager.MkdirAll(d.ctx, filepath.Dir(savePath), 0o755)
-		if err != nil {
-			filemanager.RemoveAll(d.ctx, tempDir)
+		if err = filemanager.MkdirAll(d.ctx, filepath.Dir(savePath), 0o755); err != nil {
 			return err
 		}
-		err = extractZipEntry(d.ctx, file, savePath)
+		remaining := dashboardArchiveMaxExtractedBytes - extractedBytes
+		entryLimit := min(dashboardArchiveMaxEntryBytes, remaining)
+		var written uint64
+		written, err = extractZipEntry(d.ctx, file, savePath, entryLimit)
 		if err != nil {
-			filemanager.RemoveAll(d.ctx, tempDir)
+			if entryLimit < dashboardArchiveMaxEntryBytes {
+				return E.Cause(err, "dashboard archive exceeds extracted size limit")
+			}
 			return err
 		}
+		extractedBytes += written
 	}
-	err = filemanager.WriteFile(d.ctx, filepath.Join(tempDir, dashboardEtagFileName), []byte(etag), 0o644)
-	if err != nil {
-		filemanager.RemoveAll(d.ctx, tempDir)
+	if err = filemanager.WriteFile(d.ctx, filepath.Join(tempDir, dashboardEtagFileName), []byte(etag), 0o644); err != nil {
 		return err
 	}
-	backupDir := d.path + ".old"
-	_ = filemanager.RemoveAll(d.ctx, backupDir)
+	return d.publishDirectory(tempDir)
+}
+
+func validateDashboardArchive(files []*zip.File) error {
+	if len(files) > dashboardArchiveMaxEntries {
+		return E.New("dashboard archive has too many entries")
+	}
+	var aggregate uint64
+	for _, file := range files {
+		info := file.FileInfo()
+		if info.IsDir() {
+			continue
+		}
+		if info.Mode()&os.ModeType != 0 {
+			return E.New("unsupported dashboard archive entry: ", file.Name)
+		}
+		if file.UncompressedSize64 > dashboardArchiveMaxEntryBytes {
+			return E.New("dashboard archive entry exceeds size limit: ", file.Name)
+		}
+		if file.UncompressedSize64 > dashboardArchiveMaxExtractedBytes-aggregate {
+			return E.New("dashboard archive exceeds extracted size limit")
+		}
+		aggregate += file.UncompressedSize64
+	}
+	return nil
+}
+
+func (d *dashboard) writeUpdateTime() error {
+	dashboardPublicationOwners.Lock()
+	defer dashboardPublicationOwners.Unlock()
+	if err := d.ctx.Err(); err != nil {
+		return err
+	}
+	if !d.claimed || dashboardPublicationOwners.paths[d.path] != d.generation {
+		return os.ErrClosed
+	}
+	return filemanager.WriteFile(d.ctx, filepath.Join(d.path, dashboardEtagFileName), []byte(d.lastEtag), 0o644)
+}
+
+func (d *dashboard) createGenerationDirectory(kind string) (string, error) {
+	parent := filepath.Dir(d.path)
+	if parent != "." {
+		if err := filemanager.MkdirAll(d.ctx, parent, 0o755); err != nil {
+			return "", err
+		}
+	}
+	for attempt := 0; attempt < 16; attempt++ {
+		path, err := d.generationPath(kind)
+		if err != nil {
+			return "", err
+		}
+		err = filemanager.Mkdir(d.ctx, path, 0o755)
+		if errors.Is(err, os.ErrExist) {
+			continue
+		}
+		return path, err
+	}
+	return "", E.New("allocate unique dashboard extraction directory")
+}
+
+func (d *dashboard) generationPath(kind string) (string, error) {
+	var nonce [10]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return "", err
+	}
+	name := fmt.Sprintf(".%s.%s-%d-%s", filepath.Base(d.path), kind, d.generation, hex.EncodeToString(nonce[:]))
+	return filepath.Join(filepath.Dir(d.path), name), nil
+}
+
+func (d *dashboard) publishDirectory(tempDir string) error {
+	dashboardPublicationOwners.Lock()
+	defer dashboardPublicationOwners.Unlock()
+	if err := d.ctx.Err(); err != nil {
+		return err
+	}
+	if !d.claimed || dashboardPublicationOwners.paths[d.path] != d.generation {
+		return os.ErrClosed
+	}
+	backupDir, err := d.generationPath("backup")
+	if err != nil {
+		return err
+	}
 	_, statErr := filemanager.Stat(d.ctx, d.path)
 	hasCurrent := statErr == nil
 	if statErr != nil && !os.IsNotExist(statErr) {
@@ -298,31 +454,75 @@ func (d *dashboard) extract(body io.Reader, etag string) error {
 			return err
 		}
 	}
-	if err = filemanager.Rename(d.ctx, tempDir, d.path); err != nil {
+	if err = d.ctx.Err(); err == nil {
+		err = filemanager.Rename(d.ctx, tempDir, d.path)
+	}
+	if err != nil {
 		if hasCurrent {
-			_ = filemanager.Rename(d.ctx, backupDir, d.path)
+			err = errors.Join(err, filemanager.Rename(context.WithoutCancel(d.ctx), backupDir, d.path))
 		}
 		return err
 	}
 	if hasCurrent {
-		_ = filemanager.RemoveAll(d.ctx, backupDir)
+		_ = filemanager.RemoveAll(context.WithoutCancel(d.ctx), backupDir)
 	}
 	return nil
 }
 
-func extractZipEntry(ctx context.Context, file *zip.File, savePath string) error {
+func extractZipEntry(ctx context.Context, file *zip.File, savePath string, maxBytes uint64) (uint64, error) {
 	reader, err := file.Open()
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer reader.Close()
 	writer, err := filemanager.Create(ctx, savePath)
 	if err != nil {
-		return err
+		return 0, err
 	}
-	defer writer.Close()
-	_, err = io.Copy(writer, reader)
-	return err
+	written, copyErr := copyWithContext(ctx, writer, io.LimitReader(reader, int64(maxBytes)+1))
+	if copyErr == nil && uint64(written) > maxBytes {
+		copyErr = E.New("dashboard archive entry exceeds size limit: ", file.Name)
+	}
+	closeErr := writer.Close()
+	if copyErr != nil || closeErr != nil {
+		_ = filemanager.Remove(context.WithoutCancel(ctx), savePath)
+		return 0, errors.Join(copyErr, closeErr)
+	}
+	return uint64(written), nil
+}
+
+func copyWithContext(ctx context.Context, writer io.Writer, reader io.Reader) (int64, error) {
+	buffer := make([]byte, 32<<10)
+	var written int64
+	emptyReads := 0
+	for {
+		if err := ctx.Err(); err != nil {
+			return written, err
+		}
+		readCount, readErr := reader.Read(buffer)
+		if readCount > 0 {
+			emptyReads = 0
+			writeCount, writeErr := writer.Write(buffer[:readCount])
+			written += int64(writeCount)
+			if writeErr != nil {
+				return written, writeErr
+			}
+			if writeCount != readCount {
+				return written, io.ErrShortWrite
+			}
+		} else if readErr == nil {
+			emptyReads++
+			if emptyReads >= 100 {
+				return written, io.ErrNoProgress
+			}
+		}
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				return written, nil
+			}
+			return written, readErr
+		}
+	}
 }
 
 // GitHub archives wrap every file under a single "<repo>-<branch>/" top-level directory.

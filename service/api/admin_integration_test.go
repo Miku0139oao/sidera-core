@@ -18,6 +18,7 @@ import (
 	"github.com/Miku0139oao/sidera-core/option"
 	"github.com/sagernet/sing/common/json/badoption"
 
+	"github.com/gofrs/uuid/v5"
 	"github.com/stretchr/testify/require"
 )
 
@@ -120,9 +121,9 @@ func TestPendingTrafficFlushesInsideMutationBoundary(t *testing.T) {
 		}},
 	}
 	a.mutation.Lock()
-	a.pendingTraffic = []adminTrafficEvent{{
+	require.True(t, a.queuePendingTraffic(adminTrafficEvent{
 		Inbound: managed.tag, User: "alice", Upload: 10, Download: 20, UpdatedAt: 30,
-	}}
+	}))
 	a.unlockMutation()
 	user := a.store.Inbounds[managed.tag].Users[0]
 	require.EqualValues(t, 10, user.UploadBytes)
@@ -164,10 +165,8 @@ func TestTrafficEventsUseStableIdentityAndResetGeneration(t *testing.T) {
 		}},
 	}
 	a.mutation.Lock()
-	a.pendingTraffic = []adminTrafficEvent{
-		{Inbound: managed.tag, User: "alice-old", UserID: "alice-id", Generation: 0, Upload: 100},
-		{Inbound: managed.tag, User: "alice-old", UserID: "alice-id", Generation: 1, Download: 20},
-	}
+	require.True(t, a.queuePendingTraffic(adminTrafficEvent{Inbound: managed.tag, User: "alice-old", UserID: "alice-id", Generation: 0, Upload: 100}))
+	require.True(t, a.queuePendingTraffic(adminTrafficEvent{Inbound: managed.tag, User: "alice-old", UserID: "alice-id", Generation: 1, Download: 20}))
 	a.unlockMutation()
 	user := a.store.Inbounds[managed.tag].Users[0]
 	require.Zero(t, user.UploadBytes)
@@ -921,11 +920,13 @@ func TestReloadEndpointRejectsUnsupportedHost(t *testing.T) {
 func newAdminTestAPI(t *testing.T, managed *adminTestManagedService, dashboardOwned bool) *adminAPI {
 	t.Helper()
 	a := &adminAPI{
-		ctx:             context.Background(),
-		dataPath:        filepath.Join(t.TempDir(), "dashboard.json"),
-		runtimes:        make(map[string]*adminInboundRuntime),
-		serverRevisions: make(map[string]int64),
-		userAliases:     make(map[string]adminManagedUserIdentity),
+		ctx:              context.Background(),
+		dataPath:         filepath.Join(t.TempDir(), "dashboard.json"),
+		runtimes:         make(map[string]*adminInboundRuntime),
+		serverRevisions:  make(map[string]int64),
+		userAliases:      make(map[string]adminManagedUserIdentity),
+		trafficBaselines: make(map[uuid.UUID]adminTrafficBaseline),
+		pendingTraffic:   make(map[adminTrafficKey]adminTrafficEvent),
 		store: adminStore{
 			Version: adminStoreVersion, Inbounds: make(map[string]*adminInboundStore), Servers: make(map[string]*adminServerStore), Subscriptions: make(map[string]string), ExternalSubscriptions: make(map[string]string),
 		},

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/netip"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Miku0139oao/sidera-core/adapter"
@@ -31,6 +32,16 @@ func RegisterService(registry *boxService.Registry) {
 	boxService.Register[option.APIServiceOptions](registry, C.TypeAPI, NewService)
 }
 
+// ProducerQuiescenceLifecycle splits API admission shutdown from the final
+// traffic checkpoint. Box must stop admission, quiesce inbound traffic
+// producers, and only then call CloseAfterProducerQuiescence.
+type ProducerQuiescenceLifecycle interface {
+	StopAdmission() error
+	CloseAfterProducerQuiescence() error
+}
+
+var _ ProducerQuiescenceLifecycle = (*Service)(nil)
+
 type Service struct {
 	boxService.Adapter
 	ctx             context.Context
@@ -46,6 +57,11 @@ type Service struct {
 	dashboard       *dashboard
 	admin           *adminAPI
 	runtimeRollback func() error
+	serveWorkers    sync.WaitGroup
+	stopOnce        sync.Once
+	stopErr         error
+	finalizeOnce    sync.Once
+	finalizeErr     error
 }
 
 func NewService(ctx context.Context, logger log.ContextLogger, tag string, options option.APIServiceOptions) (adapter.Service, error) {
@@ -189,7 +205,9 @@ func (s *Service) ActivateRuntime() {
 	}
 	tcpListener := s.tcpListener
 	s.tcpListener = nil
+	s.serveWorkers.Add(1)
 	go func() {
+		defer s.serveWorkers.Done()
 		serveErr := s.httpServer.Serve(tcpListener)
 		if serveErr != nil && s.ctx.Err() == nil {
 			s.logger.Error("serve error: ", serveErr)
@@ -197,27 +215,47 @@ func (s *Service) ActivateRuntime() {
 	}()
 }
 
+func (s *Service) StopAdmission() error {
+	s.stopOnce.Do(func() {
+		if s.cancel != nil {
+			s.cancel()
+		}
+		if s.httpServer != nil {
+			s.stopErr = errors.Join(s.stopErr, s.httpServer.Close())
+		}
+		if s.grpcServer != nil {
+			s.grpcServer.Stop()
+		}
+		if s.admin != nil {
+			s.admin.stopAdmission()
+		}
+		if s.dashboard != nil {
+			s.stopErr = errors.Join(s.stopErr, s.dashboard.close())
+		}
+		if s.startedService != nil {
+			s.startedService.Close()
+		}
+		s.serveWorkers.Wait()
+	})
+	return filterCloseError(s.stopErr)
+}
+
+func (s *Service) CloseAfterProducerQuiescence() error {
+	stopErr := s.StopAdmission()
+	s.finalizeOnce.Do(func() {
+		if s.admin != nil {
+			s.finalizeErr = errors.Join(s.finalizeErr, s.admin.finalizeTrafficAccounting())
+		}
+		s.finalizeErr = errors.Join(s.finalizeErr, filterCloseError(common.Close(
+			common.PtrOrNil(s.listener),
+			s.tlsConfig,
+		)))
+	})
+	return errors.Join(stopErr, s.finalizeErr)
+}
+
 func (s *Service) Close() error {
-	s.cancel()
-	if s.httpServer != nil {
-		s.httpServer.Close()
-	}
-	if s.admin != nil {
-		s.admin.close()
-	}
-	if s.dashboard != nil {
-		s.dashboard.close()
-	}
-	if s.grpcServer != nil {
-		s.grpcServer.Stop()
-	}
-	if s.startedService != nil {
-		s.startedService.Close()
-	}
-	return filterCloseError(common.Close(
-		common.PtrOrNil(s.listener),
-		s.tlsConfig,
-	))
+	return s.CloseAfterProducerQuiescence()
 }
 
 func filterCloseError(err error) error {
