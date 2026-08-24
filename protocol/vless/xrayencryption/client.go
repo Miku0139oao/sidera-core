@@ -7,6 +7,7 @@
 package xrayencryption
 
 import (
+	"context"
 	"crypto/cipher"
 	"crypto/ecdh"
 	"crypto/mlkem"
@@ -78,6 +79,16 @@ func (i *ClientInstance) Init(nfsPKeysBytes [][]byte, xorMode, seconds uint32, p
 }
 
 func (i *ClientInstance) Handshake(conn net.Conn) (*CommonConn, error) {
+	return i.HandshakeContext(context.Background(), conn)
+}
+
+func (i *ClientInstance) HandshakeContext(ctx context.Context, conn net.Conn) (*CommonConn, error) {
+	return handshakeWithContext(ctx, conn, func(ctx context.Context) (*CommonConn, error) {
+		return i.handshake(ctx, conn)
+	})
+}
+
+func (i *ClientInstance) handshake(ctx context.Context, conn net.Conn) (*CommonConn, error) {
 	if i.NfsPKeys == nil {
 		return nil, errors.New("uninitialized")
 	}
@@ -175,7 +186,9 @@ func (i *ClientInstance) Handshake(conn net.Conn) (*CommonConn, error) {
 			clientHello = clientHello[fragmentLength:]
 		}
 		if len(paddingGaps) > index {
-			time.Sleep(paddingGaps[index])
+			if err := waitContext(ctx, paddingGaps[index]); err != nil {
+				return nil, err
+			}
 		}
 	}
 

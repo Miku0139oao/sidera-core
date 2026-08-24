@@ -8,6 +8,7 @@ package xrayencryption
 
 import (
 	"bytes"
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
@@ -28,8 +29,10 @@ import (
 )
 
 const (
-	maxPlaintextSize = 8192
-	maxRecordSize    = 16640
+	maxPlaintextSize   = 8192
+	maxRecordSize      = 16640
+	maxPaddingSize     = 18 + 65535
+	maxGapMilliseconds = int64(^uint64(0)>>1) / int64(time.Millisecond)
 )
 
 var outBytesPool = sync.Pool{
@@ -286,14 +289,18 @@ func ParsePadding(padding string, paddingLens, paddingGaps *[][3]int) error {
 			return errors.New("first padding length must not be smaller than 35 and must have 100 percent probability")
 		}
 		if index%2 == 0 {
+			entryMax := max(entry[1], entry[2])
+			if entryMax > maxPaddingSize-maxLen {
+				return errors.New("total padding length must not be larger than 65553")
+			}
 			*paddingLens = append(*paddingLens, entry)
-			maxLen += max(entry[1], entry[2])
+			maxLen += entryMax
 		} else {
+			if int64(max(entry[1], entry[2])) > maxGapMilliseconds {
+				return errors.New("padding gap is too large")
+			}
 			*paddingGaps = append(*paddingGaps, entry)
 		}
-	}
-	if maxLen > 18+65535 {
-		return errors.New("total padding length must not be larger than 65553")
 	}
 	return nil
 }
@@ -304,6 +311,9 @@ func CreatePadding(paddingLens, paddingGaps [][3]int) (length int, lens []int, g
 		paddingGaps = [][3]int{{75, 0, 111}}
 	}
 	for _, entry := range paddingLens {
+		if entry[0] < 0 || entry[1] < 0 || entry[2] < 0 || max(entry[1], entry[2]) > maxPaddingSize-length {
+			return 0, nil, nil, errors.New("invalid or excessive padding length")
+		}
 		partLength := 0
 		chance, randomErr := randBetween(0, 100)
 		if randomErr != nil {
@@ -320,6 +330,9 @@ func CreatePadding(paddingLens, paddingGaps [][3]int) (length int, lens []int, g
 		length += partLength
 	}
 	for _, entry := range paddingGaps {
+		if entry[0] < 0 || entry[1] < 0 || entry[2] < 0 || int64(max(entry[1], entry[2])) > maxGapMilliseconds {
+			return 0, nil, nil, errors.New("invalid or excessive padding gap")
+		}
 		gap := int64(0)
 		chance, randomErr := randBetween(0, 100)
 		if randomErr != nil {
@@ -359,16 +372,66 @@ func randBetween(from, to int64) (int64, error) {
 	return from + value.Int64(), nil
 }
 
+func waitContext(ctx context.Context, delay time.Duration) error {
+	if delay <= 0 {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			return nil
+		}
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func handshakeWithContext(ctx context.Context, conn net.Conn, handshake func(context.Context) (*CommonConn, error)) (*CommonConn, error) {
+	if err := ctx.Err(); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	cancellationDone := make(chan struct{})
+	stopCancellation := context.AfterFunc(ctx, func() {
+		_ = conn.Close()
+		close(cancellationDone)
+	})
+	result, err := handshake(ctx)
+	if !stopCancellation() {
+		<-cancellationDone
+	}
+	if contextErr := ctx.Err(); contextErr != nil {
+		_ = conn.Close()
+		return nil, contextErr
+	}
+	return result, err
+}
+
 func writeFull(writer io.Writer, b []byte) error {
+	_, err := writeFullCount(writer, b)
+	return err
+}
+
+func writeFullCount(writer io.Writer, b []byte) (int, error) {
+	written := 0
 	for len(b) > 0 {
 		n, err := writer.Write(b)
-		if err != nil {
-			return err
+		if n < 0 || n > len(b) {
+			return written, io.ErrShortWrite
 		}
-		if n <= 0 || n > len(b) {
-			return io.ErrShortWrite
-		}
+		written += n
 		b = b[n:]
+		if err != nil {
+			return written, err
+		}
+		if n == 0 {
+			return written, io.ErrShortWrite
+		}
 	}
-	return nil
+	return written, nil
 }
