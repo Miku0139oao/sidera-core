@@ -1,6 +1,7 @@
 package api
 
 import (
+	"errors"
 	"net/http"
 	"regexp"
 	"strings"
@@ -104,7 +105,7 @@ func (a *adminAPI) updateSettings(writer http.ResponseWriter, request *http.Requ
 	}
 
 	a.mutation.Lock()
-	defer a.mutation.Unlock()
+	defer a.unlockMutation()
 	a.storeAccess.Lock()
 	previous := a.store.Settings
 	a.store.Settings = input
@@ -113,7 +114,8 @@ func (a *adminAPI) updateSettings(writer http.ResponseWriter, request *http.Requ
 		a.storeAccess.Lock()
 		a.store.Settings = previous
 		a.storeAccess.Unlock()
-		writeAdminError(writer, http.StatusInternalServerError, err.Error())
+		restoreErr := a.saveStorePreservingBackup()
+		writeAdminError(writer, http.StatusInternalServerError, errors.Join(err, restoreErr).Error())
 		return
 	}
 	writeAdminJSON(writer, http.StatusOK, adminSettingsView{PublicBaseURL: a.publicBaseURL, adminSettings: input})

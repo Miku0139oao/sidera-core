@@ -387,7 +387,9 @@ func (a *adminAPI) mutateUserGroup(writer http.ResponseWriter, oldName string, i
 			a.userAliases = make(map[string]adminManagedUserIdentity)
 		}
 		for tag, user := range current {
-			a.userAliases[adminUserKey(tag, oldName)] = adminManagedUserIdentity{ID: user.ID, Generation: user.TrafficGeneration}
+			aliasKey := adminUserKey(tag, oldName)
+			a.userAliases[aliasKey] = adminManagedUserIdentity{ID: user.ID, Generation: user.TrafficGeneration}
+			delete(a.userAliasUnused, aliasKey)
 		}
 		a.storeAccess.Unlock()
 	}
@@ -538,7 +540,7 @@ func (a *adminAPI) resetUserGroupTraffic(writer http.ResponseWriter, request *ht
 		for _, tag := range tags {
 			restoreErr = errors.Join(restoreErr, a.applyInbound(tag, true))
 		}
-		restoreErr = errors.Join(restoreErr, a.saveStore())
+		restoreErr = errors.Join(restoreErr, a.saveStorePreservingBackup())
 		writeAdminError(writer, http.StatusInternalServerError, errors.Join(E.Cause(err, "儲存流量資料失敗"), restoreErr).Error())
 		return
 	}
@@ -616,7 +618,7 @@ func (a *adminAPI) rollbackInboundBatch(tags []string, previous map[string]*admi
 		rollbackErr = errors.Join(rollbackErr, a.applyInbound(tag, true))
 	}
 	if persist {
-		rollbackErr = errors.Join(rollbackErr, a.saveStore())
+		rollbackErr = errors.Join(rollbackErr, a.saveStorePreservingBackup())
 	}
 	return rollbackErr
 }
@@ -631,7 +633,7 @@ func (a *adminAPI) restoreUserGroupState(tags []string, accounts map[string]*adm
 	for _, tag := range tags {
 		restoreErr = errors.Join(restoreErr, a.applyInbound(tag, true))
 	}
-	return errors.Join(restoreErr, a.saveStore())
+	return errors.Join(restoreErr, a.saveStorePreservingBackup())
 }
 
 func requestedUserGroupName(request *http.Request) string {

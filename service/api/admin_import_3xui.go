@@ -197,7 +197,7 @@ func (a *adminAPI) apply3XUIImport(writer http.ResponseWriter, request *http.Req
 	defer cancel()
 
 	a.mutation.Lock()
-	defer a.unlockMutation()
+	defer a.mutation.Unlock()
 	a.flushPendingTrafficLocked()
 	report, err := a.inspect3XUIDatabase(ctx, databasePath, fingerprint, mapping)
 	if err != nil {
@@ -387,7 +387,7 @@ func (a *adminAPI) applyAndSave3XUIImport(tags []string, previousInbounds map[st
 			restoreErr = errors.Join(restoreErr, a.applyInbound(tag, true))
 		}
 		if persist {
-			restoreErr = errors.Join(restoreErr, a.saveStore())
+			restoreErr = errors.Join(restoreErr, a.saveStorePreservingBackup())
 		}
 		return restoreErr
 	}
