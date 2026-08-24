@@ -33,6 +33,7 @@ func (c *httpRecordingConn) Write(p []byte) (int, error) {
 	defer c.access.Unlock()
 	return c.wire.Write(p)
 }
+
 func (c *httpRecordingConn) Close() error {
 	c.closed.Store(true)
 	return nil
@@ -118,7 +119,6 @@ func TestHTTP1ConcurrentFirstWriteEmitsOneRequest(t *testing.T) {
 	start := make(chan struct{})
 	var group sync.WaitGroup
 	for _, payload := range [][]byte{[]byte("first"), []byte("second")} {
-		payload := payload
 		group.Add(1)
 		go func() {
 			defer group.Done()

@@ -2804,7 +2804,7 @@ func (a *adminAPI) validAdminStateContent(path string) ([]byte, bool) {
 }
 
 func (a *adminAPI) writeAdminStateTemp(parent string, kind string, content []byte) (string, error) {
-	for attempt := 0; attempt < 16; attempt++ {
+	for range 16 {
 		var nonce [12]byte
 		if _, err := rand.Read(nonce[:]); err != nil {
 			return "", err

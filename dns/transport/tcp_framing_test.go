@@ -11,7 +11,7 @@ import (
 func TestWriteMessageUsesCompressedWireLength(t *testing.T) {
 	message := new(mDNS.Msg)
 	message.SetQuestion("www.example.com.", mDNS.TypeA)
-	for index := 0; index < 8; index++ {
+	for range 8 {
 		message.Answer = append(message.Answer, &mDNS.CNAME{
 			Hdr:    mDNS.RR_Header{Name: "www.example.com.", Rrtype: mDNS.TypeCNAME, Class: mDNS.ClassINET, Ttl: 60},
 			Target: "target.example.com.",

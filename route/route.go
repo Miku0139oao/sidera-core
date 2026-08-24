@@ -195,6 +195,7 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
 			}
 			return action.Error(ctx)
 		case *R.RuleActionHijackDNS:
+			//nolint:modernize // Cache wrappers must be applied in reverse read order.
 			for index := len(buffers) - 1; index >= 0; index-- {
 				conn = bufio.NewCachedConn(conn, buffers[index])
 			}
@@ -211,6 +212,7 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
 		selectedOutbound = defaultOutbound
 	}
 
+	//nolint:modernize // Cache wrappers must be applied in reverse read order.
 	for index := len(buffers) - 1; index >= 0; index-- {
 		conn = bufio.NewCachedConn(conn, buffers[index])
 	}
@@ -339,6 +341,7 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
 		}
 		selectedOutbound = defaultOutbound
 	}
+	//nolint:modernize // Cache wrappers must be applied in reverse read order.
 	for index := len(packetBuffers) - 1; index >= 0; index-- {
 		packetBuffer := packetBuffers[index]
 		conn = bufio.NewCachedPacketConn(conn, packetBuffer.Buffer, packetBuffer.Destination)
@@ -824,10 +827,7 @@ func (r *Router) actionSniff(
 		}
 		var err error
 		sniffBudget.begin(time.Now(), action.Timeout)
-		processed := sniffBudget.processed(action.SnifferNames)
-		if processed > len(inputPacketBuffers) {
-			processed = len(inputPacketBuffers)
-		}
+		processed := min(sniffBudget.processed(action.SnifferNames), len(inputPacketBuffers))
 		for _, packetBuffer := range inputPacketBuffers[processed:] {
 			if sniffBudget.exhausted(time.Now()) {
 				err = E.New("packet sniff budget exceeded")

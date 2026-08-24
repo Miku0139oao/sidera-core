@@ -29,6 +29,7 @@ func (e *managerTestEndpoint) Start(stage adapter.StartStage) error {
 	}
 	return nil
 }
+
 func (e *managerTestEndpoint) Close() error {
 	e.closed++
 	if e.closeFunc != nil {

@@ -36,7 +36,7 @@ func TestPersistenceWorkerBoundsUniqueBacklogAndJoinsClose(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("persistence worker did not start")
 	}
-	for index := 0; index < 10_000; index++ {
+	for index := range 10_000 {
 		cache.SaveDNSCacheAsync("transport", fmt.Sprintf("%d.example", index), 1, []byte("value"), time.Now().Add(time.Hour), nil)
 	}
 
@@ -95,8 +95,9 @@ func TestPersistenceWorkerSavesFinalCoalescedGeneration(t *testing.T) {
 	expiresAt := time.Now().Add(time.Hour)
 	cache.SaveDNSCacheAsync("transport", "same.example", 1, []byte("generation-0"), expiresAt, nil)
 	<-firstSaveStarted
-	for generation := 1; generation <= 10_000; generation++ {
-		cache.SaveDNSCacheAsync("transport", "same.example", 1, []byte(fmt.Sprintf("generation-%d", generation)), expiresAt, nil)
+	for index := range 10_000 {
+		generation := index + 1
+		cache.SaveDNSCacheAsync("transport", "same.example", 1, fmt.Appendf(nil, "generation-%d", generation), expiresAt, nil)
 	}
 	close(unblockSaver)
 	if err := cache.Close(); err != nil {

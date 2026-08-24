@@ -408,7 +408,7 @@ func (d *dashboard) createGenerationDirectory(kind string) (string, error) {
 			return "", err
 		}
 	}
-	for attempt := 0; attempt < 16; attempt++ {
+	for range 16 {
 		path, err := d.generationPath(kind)
 		if err != nil {
 			return "", err

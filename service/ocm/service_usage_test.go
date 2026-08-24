@@ -55,7 +55,7 @@ func TestUsageSaveWorkerCoalescesAndFinalSaveJoins(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("save worker did not start")
 	}
-	for index := 0; index < 10_000; index++ {
+	for range 10_000 {
 		if err := usage.AddUsage("gpt-test", contextWindowStandard, 1, 1, 0, serviceTierDefault, "user"); err != nil {
 			t.Fatal(err)
 		}
@@ -105,7 +105,7 @@ func TestUsageHistoryPrunesOldPeriodsIntoExactRollup(t *testing.T) {
 		saveWriter:   func([]byte) error { return nil },
 	}
 	base := time.Unix(1_700_000_000, 0).UTC()
-	for week := 0; week < 60; week++ {
+	for week := range 60 {
 		weekStart := base.Add(time.Duration(week) * 7 * 24 * time.Hour)
 		hint := &WeeklyCycleHint{WindowMinutes: 7 * 24 * 60, ResetAt: weekStart.Add(7 * 24 * time.Hour)}
 		if err := usage.AddUsageWithCycleHint("gpt-test", contextWindowStandard, 1, 2, 0, serviceTierDefault, "user", weekStart, hint); err != nil {

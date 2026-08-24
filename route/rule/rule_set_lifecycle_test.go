@@ -240,10 +240,7 @@ func TestRemoteRuleSetRejectsOversizedCountsAndCompressionBomb(t *testing.T) {
 		chunk := make([]byte, 32*1024)
 		remaining := maxRemoteRuleSetDecompressedSize + 1
 		for remaining > 0 {
-			writeSize := len(chunk)
-			if writeSize > remaining {
-				writeSize = remaining
-			}
+			writeSize := min(len(chunk), remaining)
 			_, err := writer.Write(chunk[:writeSize])
 			require.NoError(t, err)
 			remaining -= writeSize

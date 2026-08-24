@@ -30,6 +30,7 @@ func (i *closeTestInbound) Start(stage adapter.StartStage) error {
 	}
 	return nil
 }
+
 func (i *closeTestInbound) Close() error {
 	i.closed++
 	if i.started != nil {

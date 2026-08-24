@@ -217,7 +217,7 @@ func New(options Options) (result *Box, resultErr error) {
 		if constructionComplete {
 			return
 		}
-		cleanupErr, cleanupPanic := instance.closeResources()
+		cleanupPanic, cleanupErr := instance.closeResources()
 		if cleanupPanic != nil {
 			cleanupErr = errors.Join(cleanupErr, E.New("panic while rolling back Box construction: ", cleanupPanic))
 		}
@@ -693,21 +693,21 @@ func (s *Box) Close() (err error) {
 		}
 	}()
 	var closePanic any
-	err, closePanic = s.closeResources()
+	closePanic, err = s.closeResources()
 	if closePanic != nil {
 		panic(closePanic)
 	}
 	return err
 }
 
-func (s *Box) closeResources() (err error, firstPanic any) {
+func (s *Box) closeResources() (firstPanic any, err error) {
 	if s.done != nil {
 		close(s.done)
 		s.done = nil
 	}
 	closeResource := func(name string, closeFunc func() error) {
 		done := adapter.LogElapsed(s.logger, "close ", name)
-		childErr, panicValue := closeBoxResource(closeFunc)
+		panicValue, childErr := closeBoxResource(closeFunc)
 		done()
 		if childErr != nil {
 			err = errors.Join(err, E.Cause(childErr, "close ", name))
@@ -765,15 +765,15 @@ func (s *Box) closeResources() (err error, firstPanic any) {
 	if s.logFactory != nil {
 		closeResource("logger", s.logFactory.Close)
 	}
-	return err, firstPanic
+	return firstPanic, err
 }
 
-func closeBoxResource(closeFunc func() error) (err error, panicValue any) {
+func closeBoxResource(closeFunc func() error) (panicValue any, err error) {
 	defer func() {
 		panicValue = recover()
 	}()
 	err = closeFunc()
-	return err, nil
+	return nil, err
 }
 
 func (s *Box) Network() adapter.NetworkManager {
