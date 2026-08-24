@@ -25,6 +25,7 @@ import (
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 	"github.com/sagernet/sing/common/winpowrprof"
+	"github.com/sagernet/sing/common/x/list"
 	"github.com/sagernet/sing/service"
 	"github.com/sagernet/sing/service/pause"
 
@@ -56,7 +57,14 @@ type NetworkManager struct {
 	wifiMonitor            settings.WIFIMonitor
 	wifiState              adapter.WIFIState
 	wifiStateMutex         sync.RWMutex
+	operationAccess        sync.Mutex
+	lifecycleAccess        sync.Mutex
+	callbackGroup          sync.WaitGroup
+	interfaceCallback      *list.Element[tun.DefaultInterfaceUpdateCallback]
 	started                bool
+	closing                bool
+	closed                 bool
+	closeErr               error
 }
 
 func NewNetworkManager(ctx context.Context, logger logger.ContextLogger, options option.RouteOptions, dnsOptions option.DNSOptions) (*NetworkManager, error) {
@@ -125,18 +133,26 @@ func NewNetworkManager(ctx context.Context, logger logger.ContextLogger, options
 			if err != nil {
 				return nil, E.New("auto_detect_interface unsupported on current platform")
 			}
-			interfaceMonitor.RegisterCallback(nm.notifyInterfaceUpdate)
+			nm.interfaceCallback = interfaceMonitor.RegisterCallback(nm.notifyInterfaceUpdate)
 			nm.interfaceMonitor = interfaceMonitor
 		}
 	} else {
 		interfaceMonitor := nm.platformInterface.CreateDefaultInterfaceMonitor(logger)
-		interfaceMonitor.RegisterCallback(nm.notifyInterfaceUpdate)
+		nm.interfaceCallback = interfaceMonitor.RegisterCallback(nm.notifyInterfaceUpdate)
 		nm.interfaceMonitor = interfaceMonitor
 	}
 	return nm, nil
 }
 
 func (r *NetworkManager) Start(stage adapter.StartStage) error {
+	r.operationAccess.Lock()
+	defer r.operationAccess.Unlock()
+	r.lifecycleAccess.Lock()
+	if r.closing || r.closed {
+		r.lifecycleAccess.Unlock()
+		return os.ErrClosed
+	}
+	r.lifecycleAccess.Unlock()
 	monitor := taskmonitor.New(r.logger, C.StartTimeout)
 	switch stage {
 	case adapter.StartStateInitialize:
@@ -208,7 +224,9 @@ func (r *NetworkManager) Start(stage adapter.StartStage) error {
 				}
 			}
 		}
+		r.lifecycleAccess.Lock()
 		r.started = true
+		r.lifecycleAccess.Unlock()
 	}
 	return nil
 }
@@ -224,6 +242,25 @@ func (r *NetworkManager) Initialize(ruleSets []adapter.RuleSet) {
 }
 
 func (r *NetworkManager) Close() error {
+	r.operationAccess.Lock()
+	defer r.operationAccess.Unlock()
+	r.lifecycleAccess.Lock()
+	if r.closed {
+		err := r.closeErr
+		r.lifecycleAccess.Unlock()
+		return err
+	}
+	r.closing = true
+	r.started = false
+	interfaceCallback := r.interfaceCallback
+	r.interfaceCallback = nil
+	r.lifecycleAccess.Unlock()
+
+	if interfaceCallback != nil && r.interfaceMonitor != nil {
+		r.interfaceMonitor.UnregisterCallback(interfaceCallback)
+	}
+	r.callbackGroup.Wait()
+
 	monitor := taskmonitor.New(r.logger, C.StopTimeout)
 	var err error
 	if r.packageManager != nil {
@@ -261,6 +298,11 @@ func (r *NetworkManager) Close() error {
 		})
 		monitor.Finish()
 	}
+	r.lifecycleAccess.Lock()
+	r.closeErr = err
+	r.closed = true
+	r.closing = false
+	r.lifecycleAccess.Unlock()
 	return err
 }
 
@@ -429,6 +471,14 @@ func (r *NetworkManager) WIFIState() adapter.WIFIState {
 }
 
 func (r *NetworkManager) onWIFIStateChanged(state adapter.WIFIState) {
+	if !r.beginCallback() {
+		return
+	}
+	defer r.endCallback()
+	r.setWIFIState(state)
+}
+
+func (r *NetworkManager) setWIFIState(state adapter.WIFIState) {
 	state.BSSID = adapter.NormalizeWIFIBSSID(state.BSSID)
 	r.wifiStateMutex.Lock()
 	if state != r.wifiState {
@@ -445,6 +495,14 @@ func (r *NetworkManager) onWIFIStateChanged(state adapter.WIFIState) {
 }
 
 func (r *NetworkManager) UpdateWIFIState() {
+	if !r.beginCallback() {
+		return
+	}
+	defer r.endCallback()
+	r.updateWIFIState()
+}
+
+func (r *NetworkManager) updateWIFIState() {
 	var state adapter.WIFIState
 	if r.wifiMonitor != nil {
 		state = r.wifiMonitor.ReadWIFIState()
@@ -453,10 +511,32 @@ func (r *NetworkManager) UpdateWIFIState() {
 	} else {
 		return
 	}
-	r.onWIFIStateChanged(state)
+	r.setWIFIState(state)
+}
+
+func (r *NetworkManager) beginCallback() bool {
+	r.lifecycleAccess.Lock()
+	defer r.lifecycleAccess.Unlock()
+	if r.closing || r.closed {
+		return false
+	}
+	r.callbackGroup.Add(1)
+	return true
+}
+
+func (r *NetworkManager) endCallback() {
+	r.callbackGroup.Done()
 }
 
 func (r *NetworkManager) ResetNetwork() {
+	if !r.beginCallback() {
+		return
+	}
+	defer r.endCallback()
+	r.resetNetwork()
+}
+
+func (r *NetworkManager) resetNetwork() {
 	if r.connectionManager != nil {
 		r.connectionManager.CloseAll()
 	}
@@ -486,6 +566,10 @@ func (r *NetworkManager) ResetNetwork() {
 }
 
 func (r *NetworkManager) notifyInterfaceUpdate(defaultInterface *control.Interface, flags int) {
+	if !r.beginCallback() {
+		return
+	}
+	defer r.endCallback()
 	if defaultInterface == nil {
 		r.pauseManager.NetworkPause()
 		r.logger.Error("missing default interface")
@@ -520,19 +604,25 @@ func (r *NetworkManager) notifyInterfaceUpdate(defaultInterface *control.Interfa
 		}
 	}
 	r.logger.Info("updated default interface ", defaultInterface.Name, ", ", strings.Join(options, ", "))
-	r.UpdateWIFIState()
+	r.updateWIFIState()
 
-	if !r.started {
-		return
+	r.lifecycleAccess.Lock()
+	shouldReset := r.started && !r.closing && !r.closed
+	r.lifecycleAccess.Unlock()
+	if shouldReset {
+		r.resetNetwork()
 	}
-	r.ResetNetwork()
 }
 
 func (r *NetworkManager) notifyWindowsPowerEvent(event int) {
+	if !r.beginCallback() {
+		return
+	}
+	defer r.endCallback()
 	switch event {
 	case winpowrprof.EVENT_SUSPEND:
 		r.pauseManager.DevicePause()
-		r.ResetNetwork()
+		r.resetNetwork()
 	case winpowrprof.EVENT_RESUME:
 		if !r.pauseManager.IsDevicePaused() {
 			return
@@ -540,10 +630,14 @@ func (r *NetworkManager) notifyWindowsPowerEvent(event int) {
 		fallthrough
 	case winpowrprof.EVENT_RESUME_AUTOMATIC:
 		r.pauseManager.DeviceWake()
-		r.ResetNetwork()
+		r.resetNetwork()
 	}
 }
 
 func (r *NetworkManager) OnPackagesUpdated(packages int, sharedUsers int) {
+	if !r.beginCallback() {
+		return
+	}
+	defer r.endCallback()
 	r.logger.Info("updated packages list: ", packages, " packages, ", sharedUsers, " shared users")
 }

@@ -53,10 +53,7 @@ func getConfigs(server *Server, logFactory log.Factory) func(w http.ResponseWrit
 func patchConfigs(server *Server) func(w http.ResponseWriter, r *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var newConfig configSchema
-		err := render.DecodeJSON(r.Body, &newConfig)
-		if err != nil {
-			render.Status(r, http.StatusBadRequest)
-			render.JSON(w, r, ErrBadRequest)
+		if !decodeJSONRequest(w, r, &newConfig) {
 			return
 		}
 		if newConfig.Mode != "" {

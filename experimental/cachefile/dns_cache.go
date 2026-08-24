@@ -2,6 +2,7 @@ package cachefile
 
 import (
 	"encoding/binary"
+	"os"
 	"time"
 
 	"github.com/sagernet/bbolt"
@@ -16,9 +17,9 @@ func (c *CacheFile) StoreDNS() bool {
 }
 
 func (c *CacheFile) LoadDNSCache(transportName string, qName string, qType uint16) (rawMessage []byte, expireAt time.Time, loaded bool) {
-	c.saveDNSCacheAccess.RLock()
+	c.persistenceAccess.Lock()
 	entry, cached := c.saveDNSCache[saveCacheKey{transportName, qName, qType}]
-	c.saveDNSCacheAccess.RUnlock()
+	c.persistenceAccess.Unlock()
 	if cached {
 		return entry.rawMessage, entry.expireAt, true
 	}
@@ -73,65 +74,50 @@ func (c *CacheFile) SaveDNSCache(transportName string, qName string, qType uint1
 	})
 }
 
-func (c *CacheFile) SaveDNSCacheAsync(transportName string, qName string, qType uint16, rawMessage []byte, expireAt time.Time, logger logger.Logger) {
+func (c *CacheFile) SaveDNSCacheAsync(transportName string, qName string, qType uint16, rawMessage []byte, expireAt time.Time, targetLogger logger.Logger) {
 	saveKey := saveCacheKey{transportName, qName, qType}
-	if !c.queueDNSCacheSave(saveKey, rawMessage, expireAt) {
+	c.persistenceAccess.Lock()
+	if !c.persistenceStarted || c.persistenceClosing {
+		shouldLog := c.rejectPersistenceLocked()
+		c.persistenceAccess.Unlock()
+		logPersistenceRejection(targetLogger, "DNS cache", os.ErrClosed, shouldLog)
 		return
 	}
-	go c.flushPendingDNSCache(saveKey, logger)
-}
-
-func (c *CacheFile) queueDNSCacheSave(saveKey saveCacheKey, rawMessage []byte, expireAt time.Time) bool {
-	c.saveDNSCacheAccess.Lock()
-	defer c.saveDNSCacheAccess.Unlock()
-	entry := c.saveDNSCache[saveKey]
+	entry, loaded := c.saveDNSCache[saveKey]
+	additionalEntries := 0
+	additionalBytes := len(rawMessage) - len(entry.rawMessage)
+	if !loaded {
+		additionalEntries = 1
+		additionalBytes = cacheKeyPersistenceSize(saveKey) + len(rawMessage) + 32
+	}
+	if !c.queueAvailableLocked(additionalEntries, additionalBytes) {
+		shouldLog := c.rejectPersistenceLocked()
+		c.persistenceAccess.Unlock()
+		logPersistenceRejection(targetLogger, "DNS cache", errPersistenceOverloaded, shouldLog)
+		return
+	}
 	entry.rawMessage = append([]byte(nil), rawMessage...)
 	entry.expireAt = expireAt
 	entry.sequence++
-	startFlush := !entry.saving
-	entry.saving = true
+	entry.generation = c.dnsGeneration
 	c.saveDNSCache[saveKey] = entry
-	return startFlush
-}
-
-func (c *CacheFile) flushPendingDNSCache(saveKey saveCacheKey, logger logger.Logger) {
-	c.flushPendingDNSCacheWith(saveKey, logger, func(entry saveDNSCacheEntry) error {
-		return c.SaveDNSCache(saveKey.TransportName, saveKey.QuestionName, saveKey.QType, entry.rawMessage, entry.expireAt)
-	})
-}
-
-func (c *CacheFile) flushPendingDNSCacheWith(saveKey saveCacheKey, logger logger.Logger, save func(saveDNSCacheEntry) error) {
-	for {
-		c.saveDNSCacheAccess.RLock()
-		entry, loaded := c.saveDNSCache[saveKey]
-		c.saveDNSCacheAccess.RUnlock()
-		if !loaded {
-			return
-		}
-		err := save(entry)
-		if err != nil {
-			logger.Warn("save DNS cache: ", err)
-		}
-		c.saveDNSCacheAccess.Lock()
-		currentEntry, loaded := c.saveDNSCache[saveKey]
-		if !loaded {
-			c.saveDNSCacheAccess.Unlock()
-			return
-		}
-		if currentEntry.sequence != entry.sequence {
-			c.saveDNSCacheAccess.Unlock()
-			continue
-		}
-		delete(c.saveDNSCache, saveKey)
-		c.saveDNSCacheAccess.Unlock()
-		return
-	}
+	c.pendingEntries += additionalEntries
+	c.pendingBytes += additionalBytes
+	c.persistenceAccess.Unlock()
+	c.notifyPersistenceWorker()
 }
 
 func (c *CacheFile) ClearDNSCache() error {
-	c.saveDNSCacheAccess.Lock()
+	c.persistenceOperation.Lock()
+	defer c.persistenceOperation.Unlock()
+	c.persistenceAccess.Lock()
+	c.dnsGeneration++
+	for key, entry := range c.saveDNSCache {
+		c.pendingEntries--
+		c.pendingBytes -= dnsPersistenceSize(key, entry)
+	}
 	clear(c.saveDNSCache)
-	c.saveDNSCacheAccess.Unlock()
+	c.persistenceAccess.Unlock()
 	return c.batch(func(tx *bbolt.Tx) error {
 		if c.cacheID == nil {
 			bucket := tx.Bucket(bucketDNSCache)
@@ -154,6 +140,8 @@ func (c *CacheFile) loopCacheCleanup(interval time.Duration, cleanupFunc func())
 	for {
 		select {
 		case <-c.ctx.Done():
+			return
+		case <-c.cleanupStop:
 			return
 		case <-ticker.C:
 			cleanupFunc()
@@ -221,9 +209,16 @@ func (c *CacheFile) cleanupDNSCache() {
 }
 
 func (c *CacheFile) clearRDRC() {
-	c.saveRDRCAccess.Lock()
+	c.persistenceOperation.Lock()
+	defer c.persistenceOperation.Unlock()
+	c.persistenceAccess.Lock()
+	c.rdrcGeneration++
+	for key := range c.saveRDRC {
+		c.pendingEntries--
+		c.pendingBytes -= cacheKeyPersistenceSize(key)
+	}
 	clear(c.saveRDRC)
-	c.saveRDRCAccess.Unlock()
+	c.persistenceAccess.Unlock()
 	err := c.batch(func(tx *bbolt.Tx) error {
 		if c.cacheID == nil {
 			if tx.Bucket(bucketRDRC) == nil {

@@ -70,6 +70,8 @@ func memory(ctx context.Context) func(w http.ResponseWriter, r *http.Request) {
 			select {
 			case <-ctx.Done():
 				return
+			case <-r.Context().Done():
+				return
 			case <-tick.C:
 			}
 			buf.Reset()

@@ -111,24 +111,23 @@ func getConnections(ctx context.Context, trafficManager *trafficcontrol.Manager)
 			return
 		}
 
+		intervalStr := r.URL.Query().Get("interval")
+		interval := 1000
+		if intervalStr != "" {
+			parsedInterval, parseErr := strconv.Atoi(intervalStr)
+			if parseErr != nil || parsedInterval <= 0 {
+				render.Status(r, http.StatusBadRequest)
+				render.JSON(w, r, ErrBadRequest)
+				return
+			}
+			interval = parsedInterval
+		}
+
 		conn, _, _, err := ws.UpgradeHTTP(r, w)
 		if err != nil {
 			return
 		}
 		defer conn.Close()
-
-		intervalStr := r.URL.Query().Get("interval")
-		interval := 1000
-		if intervalStr != "" {
-			t, err := strconv.Atoi(intervalStr)
-			if err != nil {
-				render.Status(r, http.StatusBadRequest)
-				render.JSON(w, r, ErrBadRequest)
-				return
-			}
-
-			interval = t
-		}
 
 		buf := &bytes.Buffer{}
 		sendSnapshot := func() error {
@@ -149,6 +148,8 @@ func getConnections(ctx context.Context, trafficManager *trafficcontrol.Manager)
 		for {
 			select {
 			case <-ctx.Done():
+				return
+			case <-r.Context().Done():
 				return
 			case <-tick.C:
 			}
