@@ -382,8 +382,9 @@ func copyPacketExact(destination N.PacketWriter, source N.PacketReader) (n int64
 	// ignore MSG_TRUNC, which can turn a valid large datagram into a corrupt
 	// prefix. A maximum-size managed buffer keeps packet boundaries exact.
 	const maxUDPPayloadSize = 65535
+	options := N.NewReadWaitOptions(source, destination)
 	for {
-		buffer := buf.NewSize(maxUDPPayloadSize)
+		buffer := options.NewBufferSize(maxUDPPayloadSize)
 		packetDestination, readErr := source.ReadPacket(buffer)
 		if readErr != nil {
 			buffer.Release()
@@ -394,6 +395,7 @@ func copyPacketExact(destination N.PacketWriter, source N.PacketReader) (n int64
 			buffer.Release()
 			return n, E.New("UDP packet exceeds maximum payload size")
 		}
+		options.PostReturn(buffer)
 		if writeErr := destination.WritePacket(buffer, packetDestination); writeErr != nil {
 			buffer.Leak()
 			return n, writeErr
