@@ -17,14 +17,22 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"lukechampine.com/blake3"
 )
 
+const (
+	maxServerSessions = 4096
+	maxSessionResumes = 1024
+)
+
 type ServerSession struct {
-	PfsKey  []byte
-	NfsKeys sync.Map
+	PfsKey      []byte
+	ExpireAt    time.Time
+	NfsKeys     sync.Map
+	resumeCount atomic.Uint32
 }
 
 type ServerInstance struct {
@@ -41,8 +49,6 @@ type ServerInstance struct {
 	RWLock   sync.RWMutex
 	Closed   bool
 	done     chan struct{}
-	Lasts    map[int64][16]byte
-	Tickets  [][16]byte
 	Sessions map[[16]byte]*ServerSession
 }
 
@@ -91,9 +97,7 @@ func (i *ServerInstance) Init(nfsSKeysBytes [][]byte, xorMode uint32, secondsFro
 		return err
 	}
 	if secondsFrom > 0 || secondsTo > 0 {
-		i.Lasts = make(map[int64][16]byte)
-		i.Tickets = make([][16]byte, 0, 1024)
-		i.Sessions = make(map[[16]byte]*ServerSession)
+		i.Sessions = make(map[[16]byte]*ServerSession, min(maxServerSessions, 1024))
 		i.done = make(chan struct{})
 		go i.expireSessions()
 	}
@@ -107,17 +111,10 @@ func (i *ServerInstance) expireSessions() {
 		select {
 		case <-ticker.C:
 			i.RWLock.Lock()
-			minute := time.Now().Unix() / 60
-			last := i.Lasts[minute]
-			delete(i.Lasts, minute)
-			delete(i.Lasts, minute-1)
-			if last != [16]byte{} {
-				for index, ticket := range i.Tickets {
+			now := time.Now()
+			for ticket, session := range i.Sessions {
+				if !now.Before(session.ExpireAt) {
 					delete(i.Sessions, ticket)
-					if ticket == last {
-						i.Tickets = i.Tickets[index+1:]
-						break
-					}
 				}
 			}
 			i.RWLock.Unlock()
@@ -134,6 +131,7 @@ func (i *ServerInstance) Close() error {
 		if i.done != nil {
 			close(i.done)
 		}
+		i.Sessions = nil
 	}
 	i.RWLock.Unlock()
 	return nil
@@ -142,6 +140,12 @@ func (i *ServerInstance) Close() error {
 func (i *ServerInstance) Handshake(conn net.Conn, fallback *[]byte) (*CommonConn, error) {
 	if i.NfsSKeys == nil {
 		return nil, errors.New("uninitialized")
+	}
+	i.RWLock.RLock()
+	closed := i.Closed
+	i.RWLock.RUnlock()
+	if closed {
+		return nil, net.ErrClosed
 	}
 	c := NewCommonConn(conn, true)
 
@@ -278,9 +282,22 @@ func (i *ServerInstance) Handshake(conn net.Conn, fallback *[]byte) (*CommonConn
 	copy(ticket[:], EncodeLength(int(seconds)))
 	if seconds > 0 {
 		i.RWLock.Lock()
-		i.Lasts[(time.Now().Unix()+max(i.SecondsFrom, i.SecondsTo))/60+2] = ticket
-		i.Tickets = append(i.Tickets, ticket)
-		i.Sessions[ticket] = &ServerSession{PfsKey: pfsKey}
+		if i.Closed {
+			i.RWLock.Unlock()
+			return nil, net.ErrClosed
+		}
+		if len(i.Sessions) >= maxServerSessions {
+			var oldestTicket [16]byte
+			var oldestExpiry time.Time
+			for existingTicket, session := range i.Sessions {
+				if oldestExpiry.IsZero() || session.ExpireAt.Before(oldestExpiry) {
+					oldestTicket = existingTicket
+					oldestExpiry = session.ExpireAt
+				}
+			}
+			delete(i.Sessions, oldestTicket)
+		}
+		i.Sessions[ticket] = &ServerSession{PfsKey: pfsKey, ExpireAt: time.Now().Add(time.Duration(seconds) * time.Second)}
 		i.RWLock.Unlock()
 	}
 
@@ -331,9 +348,14 @@ func (i *ServerInstance) resume(conn net.Conn, c *CommonConn, iv, nfsKey []byte,
 	if err != nil {
 		return nil, err
 	}
-	i.RWLock.RLock()
-	session := i.Sessions[[16]byte(ticket)]
-	i.RWLock.RUnlock()
+	i.RWLock.Lock()
+	ticketID := [16]byte(ticket)
+	session := i.Sessions[ticketID]
+	if session != nil && !time.Now().Before(session.ExpireAt) {
+		delete(i.Sessions, ticketID)
+		session = nil
+	}
+	i.RWLock.Unlock()
 	if session == nil {
 		noiseLength, randomErr := randBetween(1279, 2279)
 		if randomErr != nil {
@@ -353,6 +375,12 @@ func (i *ServerInstance) resume(conn net.Conn, c *CommonConn, iv, nfsKey []byte,
 	}
 	if _, loaded := session.NfsKeys.LoadOrStore([32]byte(nfsKey), true); loaded {
 		return nil, errors.New("replay detected")
+	}
+	if session.resumeCount.Add(1) > maxSessionResumes {
+		i.RWLock.Lock()
+		delete(i.Sessions, ticketID)
+		i.RWLock.Unlock()
+		return nil, errors.New("ticket resume limit exceeded")
 	}
 	c.UnitedKey = append(session.PfsKey, nfsKey...)
 	c.PreWrite = make([]byte, 16)

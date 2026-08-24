@@ -1,9 +1,9 @@
 package v2raywebsocket
 
 import (
+	"crypto/rand"
 	"encoding/binary"
 	"io"
-	"math/rand"
 
 	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/bufio"
@@ -61,9 +61,12 @@ func (w *Writer) WriteBuffer(buffer *buf.Buffer) error {
 	}
 
 	if !w.isServer {
-		maskKey := rand.Uint32()
-		binary.BigEndian.PutUint32(header[1+payloadBitLength:], maskKey)
-		ws.Cipher(data, [4]byte(header[1+payloadBitLength:]), 0)
+		mask := header[1+payloadBitLength : 1+payloadBitLength+4]
+		if _, err := io.ReadFull(rand.Reader, mask); err != nil {
+			buffer.Release()
+			return err
+		}
+		ws.Cipher(data, [4]byte(mask), 0)
 	}
 
 	return wrapWsError(w.writer.WriteBuffer(buffer))

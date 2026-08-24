@@ -124,9 +124,9 @@ func (c *STDServerConfig) NextProtos() []string {
 	c.access.RLock()
 	defer c.access.RUnlock()
 	if c.hasACMEALPN() && len(c.config.NextProtos) > 1 && c.config.NextProtos[0] == C.ACMETLS1Protocol {
-		return c.config.NextProtos[1:]
+		return append([]string(nil), c.config.NextProtos[1:]...)
 	}
-	return c.config.NextProtos
+	return append([]string(nil), c.config.NextProtos...)
 }
 
 func (c *STDServerConfig) SetNextProtos(nextProto []string) {
@@ -134,9 +134,9 @@ func (c *STDServerConfig) SetNextProtos(nextProto []string) {
 	defer c.access.Unlock()
 	config := c.config.Clone()
 	if c.hasACMEALPN() && len(c.config.NextProtos) > 1 && c.config.NextProtos[0] == C.ACMETLS1Protocol {
-		config.NextProtos = append(c.config.NextProtos[:1], nextProto...)
+		config.NextProtos = append([]string{c.config.NextProtos[0]}, nextProto...)
 	} else {
-		config.NextProtos = nextProto
+		config.NextProtos = append([]string(nil), nextProto...)
 	}
 	c.config = config
 }
@@ -166,21 +166,34 @@ func (c *STDServerConfig) hasACMEALPN() bool {
 }
 
 func (c *STDServerConfig) STDConfig() (*STDConfig, error) {
-	return c.config, nil
+	c.access.RLock()
+	config := c.config
+	c.access.RUnlock()
+	return config, nil
 }
 
 func (c *STDServerConfig) Client(conn net.Conn) (Conn, error) {
-	return tls.Client(conn, c.config), nil
+	c.access.RLock()
+	config := c.config
+	c.access.RUnlock()
+	return tls.Client(conn, config), nil
 }
 
 func (c *STDServerConfig) Server(conn net.Conn) (Conn, error) {
-	return tls.Server(conn, c.config), nil
+	c.access.RLock()
+	config := c.config
+	c.access.RUnlock()
+	return tls.Server(conn, config), nil
 }
 
 func (c *STDServerConfig) Clone() Config {
+	c.access.RLock()
+	config := c.config.Clone()
+	handshakeTimeout := c.handshakeTimeout
+	c.access.RUnlock()
 	return &STDServerConfig{
-		config:           c.config.Clone(),
-		handshakeTimeout: c.handshakeTimeout,
+		config:           config,
+		handshakeTimeout: handshakeTimeout,
 	}
 }
 

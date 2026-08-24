@@ -93,7 +93,7 @@ func TestRuntimeFallbackTriesBackupAndRollsBackFailedPrimary(t *testing.T) {
 	}}}
 	require.NoError(t, writeRuntimeConfig(path, badOptions))
 
-	instance, cancel, active, loadedPath, priorErr, err := startRuntimeFallback(path)
+	instance, cancel, active, loadedPath, priorErr, err := startRuntimeFallback(globalCtx, path)
 	require.NoError(t, err)
 	require.Error(t, priorErr)
 	require.Equal(t, path+".bak", loadedPath)

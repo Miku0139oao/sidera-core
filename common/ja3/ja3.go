@@ -36,7 +36,7 @@ func (j *ClientHello) Equals(another *ClientHello, ignoreExtensionsSequence bool
 	if !ignoreExtensionsSequence && !slices.Equal(j.Extensions, another.Extensions) {
 		return false
 	}
-	if ignoreExtensionsSequence && !slices.Equal(j.Extensions, another.sortedExtensions()) {
+	if ignoreExtensionsSequence && !slices.Equal(j.sortedExtensions(), another.sortedExtensions()) {
 		return false
 	}
 	if !slices.Equal(j.EllipticCurves, another.EllipticCurves) {

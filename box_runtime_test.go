@@ -3,7 +3,10 @@ package box_test
 import (
 	"context"
 	"errors"
+	"os"
+	"sync"
 	"testing"
+	"time"
 
 	box "github.com/Miku0139oao/sidera-core"
 	"github.com/Miku0139oao/sidera-core/adapter"
@@ -38,6 +41,109 @@ func TestRuntimeCommitIsSkippedWhenSnapshotFails(t *testing.T) {
 	require.Equal(t, []string{"started", "validate", "snapshot"}, events)
 }
 
+func TestConcurrentCloseWaitsForOwnerAndDoesNotPanic(t *testing.T) {
+	startedClose := make(chan struct{})
+	releaseClose := make(chan struct{})
+	registry := boxService.NewRegistry()
+	boxService.Register[option.StubOptions](registry, "blocking-close-test", func(ctx context.Context, logger log.ContextLogger, tag string, options option.StubOptions) (adapter.Service, error) {
+		return &blockingCloseTestService{
+			Adapter: boxService.NewAdapter("blocking-close-test", tag),
+			started: startedClose,
+			release: releaseClose,
+		}, nil
+	})
+	ctx := include.Context(context.Background())
+	ctx = service.ContextWith[adapter.ServiceRegistry](ctx, registry)
+	ctx = service.ContextWith[option.ServiceOptionsRegistry](ctx, registry)
+	instance, err := box.New(box.Options{
+		Context: ctx,
+		Options: option.Options{Services: []option.Service{{Type: "blocking-close-test", Tag: "test", Options: &option.StubOptions{}}}},
+	})
+	require.NoError(t, err)
+	require.NoError(t, instance.Start())
+
+	firstResult := make(chan error, 1)
+	go func() { firstResult <- instance.Close() }()
+	select {
+	case <-startedClose:
+	case <-time.After(time.Second):
+		t.Fatal("first close did not reach the blocking service")
+	}
+	secondResult := make(chan error, 1)
+	go func() { secondResult <- instance.Close() }()
+	select {
+	case err := <-secondResult:
+		t.Fatalf("second close returned before teardown completed: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(releaseClose)
+	require.NoError(t, <-firstResult)
+	require.ErrorIs(t, <-secondResult, os.ErrClosed)
+}
+
+func TestCloseReentryDoesNotDeadlock(t *testing.T) {
+	registry := boxService.NewRegistry()
+	var reentrant *reentrantCloseTestService
+	boxService.Register[option.StubOptions](registry, "reentrant-close-test", func(ctx context.Context, logger log.ContextLogger, tag string, options option.StubOptions) (adapter.Service, error) {
+		reentrant = &reentrantCloseTestService{
+			Adapter: boxService.NewAdapter("reentrant-close-test", tag),
+			result:  make(chan error, 1),
+		}
+		return reentrant, nil
+	})
+	ctx := include.Context(context.Background())
+	ctx = service.ContextWith[adapter.ServiceRegistry](ctx, registry)
+	ctx = service.ContextWith[option.ServiceOptionsRegistry](ctx, registry)
+	instance, err := box.New(box.Options{
+		Context: ctx,
+		Options: option.Options{Services: []option.Service{{Type: "reentrant-close-test", Tag: "test", Options: &option.StubOptions{}}}},
+	})
+	require.NoError(t, err)
+	reentrant.instance = instance
+	require.NoError(t, instance.Start())
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- instance.Close() }()
+	select {
+	case err := <-closeDone:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("reentrant Close deadlocked")
+	}
+	require.ErrorIs(t, <-reentrant.result, os.ErrClosed)
+}
+
+func TestClosePanicDoesNotWedgeLaterCallers(t *testing.T) {
+	registry := boxService.NewRegistry()
+	boxService.Register[option.StubOptions](registry, "panic-close-test", func(ctx context.Context, logger log.ContextLogger, tag string, options option.StubOptions) (adapter.Service, error) {
+		return &panicCloseTestService{Adapter: boxService.NewAdapter("panic-close-test", tag)}, nil
+	})
+	ctx := include.Context(context.Background())
+	ctx = service.ContextWith[adapter.ServiceRegistry](ctx, registry)
+	ctx = service.ContextWith[option.ServiceOptionsRegistry](ctx, registry)
+	instance, err := box.New(box.Options{
+		Context: ctx,
+		Options: option.Options{Services: []option.Service{{Type: "panic-close-test", Tag: "test", Options: &option.StubOptions{}}}},
+	})
+	require.NoError(t, err)
+	require.NoError(t, instance.Start())
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("first Close did not propagate the service panic")
+			}
+		}()
+		_ = instance.Close()
+	}()
+	result := make(chan error, 1)
+	go func() { result <- instance.Close() }()
+	select {
+	case closeErr := <-result:
+		require.ErrorIs(t, closeErr, os.ErrClosed)
+	case <-time.After(time.Second):
+		t.Fatal("second Close blocked after the first closer panicked")
+	}
+}
+
 func TestRuntimeActivationWaitsForEveryServiceValidation(t *testing.T) {
 	var events []string
 	expected := errors.New("not ready")
@@ -66,6 +172,39 @@ func TestRuntimeCommitRollsBackEarlierCommits(t *testing.T) {
 		"started:first", "started:second", "validate:first", "validate:second", "snapshot",
 		"commit:first", "commit:second", "rollback:first", "rollback:snapshot",
 	}, events)
+}
+
+type reentrantCloseTestService struct {
+	boxService.Adapter
+	instance *box.Box
+	result   chan error
+}
+
+func (s *reentrantCloseTestService) Start(adapter.StartStage) error { return nil }
+func (s *reentrantCloseTestService) Close() error {
+	s.result <- s.instance.Close()
+	return nil
+}
+
+type panicCloseTestService struct {
+	boxService.Adapter
+}
+
+func (s *panicCloseTestService) Start(adapter.StartStage) error { return nil }
+func (s *panicCloseTestService) Close() error                   { panic("close panic") }
+
+type blockingCloseTestService struct {
+	boxService.Adapter
+	started     chan struct{}
+	release     chan struct{}
+	startedOnce sync.Once
+}
+
+func (s *blockingCloseTestService) Start(adapter.StartStage) error { return nil }
+func (s *blockingCloseTestService) Close() error {
+	s.startedOnce.Do(func() { close(s.started) })
+	<-s.release
+	return nil
 }
 
 type runtimeCommitTestService struct {

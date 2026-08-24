@@ -113,6 +113,10 @@ func ClientHandshake(ctx context.Context, conn net.Conn, config Config) (Conn, e
 	if err != nil {
 		return nil, err
 	}
+	return wrapClientReadWait(tlsConn)
+}
+
+func wrapClientReadWait(tlsConn Conn) (Conn, error) {
 	readWaitConn, err := badtls.NewReadWaitConn(tlsConn)
 	if err == nil {
 		return readWaitConn, nil
@@ -168,7 +172,12 @@ func (d *defaultDialer) dialContext(ctx context.Context, destination M.Socksaddr
 		}
 		return nil, err
 	}
-	return tlsConn, nil
+	wrappedConn, err := wrapClientReadWait(tlsConn)
+	if err != nil {
+		tlsConn.Close()
+		return nil, err
+	}
+	return wrappedConn, nil
 }
 
 func (d *defaultDialer) Upstream() any {

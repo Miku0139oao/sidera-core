@@ -49,7 +49,22 @@ Build it explicitly when migration support is required:
 go build -tags with_3xui_import ./cmd/sidera
 ```
 
-The release build profiles and optional feature tags are listed in `release/`.
+For low-RAM or slow 1–2 core devices, an additive lean profile keeps the core
+TCP proxy, system-stack TUN, built-in core management, and uTLS/REALITY paths
+while excluding optional QUIC, gVisor, VPN, cloud, and extended management
+integrations:
+
+```sh
+make build_low_memory
+# or: go build -tags "$(cat release/LOW_MEMORY_BUILD_TAGS)" ./cmd/sidera
+```
+
+This profile is intentionally separate from the full release artifact. Tagged
+features that are not compiled fail explicitly; TUN remains available but uses
+the system stack, so low-memory deployments should set `stack: system`
+explicitly rather than relying on the full profile's automatic stack choice. The release build profiles and optional feature
+tags are listed in `release/`. See [BENCHMARK.md](BENCHMARK.md) for the corrected
+sing-box/Xray methodology, current engineering baseline, and claim limits.
 
 ## Provenance
 

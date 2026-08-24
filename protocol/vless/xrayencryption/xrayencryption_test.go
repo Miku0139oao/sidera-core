@@ -6,6 +6,7 @@ import (
 	"crypto/mlkem"
 	"crypto/rand"
 	"encoding/base64"
+	"errors"
 	"io"
 	"net"
 	"strings"
@@ -114,6 +115,27 @@ func TestZeroRTTReconnect(t *testing.T) {
 	exchange(t, resumedServer.conn, resumedClient, []byte("resumed response"))
 }
 
+func TestClosedServerRejectsHandshake(t *testing.T) {
+	privateKey, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverKey := base64.RawURLEncoding.EncodeToString(privateKey.Bytes())
+	server, err := NewServer(methodName + ".native.0s." + serverKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := server.Close(); err != nil {
+		t.Fatal(err)
+	}
+	serverConn, clientConn := net.Pipe()
+	defer serverConn.Close()
+	defer clientConn.Close()
+	if _, err := server.Handshake(serverConn, nil); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("Handshake after Close = %v, want net.ErrClosed", err)
+	}
+}
+
 func TestDefaultPaddingRoundTrip(t *testing.T) {
 	privateKey, err := mlkem.GenerateKey768()
 	if err != nil {
@@ -169,6 +191,8 @@ func TestParseConfigs(t *testing.T) {
 		{"mode", true, methodName + ".unknown.0s." + serverKey},
 		{"seconds", true, methodName + ".native.bad." + serverKey},
 		{"negative seconds", true, methodName + ".native.-1s." + serverKey},
+		{"oversized seconds", true, methodName + ".native.65536s." + serverKey},
+		{"descending seconds", true, methodName + ".native.300-120s." + serverKey},
 		{"handshake", false, methodName + ".native.2rtt." + serverKey},
 		{"missing key", true, methodName + ".native.0s." + testPadding},
 		{"bad key", false, methodName + ".native.1rtt." + strings.Repeat("x", 24)},

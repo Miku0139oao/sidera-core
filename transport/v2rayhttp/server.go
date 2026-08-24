@@ -29,6 +29,8 @@ import (
 
 var _ adapter.V2RayServerTransport = (*Server)(nil)
 
+const maxHTTP1EarlyData = 1 << 20
+
 type Server struct {
 	ctx        context.Context
 	logger     logger.ContextLogger
@@ -105,6 +107,15 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	source := sHttp.SourceAddress(request)
 	if h, ok := writer.(http.Hijacker); ok {
 		var requestBody *buf.Buffer
+		defer func() {
+			if requestBody != nil {
+				requestBody.Release()
+			}
+		}()
+		if request.ContentLength > maxHTTP1EarlyData {
+			s.invalidRequest(writer, request, http.StatusRequestEntityTooLarge, E.New("request body is too large"))
+			return
+		}
 		if contentLength := int(request.ContentLength); contentLength > 0 {
 			requestBody = buf.NewSize(contentLength)
 			_, err := requestBody.ReadFullFrom(request.Body, contentLength)
@@ -132,6 +143,7 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		}
 		if requestBody != nil {
 			conn = bufio.NewCachedConn(conn, requestBody)
+			requestBody = nil
 		}
 		s.handler.NewConnectionEx(DupContext(request.Context()), conn, source, M.Socksaddr{}, nil)
 	} else {

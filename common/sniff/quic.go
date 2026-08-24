@@ -245,6 +245,12 @@ func QUICClientHello(ctx context.Context, metadata *adapter.InboundContext, pack
 			if err != nil {
 				return err
 			}
+			if length == 0 {
+				continue
+			}
+			if length > uint64(decryptedReader.Len()) || offset > ^uint64(0)-length {
+				return os.ErrInvalid
+			}
 			index := len(decrypted) - decryptedReader.Len()
 			fragments = append(fragments, qCryptoFragment{offset, length, decrypted[index : index+int(length)]})
 			_, err = decryptedReader.Seek(int64(length), io.SeekCurrent)
@@ -279,6 +285,9 @@ func QUICClientHello(ctx context.Context, metadata *adapter.InboundContext, pack
 	}
 	var frameLen uint64
 	for _, fragment := range fragments {
+		if fragment.length > 1<<16-1-frameLen {
+			return os.ErrInvalid
+		}
 		frameLen += fragment.length
 	}
 	buffer := buf.NewSize(5 + int(frameLen))
