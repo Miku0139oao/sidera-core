@@ -1,6 +1,7 @@
 package adapter
 
 import (
+	"errors"
 	"reflect"
 	"strings"
 	"time"
@@ -9,6 +10,8 @@ import (
 	E "github.com/sagernet/sing/common/exceptions"
 	F "github.com/sagernet/sing/common/format"
 )
+
+var ErrLifecycleBusy = errors.New("lifecycle callback in progress")
 
 type SimpleLifecycle interface {
 	Start() error

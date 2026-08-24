@@ -117,9 +117,13 @@ func (m *Manager) Start(stage adapter.StartStage) error {
 
 func (m *Manager) StopAdmission() (err error) {
 	m.access.Lock()
-	if m.closing || m.closed || m.lifecycleDepth > 0 {
+	if m.closing || m.closed {
 		m.access.Unlock()
 		return os.ErrClosed
+	}
+	if m.lifecycleDepth > 0 {
+		m.access.Unlock()
+		return adapter.ErrLifecycleBusy
 	}
 	m.admissionStopped = true
 	services := append([]adapter.Service(nil), m.services...)
@@ -162,7 +166,7 @@ func (m *Manager) CloseAfterProducerQuiescence() (err error) {
 	}
 	if m.lifecycleDepth > 0 && m.closeCallbacks > 0 {
 		m.access.Unlock()
-		return os.ErrClosed
+		return adapter.ErrLifecycleBusy
 	}
 	m.closing = true
 	for m.lifecycleDepth > 0 {

@@ -107,7 +107,7 @@ func (m *Manager) Close() (err error) {
 	// closed state without claiming ownership of teardown.
 	if m.mutations > 0 && m.closeCallbacks > 0 {
 		m.access.Unlock()
-		return os.ErrClosed
+		return adapter.ErrLifecycleBusy
 	}
 	m.closing = true
 	for m.mutations > 0 {

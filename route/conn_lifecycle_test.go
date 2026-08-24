@@ -91,6 +91,26 @@ func TestCopyPacketExactPreservesDestinationHeadroom(t *testing.T) {
 	require.Equal(t, payload, writer.payload)
 }
 
+func TestConnectionManagerCloseJoinsActiveRelays(t *testing.T) {
+	manager := NewConnectionManager(log.NewNOPFactory().NewLogger("connection-test"))
+	require.True(t, manager.beginRelays(1))
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- manager.Close() }()
+	select {
+	case err := <-closeDone:
+		t.Fatalf("Close returned before active relay completion: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	manager.relayGroup.Done()
+	select {
+	case err := <-closeDone:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("Close did not join active relay completion")
+	}
+	require.False(t, manager.beginRelays(1))
+}
+
 func TestConnectionManagerRejectsLateRegistrationsAfterClose(t *testing.T) {
 	manager := NewConnectionManager(log.NewNOPFactory().NewLogger("connection-test"))
 	require.NoError(t, manager.Close())

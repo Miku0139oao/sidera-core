@@ -34,6 +34,7 @@ type ConnectionManager struct {
 	logger      logger.ContextLogger
 	access      sync.Mutex
 	connections list.List[io.Closer]
+	relayGroup  sync.WaitGroup
 	closed      bool
 }
 
@@ -86,6 +87,7 @@ func (m *ConnectionManager) Close() error {
 	for _, closer := range closers {
 		common.Close(closer)
 	}
+	m.relayGroup.Wait()
 	return nil
 }
 
@@ -179,8 +181,21 @@ func (m *ConnectionManager) NewConnection(ctx context.Context, this N.Dialer, co
 		return
 	}
 	relayState := &connectionRelayState{onClose: onClose}
-	go m.connectionCopy(ctx, conn, remoteConn, false, relayState)
-	go m.connectionCopy(ctx, remoteConn, conn, true, relayState)
+	if !m.beginRelays(2) {
+		common.Close(conn, remoteConn)
+		if onClose != nil {
+			onClose(net.ErrClosed)
+		}
+		return
+	}
+	go func() {
+		defer m.relayGroup.Done()
+		m.connectionCopy(ctx, conn, remoteConn, false, relayState)
+	}()
+	go func() {
+		defer m.relayGroup.Done()
+		m.connectionCopy(ctx, remoteConn, conn, true, relayState)
+	}()
 }
 
 func (m *ConnectionManager) NewPacketConnection(ctx context.Context, this N.Dialer, conn N.PacketConn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
@@ -296,8 +311,31 @@ func (m *ConnectionManager) NewPacketConnection(ctx context.Context, this N.Dial
 	}
 	destination := bufio.NewPacketConn(remotePacketConn)
 	var done atomic.Bool
-	go m.packetConnectionCopy(ctx, conn, destination, false, &done, onClose)
-	go m.packetConnectionCopy(ctx, destination, conn, true, &done, onClose)
+	if !m.beginRelays(2) {
+		common.Close(conn, remotePacketConn)
+		if onClose != nil {
+			onClose(net.ErrClosed)
+		}
+		return
+	}
+	go func() {
+		defer m.relayGroup.Done()
+		m.packetConnectionCopy(ctx, conn, destination, false, &done, onClose)
+	}()
+	go func() {
+		defer m.relayGroup.Done()
+		m.packetConnectionCopy(ctx, destination, conn, true, &done, onClose)
+	}()
+}
+
+func (m *ConnectionManager) beginRelays(count int) bool {
+	m.access.Lock()
+	defer m.access.Unlock()
+	if m.closed {
+		return false
+	}
+	m.relayGroup.Add(count)
+	return true
 }
 
 type connectionRelayState struct {

@@ -85,8 +85,8 @@ func TestCloseDuringChildCleanupReturnsRetryableError(t *testing.T) {
 	go func() { closeDone <- manager.Close() }()
 	select {
 	case err := <-closeDone:
-		if !errors.Is(err, os.ErrClosed) {
-			t.Fatalf("Close during child cleanup = %v, want os.ErrClosed", err)
+		if !errors.Is(err, adapter.ErrLifecycleBusy) {
+			t.Fatalf("Close during child cleanup = %v, want ErrLifecycleBusy", err)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("Close during child cleanup blocked")
@@ -296,8 +296,8 @@ func TestAsyncCloseReentryDuringRemovalDoesNotDeadlock(t *testing.T) {
 	go func() { result <- manager.Remove("test") }()
 	select {
 	case err := <-result:
-		if !errors.Is(err, os.ErrClosed) {
-			t.Fatalf("Remove error = %v, want os.ErrClosed", err)
+		if !errors.Is(err, adapter.ErrLifecycleBusy) {
+			t.Fatalf("Remove error = %v, want ErrLifecycleBusy", err)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("Remove deadlocked with asynchronous Close reentry")

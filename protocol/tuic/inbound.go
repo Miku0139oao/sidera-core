@@ -33,6 +33,11 @@ func RegisterInbound(registry *inbound.Registry) {
 
 var _ adapter.ManagedUserService = (*Inbound)(nil)
 
+type authenticatedTUICUser struct {
+	UUID string
+	Name string
+}
+
 type Inbound struct {
 	inbound.Adapter
 	ctx             context.Context
@@ -41,7 +46,7 @@ type Inbound struct {
 	listenOptions   option.ListenOptions
 	listener        *listener.Listener
 	tlsConfig       tls.ServerConfig
-	server          *tuic.Service[string]
+	server          *tuic.Service[authenticatedTUICUser]
 	serviceOptions  tuic.ServiceOptions
 	serviceAccess   sync.Mutex
 	started         bool
@@ -126,8 +131,8 @@ func (h *Inbound) UpdateManagedUsers(users []adapter.ManagedUser) error {
 	return h.replaceServiceLocked(service, managedUsers, userMap, h.startService)
 }
 
-func (h *Inbound) buildService(users []adapter.ManagedUser) (*tuic.Service[string], []adapter.ManagedUser, map[string]option.TUICUser, error) {
-	userList := make([]string, len(users))
+func (h *Inbound) buildService(users []adapter.ManagedUser) (*tuic.Service[authenticatedTUICUser], []adapter.ManagedUser, map[string]option.TUICUser, error) {
+	userList := make([]authenticatedTUICUser, len(users))
 	uuidList := make([][16]byte, len(users))
 	passwordList := make([]string, len(users))
 	userMap := make(map[string]option.TUICUser, len(users))
@@ -150,13 +155,13 @@ func (h *Inbound) buildService(users []adapter.ManagedUser) (*tuic.Service[strin
 		protocolUser := option.TUICUser{Name: user.Name, UUID: user.UUID, Password: user.Password}
 		// The service writes this generation's immutable identity into the
 		// authenticated context; callbacks must not resolve through a newer map.
-		userList[index] = user.Name
+		userList[index] = authenticatedTUICUser{UUID: userID, Name: user.Name}
 		uuidList[index] = userUUID
 		passwordList[index] = user.Password
 		userMap[userID] = protocolUser
 		managedUsers[index] = adapter.ManagedUser{Name: user.Name, UUID: user.UUID, Password: user.Password}
 	}
-	service, err := tuic.NewService[string](h.serviceOptions)
+	service, err := tuic.NewService[authenticatedTUICUser](h.serviceOptions)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -165,10 +170,10 @@ func (h *Inbound) buildService(users []adapter.ManagedUser) (*tuic.Service[strin
 }
 
 func (h *Inbound) replaceServiceLocked(
-	newService *tuic.Service[string],
+	newService *tuic.Service[authenticatedTUICUser],
 	newUsers []adapter.ManagedUser,
 	newUserMap map[string]option.TUICUser,
-	startService func(*tuic.Service[string]) (*listener.Listener, error),
+	startService func(*tuic.Service[authenticatedTUICUser]) (*listener.Listener, error),
 ) error {
 	h.usersAccess.RLock()
 	oldUsers := append([]adapter.ManagedUser(nil), h.managedUsers...)
@@ -220,7 +225,7 @@ func (h *Inbound) publishUserGeneration(users []adapter.ManagedUser, userMap map
 	h.usersAccess.Unlock()
 }
 
-func (h *Inbound) startService(service *tuic.Service[string]) (*listener.Listener, error) {
+func (h *Inbound) startService(service *tuic.Service[authenticatedTUICUser]) (*listener.Listener, error) {
 	newListener := listener.New(listener.Options{Context: h.ctx, Logger: h.logger, Listen: h.listenOptions})
 	packetConn, err := newListener.ListenUDP()
 	if err != nil {
@@ -246,11 +251,11 @@ func (h *Inbound) userName(userID string) string {
 }
 
 func authenticatedUserName(ctx context.Context) string {
-	userName, loaded := auth.UserFromContext[string](ctx)
+	user, loaded := auth.UserFromContext[authenticatedTUICUser](ctx)
 	if !loaded {
 		return ""
 	}
-	return userName
+	return user.Name
 }
 
 func (h *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
