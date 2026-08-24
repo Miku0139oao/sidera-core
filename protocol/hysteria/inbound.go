@@ -122,21 +122,13 @@ func (h *Inbound) ManagedUsers() []adapter.ManagedUser {
 }
 
 func (h *Inbound) UpdateManagedUsers(users []adapter.ManagedUser) error {
+	h.serviceAccess.Lock()
+	defer h.serviceAccess.Unlock()
 	service, managedUsers, userNameMap, err := h.buildService(users)
 	if err != nil {
 		return err
 	}
-	h.serviceAccess.Lock()
-	defer h.serviceAccess.Unlock()
-	oldUsers := h.ManagedUsers()
-	if err = h.replaceServiceLocked(service, oldUsers); err != nil {
-		return err
-	}
-	h.userAccess.Lock()
-	h.userNameMap = userNameMap
-	h.users = managedUsers
-	h.userAccess.Unlock()
-	return nil
+	return h.replaceServiceLocked(service, managedUsers, userNameMap, h.startService)
 }
 
 func (h *Inbound) buildService(users []adapter.ManagedUser) (*hysteria.Service[string], []adapter.ManagedUser, map[string]string, error) {
@@ -147,6 +139,9 @@ func (h *Inbound) buildService(users []adapter.ManagedUser) (*hysteria.Service[s
 	for index, user := range users {
 		if user.Password == "" {
 			return nil, nil, nil, E.New("missing password for user ", index)
+		}
+		if _, exists := userNameMap[user.Password]; exists {
+			return nil, nil, nil, E.New("duplicate password for user ", index)
 		}
 		userList[index] = user.Password
 		passwordList[index] = user.Password
@@ -164,29 +159,48 @@ func (h *Inbound) buildService(users []adapter.ManagedUser) (*hysteria.Service[s
 	return service, managedUsers, userNameMap, nil
 }
 
-func (h *Inbound) replaceServiceLocked(newService *hysteria.Service[string], oldUsers []adapter.ManagedUser) error {
+func (h *Inbound) replaceServiceLocked(
+	newService *hysteria.Service[string],
+	newUsers []adapter.ManagedUser,
+	newUserNameMap map[string]string,
+	startService func(*hysteria.Service[string]) (*listener.Listener, error),
+) error {
+	h.userAccess.RLock()
+	oldUsers := append([]adapter.ManagedUser(nil), h.users...)
+	oldUserNameMap := h.userNameMap
+	h.userAccess.RUnlock()
 	if !h.started {
 		if h.service != nil {
 			_ = h.service.Close()
 		}
 		h.service = newService
+		h.publishUserGeneration(newUsers, newUserNameMap)
 		return nil
 	}
-	oldService := h.service
-	oldListener := h.listener
-	_ = oldService.Close()
-	_ = oldListener.Close()
-	newListener, err := h.startService(newService)
+	if h.service != nil {
+		_ = h.service.Close()
+	}
+	if h.listener != nil {
+		_ = h.listener.Close()
+	}
+
+	// Publish identity metadata before Start can authenticate or dispatch traffic.
+	h.publishUserGeneration(newUsers, newUserNameMap)
+	newListener, err := startService(newService)
 	if err == nil {
 		h.service = newService
 		h.listener = newListener
 		return nil
 	}
+
+	// No new listener was admitted. Restore the previous identity generation
+	// before a rebuilt previous service can authenticate traffic.
+	h.publishUserGeneration(oldUsers, oldUserNameMap)
 	rollbackService, _, _, rollbackBuildErr := h.buildService(oldUsers)
 	if rollbackBuildErr != nil {
 		return errors.Join(err, E.Cause(rollbackBuildErr, "rebuild previous hysteria service"))
 	}
-	rollbackListener, rollbackErr := h.startService(rollbackService)
+	rollbackListener, rollbackErr := startService(rollbackService)
 	if rollbackErr != nil {
 		return errors.Join(err, E.Cause(rollbackErr, "restore previous hysteria service"))
 	}
@@ -195,10 +209,19 @@ func (h *Inbound) replaceServiceLocked(newService *hysteria.Service[string], old
 	return err
 }
 
+func (h *Inbound) publishUserGeneration(users []adapter.ManagedUser, userNameMap map[string]string) {
+	h.userAccess.Lock()
+	h.userNameMap = userNameMap
+	h.users = users
+	h.userAccess.Unlock()
+}
+
 func (h *Inbound) startService(service *hysteria.Service[string]) (*listener.Listener, error) {
 	newListener := listener.New(listener.Options{Context: h.ctx, Logger: h.logger, Listen: h.listenOptions})
 	packetConn, err := newListener.ListenUDP()
 	if err != nil {
+		_ = newListener.Close()
+		_ = service.Close()
 		return nil, err
 	}
 	address := newListener.UDPAddr()

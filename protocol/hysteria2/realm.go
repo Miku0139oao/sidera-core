@@ -54,9 +54,19 @@ func NewRealmService(ctx context.Context, logger log.ContextLogger, tag string, 
 		if user.Token == "" {
 			return nil, E.New("missing token for user[", i, "]")
 		}
+		if user.MaxRealms < 0 {
+			return nil, E.New("max_realms must not be negative for user[", i, "]")
+		}
+		if _, exists := tokenMap[user.Token]; exists {
+			return nil, E.New("duplicate token for user[", i, "]")
+		}
+		maxRealms := user.MaxRealms
+		if maxRealms == 0 {
+			maxRealms = defaultMaxRealmsPerUser
+		}
 		tokenMap[user.Token] = &realmUser{
 			name:      user.Name,
-			maxRealms: user.MaxRealms,
+			maxRealms: maxRealms,
 		}
 	}
 	server := newServer(logger, tokenMap)

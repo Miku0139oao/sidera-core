@@ -402,6 +402,7 @@ func translateXray(ctx context.Context, content []byte) (option.Options, error) 
 	if len(source.Outbounds) > 0 {
 		outbounds := make([]map[string]any, 0, len(source.Outbounds))
 		endpoints := make([]map[string]any, 0)
+		requiresExplicitFreedomFinalRules := hasXrayPrivateFreedomDefault(source.Inbounds, exclusions.inbounds)
 		for index, outbound := range source.Outbounds {
 			if strings.EqualFold(outbound.Protocol, "wireguard") {
 				converted, convertErr := translateXrayWireGuardEndpoint(ctx, outbound)
@@ -411,7 +412,7 @@ func translateXray(ctx context.Context, content []byte) (option.Options, error) 
 				endpoints = append(endpoints, converted)
 				continue
 			}
-			converted, convertErr := translateXrayOutbound(ctx, outbound)
+			converted, convertErr := translateXrayOutbound(ctx, outbound, requiresExplicitFreedomFinalRules)
 			if convertErr != nil {
 				return option.Options{}, E.Cause(convertErr, "outbounds[", index, "]")
 			}
@@ -715,7 +716,7 @@ func translateAccounts(accounts []xrayAccount) []map[string]any {
 	return result
 }
 
-func translateXrayOutbound(ctx context.Context, source xrayOutbound) (map[string]any, error) {
+func translateXrayOutbound(ctx context.Context, source xrayOutbound, requiresExplicitFreedomFinalRules bool) (map[string]any, error) {
 	protocol := strings.ToLower(source.Protocol)
 	if protocol == "" {
 		return nil, E.New("missing protocol")
@@ -770,7 +771,7 @@ func translateXrayOutbound(ctx context.Context, source xrayOutbound) (map[string
 		if err != nil {
 			return nil, err
 		}
-		if err = validateFreedomSettings(ctx, settings); err != nil {
+		if err = validateFreedomSettings(ctx, settings, requiresExplicitFreedomFinalRules); err != nil {
 			return nil, err
 		}
 	case "blackhole", "block":
@@ -1089,7 +1090,7 @@ func parseXrayRealityTarget(raw stdjson.RawMessage) (string, uint16, error) {
 	return host, uint16(port), nil
 }
 
-func validateFreedomSettings(ctx context.Context, source xrayFreedomSettings) error {
+func validateFreedomSettings(ctx context.Context, source xrayFreedomSettings, requiresExplicitFinalRules bool) error {
 	strategy := source.TargetStrategy
 	if strategy == "" {
 		strategy = source.DomainStrategy
@@ -1102,7 +1103,13 @@ func validateFreedomSettings(ctx context.Context, source xrayFreedomSettings) er
 	if source.Redirect != "" || source.UserLevel != 0 || source.ProxyProtocol != 0 || hasJSONValue(source.Fragment) || hasJSONValue(source.Noise) || hasJSONValue(source.Noises) || hasJSONValue(source.IPsBlocked) {
 		return E.New("Xray direct outbound contains fields without a current Sidera equivalent")
 	}
-	if hasJSONValue(source.FinalRules) {
+	if !hasJSONValue(source.FinalRules) {
+		if requiresExplicitFinalRules {
+			return E.New("omitted Xray freedom finalRules applies a private-address policy that cannot be represented; configure one unconditional allow rule explicitly")
+		}
+		return nil
+	}
+	{
 		var rules []struct {
 			Action     string             `json:"action"`
 			Network    stdjson.RawMessage `json:"network"`
@@ -1476,7 +1483,7 @@ func translateXrayRoutingRule(source xrayRoutingRule) (map[string]any, error) {
 		result["network"] = networks
 	}
 	if len(source.Protocols) > 0 {
-		result["protocol"] = []string(source.Protocols)
+		return nil, E.New("Xray protocol rules use prefix matching and cannot be represented exactly")
 	}
 	if len(source.User) > 0 {
 		var users []string
@@ -1534,11 +1541,11 @@ func appendDomainMatch(result map[string]any, domains []string) error {
 		}
 		switch {
 		case strings.HasPrefix(domain, "full:"):
-			full = append(full, strings.TrimPrefix(domain, "full:"))
+			full = append(full, strings.ToLower(strings.TrimPrefix(domain, "full:")))
 		case strings.HasPrefix(domain, "domain:"):
-			suffix = append(suffix, strings.TrimPrefix(domain, "domain:"))
+			suffix = append(suffix, strings.ToLower(strings.TrimPrefix(domain, "domain:")))
 		case strings.HasPrefix(domain, "keyword:"):
-			keyword = append(keyword, strings.TrimPrefix(domain, "keyword:"))
+			keyword = append(keyword, strings.ToLower(strings.TrimPrefix(domain, "keyword:")))
 		case strings.HasPrefix(domain, "regexp:"):
 			regex = append(regex, strings.TrimPrefix(domain, "regexp:"))
 		case strings.HasPrefix(domain, "dotless:"):
@@ -1554,7 +1561,7 @@ func appendDomainMatch(result map[string]any, domains []string) error {
 		case strings.HasPrefix(domain, "geosite:") || strings.HasPrefix(domain, "ext:"):
 			return E.New("geodata domain rule is not implemented: ", domain)
 		default:
-			keyword = append(keyword, domain)
+			keyword = append(keyword, strings.ToLower(domain))
 		}
 	}
 	if len(full) > 0 {
@@ -1675,6 +1682,23 @@ func cloneHeaders(source map[string]string) map[string]string {
 	return result
 }
 
+func hasXrayPrivateFreedomDefault(inbounds []xrayInbound, excluded map[int]bool) bool {
+	for index, inbound := range inbounds {
+		if excluded[index] {
+			continue
+		}
+		protocol := strings.ToLower(inbound.Protocol)
+		switch protocol {
+		case "vless", "vmess", "trojan", "hysteria", "wireguard":
+			return true
+		}
+		if strings.HasPrefix(protocol, "shadowsocks") {
+			return true
+		}
+	}
+	return false
+}
+
 var xrayPrivatePrefixes = []netip.Prefix{
 	netip.MustParsePrefix("0.0.0.0/8"),
 	netip.MustParsePrefix("10.0.0.0/8"),
@@ -1696,6 +1720,8 @@ var xrayPrivatePrefixes = []netip.Prefix{
 	netip.MustParsePrefix("ff00::/8"),
 }
 
+var xrayPrivateSingleLabelPattern = regexp.MustCompile(`^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$`)
+
 func isXrayPrivateAddress(address string) bool {
 	if ip, err := netip.ParseAddr(strings.Trim(address, "[]")); err == nil {
 		ip = ip.Unmap().WithZone("")
@@ -1708,7 +1734,7 @@ func isXrayPrivateAddress(address string) bool {
 	}
 	domain := strings.TrimSuffix(strings.ToLower(address), ".")
 	if !strings.Contains(domain, ".") {
-		return true
+		return xrayPrivateSingleLabelPattern.MatchString(domain)
 	}
 	for _, suffix := range []string{"lan", "localdomain", "example", "invalid", "localhost", "test", "local", "home.arpa", "internal"} {
 		if domain == suffix || strings.HasSuffix(domain, "."+suffix) {
