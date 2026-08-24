@@ -187,6 +187,25 @@ func TestDecodeXrayRoutingCompatibility(t *testing.T) {
 		require.Equal(t, []string{"^[^.]*ads[^.]*$", "^[^.]*$"}, []string(options.Route.Rules[0].DefaultOptions.DomainRegex))
 	})
 
+	t.Run("literal domains use Xray lowercase semantics", func(t *testing.T) {
+		options := decodeXrayTestConfig(t, xrayRoutingDocument(`{
+			"domain": ["full:Example.COM", "domain:Example.ORG", "keyword:TRACKER", "BareLiteral", "regexp:^CaseSensitive$"],
+			"outboundTag": "block"
+		}`))
+		rule := options.Route.Rules[0].DefaultOptions
+		require.Equal(t, []string{"example.com"}, []string(rule.Domain))
+		require.Equal(t, []string{"example.org"}, []string(rule.DomainSuffix))
+		require.Equal(t, []string{"tracker", "bareliteral"}, []string(rule.DomainKeyword))
+		require.Equal(t, []string{"^CaseSensitive$"}, []string(rule.DomainRegex))
+	})
+
+	t.Run("protocol prefix matcher is rejected", func(t *testing.T) {
+		requireXrayTestError(t, xrayRoutingDocument(`{
+			"protocol": ["http"],
+			"outboundTag": "block"
+		}`), "prefix matching")
+	})
+
 	t.Run("negated IP is rejected early", func(t *testing.T) {
 		requireXrayTestError(t, xrayRoutingDocument(`{
 			"ip": ["!10.0.0.0/8"],
@@ -355,7 +374,11 @@ func TestDecodeXrayVLESSInboundWithRealityEncryption(t *testing.T) {
 				}
 			}
 		}],
-		"outbounds": [{"protocol": "freedom", "tag": "direct"}]
+		"outbounds": [{
+			"protocol": "freedom",
+			"tag": "direct",
+			"settings": {"finalRules": [{"action": "allow"}]}
+		}]
 	}`)
 	require.Len(t, options.Inbounds, 1)
 	require.Equal(t, "vless", options.Inbounds[0].Type)
@@ -529,8 +552,7 @@ func TestDecodeXrayLiveServerManagementAndHysteria2(t *testing.T) {
 			"domainStrategy": "AsIs",
 			"rules": [
 				{"type": "field", "inboundTag": ["api"], "outboundTag": "api"},
-				{"type": "field", "ip": ["geoip:private"], "outboundTag": "blocked"},
-				{"type": "field", "protocol": ["bittorrent"], "outboundTag": "blocked"}
+				{"type": "field", "ip": ["geoip:private"], "outboundTag": "blocked"}
 			]
 		}
 	}`)
@@ -561,14 +583,56 @@ func TestDecodeXrayLiveServerManagementAndHysteria2(t *testing.T) {
 	require.ElementsMatch(t, []string{"alice", "bob"}, options.Experimental.V2RayAPI.Stats.Users)
 	require.ElementsMatch(t, []string{"alice", "bob"}, options.Experimental.V2RayAPI.Stats.UsersOnline)
 
-	require.Len(t, options.Route.Rules, 2)
+	require.Len(t, options.Route.Rules, 1)
 	privateRule := options.Route.Rules[0].DefaultOptions
 	require.Contains(t, []string(privateRule.IPCIDR), "10.0.0.0/8")
 	require.Contains(t, []string(privateRule.IPCIDR), "100.64.0.0/10")
 	require.Equal(t, "blocked", privateRule.RouteOptions.Outbound)
-	bittorrentRule := options.Route.Rules[1].DefaultOptions
-	require.Equal(t, []string{"bittorrent"}, []string(bittorrentRule.Protocol))
-	require.Equal(t, "blocked", bittorrentRule.RouteOptions.Outbound)
+}
+
+func TestDecodeXrayFreedomPrivateAddressDefault(t *testing.T) {
+	const inbound = `"inbounds": [{
+		"protocol": "vless",
+		"tag": "vless-in",
+		"port": 443,
+		"settings": {
+			"clients": [{"email": "alice", "id": "27848739-7e62-4138-9fd3-098a63964b6b"}],
+			"decryption": "none"
+		},
+		"streamSettings": {"network": "raw", "security": "none"}
+	}],`
+
+	requireXrayTestError(t, `{`+inbound+`
+		"outbounds": [{"protocol": "freedom", "tag": "direct", "settings": {}}]
+	}`, "private-address policy")
+
+	options := decodeXrayTestConfig(t, `{`+inbound+`
+		"outbounds": [{
+			"protocol": "freedom",
+			"tag": "direct",
+			"settings": {"finalRules": [{"action": "allow"}]}
+		}]
+	}`)
+	require.Len(t, options.Outbounds, 1)
+	require.Equal(t, "direct", options.Outbounds[0].Type)
+}
+
+func TestDecodeXrayPrivateSingleLabelSemantics(t *testing.T) {
+	privateDocument := func(address string) string {
+		return `{
+			"outbounds": [{
+				"protocol": "vless",
+				"settings": {
+					"address": "` + address + `",
+					"port": 443,
+					"id": "27848739-7e62-4138-9fd3-098a63964b6b",
+					"encryption": "none"
+				}
+			}]
+		}`
+	}
+	decodeXrayTestConfig(t, privateDocument("gateway"))
+	requireXrayTestError(t, privateDocument("bad_name"), "prohibited for a public server address")
 }
 
 func TestDecodeXrayRejectsNonEquivalentHysteriaWindows(t *testing.T) {

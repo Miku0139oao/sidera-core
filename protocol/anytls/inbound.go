@@ -37,8 +37,16 @@ var (
 )
 
 type trackedConnection struct {
-	owner uint64
-	done  chan struct{}
+	owner  uint64
+	cancel context.CancelFunc
+	done   chan struct{}
+}
+
+type trackedStreamHandler struct {
+	owner  uint64
+	conn   net.Conn
+	cancel context.CancelFunc
+	done   chan struct{}
 }
 
 type Inbound struct {
@@ -53,6 +61,7 @@ type Inbound struct {
 	paddingScheme    []byte
 	connectionAccess sync.Mutex
 	connections      map[net.Conn]*trackedConnection
+	streamHandlers   map[*trackedStreamHandler]struct{}
 	closeDone        chan struct{}
 	closeOwner       uint64
 	closeErr         error
@@ -114,42 +123,62 @@ func (h *Inbound) Start(stage adapter.StartStage) error {
 	return h.listener.Start()
 }
 
-func (h *Inbound) Close() (err error) {
+func (h *Inbound) Close() error {
 	owner := anyTLSGoroutineID()
 	h.connectionAccess.Lock()
+	ownedCaller := h.isOwnedCallerLocked(owner)
 	if h.closed {
 		closeErr := h.closeErr
 		h.connectionAccess.Unlock()
 		return E.Errors(os.ErrClosed, closeErr)
 	}
-	if h.closing {
-		if owner != 0 && owner == h.closeOwner {
-			h.connectionAccess.Unlock()
-			return os.ErrClosed
+	firstClose := !h.closing
+	if firstClose {
+		h.closing = true
+		h.closeDone = make(chan struct{})
+		connections := make([]net.Conn, 0, len(h.connections))
+		connectionStates := make([]*trackedConnection, 0, len(h.connections))
+		for conn, connectionState := range h.connections {
+			connections = append(connections, conn)
+			connectionStates = append(connectionStates, connectionState)
 		}
-		closeDone := h.closeDone
-		h.connectionAccess.Unlock()
-		<-closeDone
-		h.connectionAccess.Lock()
-		closeErr := h.closeErr
-		h.connectionAccess.Unlock()
-		return E.Errors(os.ErrClosed, closeErr)
+		streamHandlers := make([]*trackedStreamHandler, 0, len(h.streamHandlers))
+		for streamHandler := range h.streamHandlers {
+			streamHandlers = append(streamHandlers, streamHandler)
+		}
+		go h.closeTracked(connections, connectionStates, streamHandlers)
 	}
-	h.closing = true
-	h.closeOwner = owner
-	h.closeDone = make(chan struct{})
-	calledFromSession := false
-	connections := make([]net.Conn, 0, len(h.connections))
-	connectionStates := make([]*trackedConnection, 0, len(h.connections))
-	for conn, connectionState := range h.connections {
-		connections = append(connections, conn)
-		connectionStates = append(connectionStates, connectionState)
-		calledFromSession = calledFromSession || owner != 0 && owner == connectionState.owner
-	}
+	closeDone := h.closeDone
 	h.connectionAccess.Unlock()
 
+	// A session or stream handler cannot wait for a close operation that joins it.
+	// It only initiates (or observes) teardown and then unwinds, allowing the
+	// dedicated closer to complete. This also prevents two sessions that call
+	// Close concurrently from waiting on each other's done channel.
+	if ownedCaller {
+		if firstClose {
+			return nil
+		}
+		return os.ErrClosed
+	}
+	<-closeDone
+	h.connectionAccess.Lock()
+	closeErr := h.closeErr
+	h.connectionAccess.Unlock()
+	if firstClose {
+		return closeErr
+	}
+	return E.Errors(os.ErrClosed, closeErr)
+}
+
+func (h *Inbound) closeTracked(connections []net.Conn, connectionStates []*trackedConnection, streamHandlers []*trackedStreamHandler) (err error) {
+	h.connectionAccess.Lock()
+	h.closeOwner = anyTLSGoroutineID()
+	h.connectionAccess.Unlock()
 	defer func() {
-		panicValue := recover()
+		if panicValue := recover(); panicValue != nil {
+			err = E.Errors(err, E.New("panic while closing AnyTLS inbound: ", panicValue))
+		}
 		h.connectionAccess.Lock()
 		h.closeErr = err
 		h.closing = false
@@ -157,22 +186,51 @@ func (h *Inbound) Close() (err error) {
 		h.closeOwner = 0
 		close(h.closeDone)
 		h.connectionAccess.Unlock()
-		if panicValue != nil {
-			panic(panicValue)
-		}
 	}()
+
 	err = common.Close(h.listener)
+	for _, connectionState := range connectionStates {
+		connectionState.cancel()
+	}
+	for _, streamHandler := range streamHandlers {
+		streamHandler.cancel()
+	}
 	for _, conn := range connections {
 		err = E.Errors(err, conn.Close())
 	}
+	for _, streamHandler := range streamHandlers {
+		// Closing the logical stream unblocks handlers that do not observe their
+		// context promptly. The parent session may already have closed it.
+		_ = streamHandler.conn.Close()
+	}
 	for _, connectionState := range connectionStates {
-		if calledFromSession && owner == connectionState.owner {
-			continue
-		}
 		<-connectionState.done
+	}
+	for _, streamHandler := range streamHandlers {
+		<-streamHandler.done
 	}
 	err = E.Errors(err, common.Close(h.tlsConfig))
 	return err
+}
+
+func (h *Inbound) isOwnedCallerLocked(owner uint64) bool {
+	if owner == 0 {
+		return false
+	}
+	if owner == h.closeOwner {
+		return true
+	}
+	for _, connectionState := range h.connections {
+		if connectionState.owner == owner {
+			return true
+		}
+	}
+	for streamHandler := range h.streamHandlers {
+		if streamHandler.owner == owner {
+			return true
+		}
+	}
+	return false
 }
 
 func (h *Inbound) ManagedUserSchema() adapter.ManagedUserSchema {
@@ -223,6 +281,7 @@ func (h *Inbound) buildService(users []adapter.ManagedUser) (*anytls.Service, []
 
 func buildUsers(users []adapter.ManagedUser) ([]adapter.ManagedUser, []anytls.User, error) {
 	names := make(map[string]struct{}, len(users))
+	passwords := make(map[string]struct{}, len(users))
 	usersCopy := make([]adapter.ManagedUser, len(users))
 	serviceUsers := make([]anytls.User, len(users))
 	for index, user := range users {
@@ -235,7 +294,11 @@ func buildUsers(users []adapter.ManagedUser) ([]adapter.ManagedUser, []anytls.Us
 		if _, exists := names[user.Name]; exists {
 			return nil, nil, E.New("duplicate name for user[", index, "]: ", user.Name)
 		}
+		if _, exists := passwords[user.Password]; exists {
+			return nil, nil, E.New("duplicate password for user[", index, "]")
+		}
 		names[user.Name] = struct{}{}
+		passwords[user.Password] = struct{}{}
 		usersCopy[index] = adapter.ManagedUser{Name: user.Name, Password: user.Password}
 		serviceUsers[index] = anytls.User{Name: user.Name, Password: user.Password}
 	}
@@ -243,17 +306,20 @@ func buildUsers(users []adapter.ManagedUser) ([]adapter.ManagedUser, []anytls.Us
 }
 
 func (h *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
+	sessionCtx, sessionCancel := context.WithCancel(adapter.WithContext(ctx, &metadata))
 	trackedConn := conn
-	if !h.trackConnection(trackedConn) {
+	if !h.trackConnection(trackedConn, sessionCancel) {
+		sessionCancel()
 		N.CloseOnHandshakeFailure(conn, onClose, os.ErrClosed)
 		return
 	}
 	defer h.untrackConnection(trackedConn)
+	defer sessionCancel()
 	if h.tlsConfig != nil {
-		tlsConn, err := tls.ServerHandshake(ctx, conn, h.tlsConfig)
+		tlsConn, err := tls.ServerHandshake(sessionCtx, conn, h.tlsConfig)
 		if err != nil {
 			N.CloseOnHandshakeFailure(conn, onClose, err)
-			h.logger.ErrorContext(ctx, E.Cause(err, "process connection from ", metadata.Source, ": TLS handshake"))
+			h.logger.ErrorContext(sessionCtx, E.Cause(err, "process connection from ", metadata.Source, ": TLS handshake"))
 			return
 		}
 		conn = tlsConn
@@ -261,14 +327,14 @@ func (h *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
 	h.serviceAccess.RLock()
 	service := h.service
 	h.serviceAccess.RUnlock()
-	err := service.NewConnection(adapter.WithContext(ctx, &metadata), conn, metadata.Source, onClose)
+	err := service.NewConnection(sessionCtx, conn, metadata.Source, onClose)
 	if err != nil {
 		N.CloseOnHandshakeFailure(conn, onClose, err)
-		h.logger.ErrorContext(ctx, E.Cause(err, "process connection from ", metadata.Source))
+		h.logger.ErrorContext(sessionCtx, E.Cause(err, "process connection from ", metadata.Source))
 	}
 }
 
-func (h *Inbound) trackConnection(conn net.Conn) bool {
+func (h *Inbound) trackConnection(conn net.Conn, cancel context.CancelFunc) bool {
 	h.connectionAccess.Lock()
 	defer h.connectionAccess.Unlock()
 	if h.closing || h.closed {
@@ -277,7 +343,7 @@ func (h *Inbound) trackConnection(conn net.Conn) bool {
 	if h.connections == nil {
 		h.connections = make(map[net.Conn]*trackedConnection)
 	}
-	h.connections[conn] = &trackedConnection{owner: anyTLSGoroutineID(), done: make(chan struct{})}
+	h.connections[conn] = &trackedConnection{owner: anyTLSGoroutineID(), cancel: cancel, done: make(chan struct{})}
 	return true
 }
 
@@ -288,6 +354,35 @@ func (h *Inbound) untrackConnection(conn net.Conn) {
 	h.connectionAccess.Unlock()
 	if connectionState != nil {
 		close(connectionState.done)
+	}
+}
+
+func (h *Inbound) trackStreamHandler(conn net.Conn, cancel context.CancelFunc) (*trackedStreamHandler, bool) {
+	h.connectionAccess.Lock()
+	defer h.connectionAccess.Unlock()
+	if h.closing || h.closed {
+		return nil, false
+	}
+	if h.streamHandlers == nil {
+		h.streamHandlers = make(map[*trackedStreamHandler]struct{})
+	}
+	streamHandler := &trackedStreamHandler{
+		owner:  anyTLSGoroutineID(),
+		conn:   conn,
+		cancel: cancel,
+		done:   make(chan struct{}),
+	}
+	h.streamHandlers[streamHandler] = struct{}{}
+	return streamHandler, true
+}
+
+func (h *Inbound) untrackStreamHandler(streamHandler *trackedStreamHandler) {
+	h.connectionAccess.Lock()
+	_, tracked := h.streamHandlers[streamHandler]
+	delete(h.streamHandlers, streamHandler)
+	h.connectionAccess.Unlock()
+	if tracked {
+		close(streamHandler.done)
 	}
 }
 
@@ -312,6 +407,17 @@ func anyTLSGoroutineID() uint64 {
 type inboundHandler Inbound
 
 func (h *inboundHandler) NewConnectionEx(ctx context.Context, conn net.Conn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
+	inbound := (*Inbound)(h)
+	handlerCtx, handlerCancel := context.WithCancel(ctx)
+	streamHandler, tracked := inbound.trackStreamHandler(conn, handlerCancel)
+	if !tracked {
+		handlerCancel()
+		N.CloseOnHandshakeFailure(conn, onClose, os.ErrClosed)
+		return
+	}
+	defer inbound.untrackStreamHandler(streamHandler)
+	defer handlerCancel()
+	ctx = handlerCtx
 	var metadata adapter.InboundContext
 	metadata.Inbound = h.Tag()
 	metadata.InboundType = h.Type()

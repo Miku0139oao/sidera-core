@@ -117,21 +117,13 @@ func (h *Inbound) ManagedUsers() []adapter.ManagedUser {
 }
 
 func (h *Inbound) UpdateManagedUsers(users []adapter.ManagedUser) error {
+	h.serviceAccess.Lock()
+	defer h.serviceAccess.Unlock()
 	service, managedUsers, userMap, err := h.buildService(users)
 	if err != nil {
 		return err
 	}
-	h.serviceAccess.Lock()
-	defer h.serviceAccess.Unlock()
-	oldUsers := h.ManagedUsers()
-	if err = h.replaceServiceLocked(service, oldUsers); err != nil {
-		return err
-	}
-	h.usersAccess.Lock()
-	h.users = userMap
-	h.managedUsers = managedUsers
-	h.usersAccess.Unlock()
-	return nil
+	return h.replaceServiceLocked(service, managedUsers, userMap, h.startService)
 }
 
 func (h *Inbound) buildService(users []adapter.ManagedUser) (*tuic.Service[string], []adapter.ManagedUser, map[string]option.TUICUser, error) {
@@ -152,6 +144,9 @@ func (h *Inbound) buildService(users []adapter.ManagedUser) (*tuic.Service[strin
 			return nil, nil, nil, E.Cause(err, "invalid uuid for user ", index)
 		}
 		userID := userUUID.String()
+		if _, exists := userMap[userID]; exists {
+			return nil, nil, nil, E.New("duplicate uuid for user ", index, ": ", userID)
+		}
 		protocolUser := option.TUICUser{Name: user.Name, UUID: user.UUID, Password: user.Password}
 		userList[index] = userID
 		uuidList[index] = userUUID
@@ -167,27 +162,47 @@ func (h *Inbound) buildService(users []adapter.ManagedUser) (*tuic.Service[strin
 	return service, managedUsers, userMap, nil
 }
 
-func (h *Inbound) replaceServiceLocked(newService *tuic.Service[string], oldUsers []adapter.ManagedUser) error {
+func (h *Inbound) replaceServiceLocked(
+	newService *tuic.Service[string],
+	newUsers []adapter.ManagedUser,
+	newUserMap map[string]option.TUICUser,
+	startService func(*tuic.Service[string]) (*listener.Listener, error),
+) error {
+	h.usersAccess.RLock()
+	oldUsers := append([]adapter.ManagedUser(nil), h.managedUsers...)
+	oldUserMap := h.users
+	h.usersAccess.RUnlock()
 	if !h.started {
 		if h.server != nil {
 			_ = h.server.Close()
 		}
 		h.server = newService
+		h.publishUserGeneration(newUsers, newUserMap)
 		return nil
 	}
-	_ = h.server.Close()
-	_ = h.listener.Close()
-	newListener, err := h.startService(newService)
+	if h.server != nil {
+		_ = h.server.Close()
+	}
+	if h.listener != nil {
+		_ = h.listener.Close()
+	}
+
+	// Publish UUID-to-identity metadata before Start can authenticate traffic.
+	h.publishUserGeneration(newUsers, newUserMap)
+	newListener, err := startService(newService)
 	if err == nil {
 		h.server = newService
 		h.listener = newListener
 		return nil
 	}
+
+	// Restore the previous metadata before the rollback listener admits traffic.
+	h.publishUserGeneration(oldUsers, oldUserMap)
 	rollbackService, _, _, rollbackBuildErr := h.buildService(oldUsers)
 	if rollbackBuildErr != nil {
 		return errors.Join(err, E.Cause(rollbackBuildErr, "rebuild previous TUIC service"))
 	}
-	rollbackListener, rollbackErr := h.startService(rollbackService)
+	rollbackListener, rollbackErr := startService(rollbackService)
 	if rollbackErr != nil {
 		return errors.Join(err, E.Cause(rollbackErr, "restore previous TUIC service"))
 	}
@@ -196,10 +211,19 @@ func (h *Inbound) replaceServiceLocked(newService *tuic.Service[string], oldUser
 	return err
 }
 
+func (h *Inbound) publishUserGeneration(users []adapter.ManagedUser, userMap map[string]option.TUICUser) {
+	h.usersAccess.Lock()
+	h.users = userMap
+	h.managedUsers = users
+	h.usersAccess.Unlock()
+}
+
 func (h *Inbound) startService(service *tuic.Service[string]) (*listener.Listener, error) {
 	newListener := listener.New(listener.Options{Context: h.ctx, Logger: h.logger, Listen: h.listenOptions})
 	packetConn, err := newListener.ListenUDP()
 	if err != nil {
+		_ = newListener.Close()
+		_ = service.Close()
 		return nil, err
 	}
 	address := newListener.UDPAddr()
