@@ -42,6 +42,12 @@ type queryMultiplexer struct {
 	options    queryMultiplexerOptions
 	connection *ConnPool[*multiplexConn]
 
+	lifecycleAccess sync.Mutex
+	generation      *queryMultiplexerGeneration
+	closed          bool
+	closeDone       chan struct{}
+	closeErr        error
+
 	queryAccess sync.Mutex
 	queries     map[uint16]*pendingQuery
 
@@ -51,6 +57,17 @@ type queryMultiplexer struct {
 	probeAccess   sync.Mutex
 	probeEpoch    uint32
 	lastProbeTime time.Time
+}
+
+type queryMultiplexerGeneration struct {
+	ctx     context.Context
+	cancel  context.CancelCauseFunc
+	workers sync.WaitGroup
+}
+
+func newQueryMultiplexerGeneration() *queryMultiplexerGeneration {
+	ctx, cancel := context.WithCancelCause(context.Background())
+	return &queryMultiplexerGeneration{ctx: ctx, cancel: cancel}
 }
 
 type multiplexConn struct {
@@ -82,8 +99,10 @@ type pendingQuery struct {
 
 func newQueryMultiplexer(options queryMultiplexerOptions) *queryMultiplexer {
 	return &queryMultiplexer{
-		options: options,
-		queries: make(map[uint16]*pendingQuery),
+		options:    options,
+		queries:    make(map[uint16]*pendingQuery),
+		generation: newQueryMultiplexerGeneration(),
+		closeDone:  make(chan struct{}),
 		connection: NewConnPool(ConnPoolOptions[*multiplexConn]{
 			Mode: ConnPoolSingle,
 			IsAlive: func(conn *multiplexConn) bool {
@@ -97,10 +116,43 @@ func newQueryMultiplexer(options queryMultiplexerOptions) *queryMultiplexer {
 }
 
 func (m *queryMultiplexer) Close() error {
-	return m.connection.Close()
+	m.lifecycleAccess.Lock()
+	if m.closed {
+		closeDone := m.closeDone
+		m.lifecycleAccess.Unlock()
+		<-closeDone
+		return m.closeErr
+	}
+	m.closed = true
+	generation := m.generation
+	m.generation = nil
+	if m.options.probeReuse {
+		m.probeAccess.Lock()
+		m.probeEpoch++
+		m.reuseState.Store(reuseStateUnknown)
+		m.probeAccess.Unlock()
+	}
+	m.lifecycleAccess.Unlock()
+
+	generation.cancel(net.ErrClosed)
+	closeErr := m.connection.Close()
+	generation.workers.Wait()
+
+	m.lifecycleAccess.Lock()
+	m.closeErr = closeErr
+	close(m.closeDone)
+	m.lifecycleAccess.Unlock()
+	return closeErr
 }
 
 func (m *queryMultiplexer) Reset() {
+	m.lifecycleAccess.Lock()
+	if m.closed {
+		m.lifecycleAccess.Unlock()
+		return
+	}
+	oldGeneration := m.generation
+	m.generation = newQueryMultiplexerGeneration()
 	if m.options.probeReuse {
 		m.probeAccess.Lock()
 		m.probeEpoch++
@@ -109,7 +161,53 @@ func (m *queryMultiplexer) Reset() {
 		m.probeAccess.Unlock()
 		m.demoteFailures.Store(0)
 	}
+	m.lifecycleAccess.Unlock()
+
+	oldGeneration.cancel(net.ErrClosed)
 	m.connection.Reset()
+	oldGeneration.workers.Wait()
+}
+
+func (m *queryMultiplexer) startWorker() (*queryMultiplexerGeneration, bool) {
+	m.lifecycleAccess.Lock()
+	defer m.lifecycleAccess.Unlock()
+	if m.closed {
+		return nil, false
+	}
+	generation := m.generation
+	generation.workers.Add(1)
+	return generation, true
+}
+
+func contextWithMultiplexerGeneration(ctx context.Context, generation *queryMultiplexerGeneration) (context.Context, func()) {
+	workerCtx, cancel := context.WithCancelCause(ctx)
+	generationCallbackDone := make(chan struct{})
+	stopGeneration := context.AfterFunc(generation.ctx, func() {
+		defer close(generationCallbackDone)
+		cancel(context.Cause(generation.ctx))
+	})
+	if cause := context.Cause(generation.ctx); cause != nil {
+		cancel(cause)
+	}
+	return workerCtx, func() {
+		if !stopGeneration() {
+			<-generationCallbackDone
+		}
+		cancel(nil)
+	}
+}
+
+func closeConnOnContext(ctx context.Context, conn net.Conn) func() {
+	callbackDone := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		defer close(callbackDone)
+		conn.Close()
+	})
+	return func() {
+		if !stop() {
+			<-callbackDone
+		}
+	}
 }
 
 func (m *queryMultiplexer) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {
@@ -134,51 +232,61 @@ func (m *queryMultiplexer) ExchangeAsync(ctx context.Context, message *mDNS.Msg,
 func (m *queryMultiplexer) dispatch(ctx context.Context, message *mDNS.Msg, callback func(response *mDNS.Msg, err error), retryReadError bool) {
 	if m.options.probeReuse && m.reuseState.Load() != reuseStateSupported {
 		m.maybeStartProbe(ctx, message)
-		go m.exchangeSingle(ctx, message, callback)
+		generation, started := m.startWorker()
+		if !started {
+			callback(nil, net.ErrClosed)
+			return
+		}
+		go func() {
+			defer generation.workers.Done()
+			workerCtx, cancel := contextWithMultiplexerGeneration(ctx, generation)
+			response, err := m.exchangeSingle(workerCtx, message)
+			cancel()
+			callback(response, err)
+		}()
+		return
+	}
+	m.lifecycleAccess.Lock()
+	closed := m.closed
+	m.lifecycleAccess.Unlock()
+	if closed {
+		callback(nil, net.ErrClosed)
 		return
 	}
 	m.exchangeAsync(ctx, message, callback, retryReadError)
 }
 
-func (m *queryMultiplexer) exchangeSingle(ctx context.Context, message *mDNS.Msg, callback func(response *mDNS.Msg, err error)) {
+func (m *queryMultiplexer) exchangeSingle(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {
 	conn, err := m.options.dial(ctx)
 	if err != nil {
-		callback(nil, err)
-		return
+		if ctxErr := context.Cause(ctx); ctxErr != nil {
+			return nil, ctxErr
+		}
+		return nil, err
 	}
 	defer conn.Close()
-	stop := context.AfterFunc(ctx, func() {
-		conn.Close()
-	})
-	defer stop()
-	err = m.options.write(conn, message, message.Id)
+	defer closeConnOnContext(ctx, conn)()
+	queryID := mDNS.Id()
+	err = m.options.write(conn, message, queryID)
 	if err != nil {
-		ctxErr := ctx.Err()
-		if ctxErr != nil {
-			callback(nil, ctxErr)
-			return
+		if ctxErr := context.Cause(ctx); ctxErr != nil {
+			return nil, ctxErr
 		}
-		callback(nil, E.Cause(err, "write request"))
-		return
+		return nil, E.Cause(err, "write request")
 	}
 	for {
-		var response *mDNS.Msg
-		response, err = m.options.readNext(conn)
-		if err != nil {
-			ctxErr := ctx.Err()
-			if ctxErr != nil {
-				callback(nil, ctxErr)
-				return
+		response, readErr := m.options.readNext(conn)
+		if readErr != nil {
+			if ctxErr := context.Cause(ctx); ctxErr != nil {
+				return nil, ctxErr
 			}
-			callback(nil, E.Cause(err, "read response"))
-			return
+			return nil, E.Cause(readErr, "read response")
 		}
-		if response == nil {
+		if response == nil || response.Id != queryID || validateDNSResponse(message, response) != nil {
 			continue
 		}
 		response.Id = message.Id
-		callback(response, nil)
-		return
+		return response, nil
 	}
 }
 
@@ -186,24 +294,43 @@ func (m *queryMultiplexer) maybeStartProbe(ctx context.Context, message *mDNS.Ms
 	if len(message.Question) == 0 {
 		return
 	}
+	m.lifecycleAccess.Lock()
+	if m.closed {
+		m.lifecycleAccess.Unlock()
+		return
+	}
 	m.probeAccess.Lock()
 	if m.reuseState.Load() == reuseStateProbing {
 		m.probeAccess.Unlock()
+		m.lifecycleAccess.Unlock()
 		return
 	}
 	if !m.lastProbeTime.IsZero() && time.Since(m.lastProbeTime) < reuseProbeRetryInterval {
 		m.probeAccess.Unlock()
+		m.lifecycleAccess.Unlock()
 		return
 	}
 	m.reuseState.Store(reuseStateProbing)
 	m.lastProbeTime = time.Now()
 	epoch := m.probeEpoch
+	generation := m.generation
+	generation.workers.Add(1)
 	m.probeAccess.Unlock()
-	go m.runReuseProbe(context.WithoutCancel(ctx), message.Question[0].Name, epoch)
+	m.lifecycleAccess.Unlock()
+	go m.runReuseProbe(context.WithoutCancel(ctx), message.Question[0].Name, epoch, generation)
 }
 
-func (m *queryMultiplexer) runReuseProbe(ctx context.Context, questionName string, epoch uint32) {
-	supported, dialFailed := m.executeReuseProbe(ctx, questionName)
+func (m *queryMultiplexer) runReuseProbe(ctx context.Context, questionName string, epoch uint32, generation *queryMultiplexerGeneration) {
+	defer generation.workers.Done()
+	probeCtx, cancel := contextWithMultiplexerGeneration(ctx, generation)
+	supported, dialFailed := m.executeReuseProbe(probeCtx, questionName)
+	cancel()
+
+	m.lifecycleAccess.Lock()
+	defer m.lifecycleAccess.Unlock()
+	if m.closed || m.generation != generation {
+		return
+	}
 	m.probeAccess.Lock()
 	defer m.probeAccess.Unlock()
 	if m.probeEpoch != epoch {
@@ -228,10 +355,7 @@ func (m *queryMultiplexer) executeReuseProbe(ctx context.Context, questionName s
 		return false, true
 	}
 	defer conn.Close()
-	stop := context.AfterFunc(probeCtx, func() {
-		conn.Close()
-	})
-	defer stop()
+	defer closeConnOnContext(probeCtx, conn)()
 	queryA := new(mDNS.Msg)
 	queryA.SetQuestion(questionName, mDNS.TypeA)
 	queryAAAA := new(mDNS.Msg)
@@ -255,9 +379,9 @@ func (m *queryMultiplexer) executeReuseProbe(ctx context.Context, questionName s
 		}
 		switch response.Id {
 		case reuseProbeQueryIdA:
-			seenA = true
+			seenA = seenA || validateDNSResponse(queryA, response) == nil
 		case reuseProbeQueryIdB:
-			seenAAAA = true
+			seenAAAA = seenAAAA || validateDNSResponse(queryAAAA, response) == nil
 		}
 	}
 	return true, false

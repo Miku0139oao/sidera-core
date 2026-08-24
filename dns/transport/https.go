@@ -32,9 +32,17 @@ import (
 	"golang.org/x/net/http2"
 )
 
-const MimeType = "application/dns-message"
+const (
+	MimeType              = "application/dns-message"
+	maxDNSWireMessageSize = 1<<16 - 1
+)
 
 var _ adapter.DNSTransport = (*HTTPSTransport)(nil)
+
+type httpsRoundTripper interface {
+	RoundTrip(request *http.Request) (*http.Response, error)
+	Close()
+}
 
 func RegisterHTTPS(registry *dns.TransportRegistry) {
 	dns.RegisterTransport[option.RemoteHTTPSDNSServerOptions](registry, C.DNSTypeHTTPS, NewHTTPS)
@@ -49,8 +57,9 @@ type HTTPSTransport struct {
 	serverAddr       M.Socksaddr
 	fallback         *atomic.Bool
 	transportAccess  sync.Mutex
-	transport        *HTTPSTransportWrapper
+	transport        httpsRoundTripper
 	transportResetAt time.Time
+	closed           bool
 }
 
 func NewHTTPS(ctx context.Context, logger log.ContextLogger, tag string, options option.RemoteHTTPSDNSServerOptions) (adapter.DNSTransport, error) {
@@ -151,13 +160,27 @@ func (t *HTTPSTransport) Start(stage adapter.StartStage) error {
 }
 
 func (t *HTTPSTransport) Close() error {
-	t.Reset()
+	t.transportAccess.Lock()
+	if t.closed {
+		t.transportAccess.Unlock()
+		return nil
+	}
+	t.closed = true
+	oldTransport := t.transport
+	t.transport = nil
+	t.transportAccess.Unlock()
+	if oldTransport != nil {
+		oldTransport.Close()
+	}
 	return nil
 }
 
 func (t *HTTPSTransport) Reset() {
 	t.transportAccess.Lock()
 	defer t.transportAccess.Unlock()
+	if t.closed {
+		return
+	}
 	t.resetTransportLocked()
 }
 
@@ -165,7 +188,9 @@ func (t *HTTPSTransport) resetTransportLocked() {
 	oldTransport := t.transport
 	t.transport = NewHTTPSTransportWrapper(t.dialer, t.serverAddr, t.fallback)
 	t.transportResetAt = time.Now()
-	oldTransport.Close()
+	if oldTransport != nil {
+		oldTransport.Close()
+	}
 }
 
 func (t *HTTPSTransport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {
@@ -175,7 +200,7 @@ func (t *HTTPSTransport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS
 		if errors.Is(err, context.DeadlineExceeded) {
 			t.transportAccess.Lock()
 			defer t.transportAccess.Unlock()
-			if t.transportResetAt.After(startAt) {
+			if t.closed || t.transportResetAt.After(startAt) {
 				return nil, err
 			}
 			t.resetTransportLocked()
@@ -210,6 +235,11 @@ func (t *HTTPSTransport) exchange(ctx context.Context, message *mDNS.Msg) (*mDNS
 	request.Header.Set("Content-Type", MimeType)
 	request.Header.Set("Accept", MimeType)
 	t.transportAccess.Lock()
+	if t.closed || t.transport == nil {
+		t.transportAccess.Unlock()
+		requestBuffer.Release()
+		return nil, net.ErrClosed
+	}
 	currentTransport := t.transport
 	t.transportAccess.Unlock()
 	response, err := currentTransport.RoundTrip(request)
@@ -221,23 +251,32 @@ func (t *HTTPSTransport) exchange(ctx context.Context, message *mDNS.Msg) (*mDNS
 	if response.StatusCode != http.StatusOK {
 		return nil, E.New("unexpected status: ", response.Status)
 	}
-	var responseMessage mDNS.Msg
-	if response.ContentLength > 0 {
-		responseBuffer := buf.NewSize(int(response.ContentLength))
-		defer responseBuffer.Release()
-		_, err = responseBuffer.ReadFullFrom(response.Body, int(response.ContentLength))
-		if err != nil {
-			return nil, err
-		}
-		err = responseMessage.Unpack(responseBuffer.Bytes())
+	return ReadDNSResponseBody(response.Body, response.ContentLength)
+}
+
+// ReadDNSResponseBody reads one bounded DNS wire message from an HTTP response body.
+func ReadDNSResponseBody(body io.Reader, contentLength int64) (*mDNS.Msg, error) {
+	if contentLength > maxDNSWireMessageSize {
+		return nil, E.New("DNS response exceeds wire size limit: ", contentLength)
+	}
+	var (
+		rawMessage []byte
+		err        error
+	)
+	if contentLength >= 0 {
+		rawMessage = make([]byte, int(contentLength))
+		_, err = io.ReadFull(body, rawMessage)
 	} else {
-		rawMessage, err = io.ReadAll(response.Body)
-		if err != nil {
-			return nil, err
+		rawMessage, err = io.ReadAll(io.LimitReader(body, maxDNSWireMessageSize+1))
+		if err == nil && len(rawMessage) > maxDNSWireMessageSize {
+			return nil, E.New("DNS response exceeds wire size limit: ", len(rawMessage))
 		}
-		err = responseMessage.Unpack(rawMessage)
 	}
 	if err != nil {
+		return nil, err
+	}
+	var responseMessage mDNS.Msg
+	if err = responseMessage.Unpack(rawMessage); err != nil {
 		return nil, err
 	}
 	return &responseMessage, nil
