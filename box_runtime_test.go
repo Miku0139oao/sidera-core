@@ -145,6 +145,39 @@ func TestLateConstructorFailureClosesPreviouslyCreatedChild(t *testing.T) {
 	}
 }
 
+func TestCloseQuiescesTrafficProducersBeforeServiceFinalization(t *testing.T) {
+	var events []string
+	serviceRegistry := boxService.NewRegistry()
+	boxService.Register[option.StubOptions](serviceRegistry, "producer-quiescence-test", func(context.Context, log.ContextLogger, string, option.StubOptions) (adapter.Service, error) {
+		return &producerQuiescenceTestService{
+			Adapter: boxService.NewAdapter("producer-quiescence-test", "service"),
+			events:  &events,
+		}, nil
+	})
+	inboundRegistry := boxInbound.NewRegistry()
+	boxInbound.Register[option.StubOptions](inboundRegistry, "producer-quiescence-test", func(context.Context, adapter.Router, log.ContextLogger, string, option.StubOptions) (adapter.Inbound, error) {
+		return &orderedCloseTestInbound{
+			Adapter: boxInbound.NewAdapter("producer-quiescence-test", "inbound"),
+			events:  &events,
+		}, nil
+	})
+	ctx := include.Context(t.Context())
+	ctx = service.ContextWith[adapter.ServiceRegistry](ctx, serviceRegistry)
+	ctx = service.ContextWith[option.ServiceOptionsRegistry](ctx, serviceRegistry)
+	ctx = service.ContextWith[adapter.InboundRegistry](ctx, inboundRegistry)
+	ctx = service.ContextWith[option.InboundOptionsRegistry](ctx, inboundRegistry)
+	instance, err := box.New(box.Options{
+		Context: ctx,
+		Options: option.Options{
+			Inbounds: []option.Inbound{{Type: "producer-quiescence-test", Tag: "inbound", Options: &option.StubOptions{}}},
+			Services: []option.Service{{Type: "producer-quiescence-test", Tag: "service", Options: &option.StubOptions{}}},
+		},
+	})
+	require.NoError(t, err)
+	require.NoError(t, instance.Close())
+	require.Equal(t, []string{"stop-admission", "inbound-close", "finalize-service"}, events)
+}
+
 func TestChildClosePanicStillClosesLaterBoxChildren(t *testing.T) {
 	serviceRegistry := boxService.NewRegistry()
 	boxService.Register[option.StubOptions](serviceRegistry, "panic-close-test", func(ctx context.Context, logger log.ContextLogger, tag string, options option.StubOptions) (adapter.Service, error) {
@@ -244,6 +277,37 @@ func TestRuntimeCommitRollsBackEarlierCommits(t *testing.T) {
 		"started:first", "started:second", "validate:first", "validate:second", "snapshot",
 		"commit:first", "commit:second", "rollback:first", "rollback:snapshot",
 	}, events)
+}
+
+type producerQuiescenceTestService struct {
+	boxService.Adapter
+	events *[]string
+}
+
+func (s *producerQuiescenceTestService) Start(adapter.StartStage) error { return nil }
+func (s *producerQuiescenceTestService) Close() error {
+	return errors.New("Close called instead of CloseAfterProducerQuiescence")
+}
+
+func (s *producerQuiescenceTestService) StopAdmission() error {
+	*s.events = append(*s.events, "stop-admission")
+	return nil
+}
+
+func (s *producerQuiescenceTestService) CloseAfterProducerQuiescence() error {
+	*s.events = append(*s.events, "finalize-service")
+	return nil
+}
+
+type orderedCloseTestInbound struct {
+	boxInbound.Adapter
+	events *[]string
+}
+
+func (i *orderedCloseTestInbound) Start(adapter.StartStage) error { return nil }
+func (i *orderedCloseTestInbound) Close() error {
+	*i.events = append(*i.events, "inbound-close")
+	return nil
 }
 
 type reentrantCloseTestService struct {

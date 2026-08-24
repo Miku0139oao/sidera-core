@@ -22,7 +22,6 @@ import (
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	aTLS "github.com/sagernet/sing/common/tls"
-	sHttp "github.com/sagernet/sing/protocol/http"
 
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
@@ -107,7 +106,7 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		}
 	}
 
-	source := sHttp.SourceAddress(request)
+	source := M.ParseSocksaddr(request.RemoteAddr).Unwrap()
 	if h, ok := writer.(http.Hijacker); ok {
 		var requestBody *buf.Buffer
 		defer func() {

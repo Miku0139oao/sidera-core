@@ -720,24 +720,37 @@ func (s *Box) closeResources() (firstPanic any, err error) {
 			}
 		}
 	}
+	retryManagerClose := func(closeFunc func() error) error {
+		deadline := time.Now().Add(C.StopTimeout)
+		for {
+			err := closeFunc()
+			if !errors.Is(err, os.ErrClosed) || !time.Now().Before(deadline) {
+				return err
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
 	if s.debugHTTPServer != nil {
 		closeResource("debug HTTP server", s.debugHTTPServer.Close)
 		s.debugHTTPServer = nil
 	}
 	if s.service != nil {
-		closeResource("service", s.service.Close)
+		closeResource("service admission", func() error { return retryManagerClose(s.service.StopAdmission) })
 	}
 	if s.inbound != nil {
-		closeResource("inbound", s.inbound.Close)
+		closeResource("inbound", func() error { return retryManagerClose(s.inbound.Close) })
+	}
+	if s.service != nil {
+		closeResource("service", func() error { return retryManagerClose(s.service.CloseAfterProducerQuiescence) })
 	}
 	if s.certificateProvider != nil {
-		closeResource("certificate-provider", s.certificateProvider.Close)
+		closeResource("certificate-provider", func() error { return retryManagerClose(s.certificateProvider.Close) })
 	}
 	if s.endpoint != nil {
-		closeResource("endpoint", s.endpoint.Close)
+		closeResource("endpoint", func() error { return retryManagerClose(s.endpoint.Close) })
 	}
 	if s.outbound != nil {
-		closeResource("outbound", s.outbound.Close)
+		closeResource("outbound", func() error { return retryManagerClose(s.outbound.Close) })
 	}
 	if s.router != nil {
 		closeResource("router", s.router.Close)
@@ -749,7 +762,7 @@ func (s *Box) closeResources() (firstPanic any, err error) {
 		closeResource("dns-router", s.dnsRouter.Close)
 	}
 	if s.dnsTransport != nil {
-		closeResource("dns-transport", s.dnsTransport.Close)
+		closeResource("dns-transport", func() error { return retryManagerClose(s.dnsTransport.Close) })
 	}
 	if s.network != nil {
 		closeResource("network", s.network.Close)

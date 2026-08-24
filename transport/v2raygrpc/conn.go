@@ -12,7 +12,10 @@ import (
 	N "github.com/sagernet/sing/common/network"
 )
 
-var _ net.Conn = (*GRPCConn)(nil)
+var (
+	_ net.Conn      = (*GRPCConn)(nil)
+	_ N.WriteCloser = (*GRPCConn)(nil)
+)
 
 type grpcRecvResult struct {
 	hunk *Hunk
@@ -21,12 +24,14 @@ type grpcRecvResult struct {
 
 type GRPCConn struct {
 	GunService
-	cache       []byte
-	cancel      context.CancelCauseFunc
-	readAccess  sync.Mutex
-	writeAccess sync.Mutex
-	done        chan struct{}
-	closeOnce   sync.Once
+	cache          []byte
+	cancel         context.CancelCauseFunc
+	readAccess     sync.Mutex
+	writeAccess    sync.Mutex
+	writeCloseOnce sync.Once
+	writeCloseErr  error
+	done           chan struct{}
+	closeOnce      sync.Once
 }
 
 func NewGRPCConn(service GunService, cancel context.CancelCauseFunc) *GRPCConn {
@@ -98,6 +103,17 @@ func (c *GRPCConn) Write(b []byte) (n int, err error) {
 		return 0, err
 	}
 	return len(b), nil
+}
+
+func (c *GRPCConn) CloseWrite() error {
+	c.writeAccess.Lock()
+	defer c.writeAccess.Unlock()
+	c.writeCloseOnce.Do(func() {
+		if writeCloser, loaded := c.GunService.(N.WriteCloser); loaded {
+			c.writeCloseErr = writeCloser.CloseWrite()
+		}
+	})
+	return c.writeCloseErr
 }
 
 func (c *GRPCConn) Close() error {

@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -104,6 +105,33 @@ func TestHTTP2WrapperClosedWriteBufferReleasesOwnership(t *testing.T) {
 	}
 	if buffer.Cap() != 0 {
 		t.Fatal("closed wrapper did not release owned buffer")
+	}
+}
+
+func TestHTTP2CloseWritePreservesResponseReader(t *testing.T) {
+	requestReader, requestWriter := io.Pipe()
+	conn := NewHTTPConn(strings.NewReader("response"), requestWriter)
+	requestDone := make(chan []byte, 1)
+	go func() {
+		request, _ := io.ReadAll(requestReader)
+		requestDone <- request
+	}()
+	_, err := conn.Write([]byte("request"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = conn.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	if request := <-requestDone; string(request) != "request" {
+		t.Fatalf("request = %q", request)
+	}
+	response, err := io.ReadAll(conn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(response) != "response" {
+		t.Fatalf("response = %q", response)
 	}
 }
 

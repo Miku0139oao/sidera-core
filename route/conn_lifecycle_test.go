@@ -50,6 +50,29 @@ func tcpConnPair(t *testing.T) (*net.TCPConn, *net.TCPConn) {
 	return nil, nil
 }
 
+func TestConnectionManagerRejectsLateRegistrationsAfterClose(t *testing.T) {
+	manager := NewConnectionManager(log.NewNOPFactory().NewLogger("connection-test"))
+	require.NoError(t, manager.Close())
+
+	tracked, peer := net.Pipe()
+	defer peer.Close()
+	returned := manager.TrackConn(tracked)
+	require.Same(t, tracked, returned)
+	_ = peer.SetReadDeadline(time.Now().Add(time.Second))
+	var one [1]byte
+	_, err := peer.Read(one[:])
+	require.Error(t, err)
+
+	packet, err := net.ListenPacket("udp", "127.0.0.1:0")
+	require.NoError(t, err)
+	returnedPacket := manager.TrackPacketConn(packet)
+	require.Same(t, packet, returnedPacket)
+	_ = packet.SetReadDeadline(time.Now().Add(time.Millisecond))
+	_, _, err = packet.ReadFrom(one[:])
+	require.Error(t, err)
+	require.Zero(t, manager.Count())
+}
+
 func TestRelayPreservesWrappedCloseWriteResponseAfterEOF(t *testing.T) {
 	client, relayInbound := tcpConnPair(t)
 	relayOutbound, backend := tcpConnPair(t)

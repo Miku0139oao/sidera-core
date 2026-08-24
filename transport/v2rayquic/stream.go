@@ -35,9 +35,13 @@ func (s *StreamWrapper) Upstream() any {
 	return s.Stream
 }
 
+func (s *StreamWrapper) CloseWrite() error {
+	return s.Stream.Close()
+}
+
 func (s *StreamWrapper) Close() error {
 	s.CancelRead(0)
-	s.Stream.Close()
+	_ = s.CloseWrite()
 	// quic-go's Stream.Close does not unblock a Write blocked on flow control,
 	// but a past write deadline does; buffered data and the FIN are unaffected.
 	s.Stream.SetWriteDeadline(time.Now())

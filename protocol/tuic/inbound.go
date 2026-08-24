@@ -148,7 +148,9 @@ func (h *Inbound) buildService(users []adapter.ManagedUser) (*tuic.Service[strin
 			return nil, nil, nil, E.New("duplicate uuid for user ", index, ": ", userID)
 		}
 		protocolUser := option.TUICUser{Name: user.Name, UUID: user.UUID, Password: user.Password}
-		userList[index] = userID
+		// The service writes this generation's immutable identity into the
+		// authenticated context; callbacks must not resolve through a newer map.
+		userList[index] = user.Name
 		uuidList[index] = userUUID
 		passwordList[index] = user.Password
 		userMap[userID] = protocolUser
@@ -243,6 +245,14 @@ func (h *Inbound) userName(userID string) string {
 	return user.Name
 }
 
+func authenticatedUserName(ctx context.Context) string {
+	userName, loaded := auth.UserFromContext[string](ctx)
+	if !loaded {
+		return ""
+	}
+	return userName
+}
+
 func (h *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
 	ctx = log.ContextWithNewID(ctx)
 	var metadata adapter.InboundContext
@@ -257,11 +267,7 @@ func (h *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, source M.S
 	metadata.Source = source
 	metadata.Destination = destination
 	h.logger.InfoContext(ctx, "inbound connection from ", metadata.Source)
-	userID, loaded := auth.UserFromContext[string](ctx)
-	var userName string
-	if loaded {
-		userName = h.userName(userID)
-	}
+	userName := authenticatedUserName(ctx)
 	if userName != "" {
 		metadata.User = userName
 		h.logger.InfoContext(ctx, "[", userName, "] inbound connection to ", metadata.Destination)
@@ -285,11 +291,7 @@ func (h *Inbound) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, 
 	metadata.Source = source
 	metadata.Destination = destination
 	h.logger.InfoContext(ctx, "inbound packet connection from ", metadata.Source)
-	userID, loaded := auth.UserFromContext[string](ctx)
-	var userName string
-	if loaded {
-		userName = h.userName(userID)
-	}
+	userName := authenticatedUserName(ctx)
 	if userName != "" {
 		metadata.User = userName
 		h.logger.InfoContext(ctx, "[", userName, "] inbound packet connection to ", metadata.Destination)

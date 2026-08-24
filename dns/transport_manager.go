@@ -2,6 +2,7 @@ package dns
 
 import (
 	"context"
+	"errors"
 	"io"
 	"os"
 	"strings"
@@ -30,6 +31,7 @@ type TransportManager struct {
 	closing                  bool
 	closed                   bool
 	mutations                int
+	closeCallbacks           int
 	mutationOwners           map[uint64]int
 	closeErr                 error
 	stage                    adapter.StartStage
@@ -231,6 +233,10 @@ func (m *TransportManager) Close() (err error) {
 		m.access.Unlock()
 		return E.New("cannot close DNS transport manager from an active lifecycle callback")
 	}
+	if m.mutations > 0 && m.closeCallbacks > 0 {
+		m.access.Unlock()
+		return os.ErrClosed
+	}
 	m.closing = true
 	for m.mutations > 0 {
 		condition.Wait()
@@ -255,14 +261,27 @@ func (m *TransportManager) Close() (err error) {
 			panic(panicValue)
 		}
 	}()
+	var firstPanic any
 	for _, transport := range transports {
 		if closer, isCloser := transport.(io.Closer); isCloser {
-			monitor.Start("close server/", transport.Type(), "[", transport.Tag(), "]")
-			err = E.Append(err, closer.Close(), func(err error) error {
-				return E.Cause(err, "close server/", transport.Type(), "[", transport.Tag(), "]")
+			name := "server/" + transport.Type() + "[" + transport.Tag() + "]"
+			monitor.Start("close ", name)
+			panicValue, closeErr := adapter.CloseWithPanic(closer.Close)
+			err = E.Append(err, closeErr, func(err error) error {
+				return E.Cause(err, "close ", name)
 			})
+			if panicValue != nil {
+				if firstPanic == nil {
+					firstPanic = panicValue
+				} else {
+					err = errors.Join(err, E.New("additional panic while closing ", name, ": ", panicValue))
+				}
+			}
 			monitor.Finish()
 		}
+	}
+	if firstPanic != nil {
+		panic(firstPanic)
 	}
 	return err
 }
@@ -490,6 +509,14 @@ func (m *TransportManager) Create(ctx context.Context, logger log.ContextLogger,
 }
 
 func (m *TransportManager) closeTransport(transport adapter.DNSTransport) error {
+	m.access.Lock()
+	m.closeCallbacks++
+	m.access.Unlock()
+	defer func() {
+		m.access.Lock()
+		m.closeCallbacks--
+		m.access.Unlock()
+	}()
 	return transport.Close()
 }
 

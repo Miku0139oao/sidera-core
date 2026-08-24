@@ -56,6 +56,27 @@ func requireXrayTestError(t *testing.T, content string, message string) {
 	require.ErrorContains(t, err, message)
 }
 
+func TestDecodeXrayVLESSWireCompatibility(t *testing.T) {
+	t.Run("Vision rejects UDP 443", func(t *testing.T) {
+		document := strings.Replace(xrayVLESSDocument(`{"network":"raw"}`), `"encryption": "none"`, `"encryption": "none", "flow": "xtls-rprx-vision"`, 1)
+		options := decodeXrayTestConfig(t, document)
+		vlessOptions := options.Outbounds[0].Options.(*option.VLESSOutboundOptions)
+		require.True(t, vlessOptions.XrayVisionRejectUDP443)
+	})
+
+	t.Run("gRPC service name escaping", func(t *testing.T) {
+		options := decodeXrayTestConfig(t, xrayVLESSDocument(`{"network":"grpc","grpcSettings":{"serviceName":"foo/bar"}}`))
+		vlessOptions := options.Outbounds[0].Options.(*option.VLESSOutboundOptions)
+		require.Equal(t, "foo%2Fbar", vlessOptions.Transport.GRPCOptions.ServiceName)
+	})
+
+	t.Run("invalid UUID and long alias", func(t *testing.T) {
+		base := xrayVLESSDocument(`{"network":"raw"}`)
+		requireXrayTestError(t, strings.Replace(base, "27848739-7e62-4138-9fd3-098a63964b6b", "zzzzzzzz-7e62-4138-9fd3-098a63964b6b", 1), "invalid VLESS user id")
+		requireXrayTestError(t, strings.Replace(base, "27848739-7e62-4138-9fd3-098a63964b6b", strings.Repeat("a", 31), 1), "invalid VLESS user id")
+	})
+}
+
 func TestDecodeXrayTLSCompatibility(t *testing.T) {
 	t.Run("removed allowInsecure", func(t *testing.T) {
 		requireXrayTestError(t, xrayVLESSDocument(`{

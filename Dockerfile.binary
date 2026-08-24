@@ -11,4 +11,7 @@ RUN set -ex \
         && rm -rf /var/lib/apt/lists/*; \
     fi
 COPY sidera-${TARGETARCH}${TARGETVARIANT} /usr/local/bin/sidera
+COPY LICENSE /usr/share/licenses/sidera/LICENSE
+COPY release/licenses/ /usr/share/licenses/sidera/third-party/
+COPY NOTICE.md UPSTREAM.md sidera.buildinfo /usr/share/doc/sidera/
 ENTRYPOINT ["sidera"]

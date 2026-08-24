@@ -30,6 +30,33 @@ func (s *blockingGunService) Recv() (*Hunk, error) {
 	return nil, io.EOF
 }
 
+type halfCloseGunService struct {
+	blockingGunService
+	closeWrite chan struct{}
+	closeOnce  sync.Once
+}
+
+func (s *halfCloseGunService) CloseWrite() error {
+	s.closeOnce.Do(func() { close(s.closeWrite) })
+	return nil
+}
+
+func TestGRPCConnForwardsCloseWrite(t *testing.T) {
+	service := &halfCloseGunService{
+		blockingGunService: blockingGunService{ctx: context.Background()},
+		closeWrite:         make(chan struct{}),
+	}
+	conn := NewGRPCConn(service, nil)
+	if err := conn.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-service.closeWrite:
+	case <-time.After(time.Second):
+		t.Fatal("CloseWrite was not forwarded")
+	}
+}
+
 func TestGRPCConnCloseUnblocksRecv(t *testing.T) {
 	service := &blockingGunService{
 		ctx:         context.Background(),

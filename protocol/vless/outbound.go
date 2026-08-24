@@ -32,18 +32,19 @@ var _ adapter.OutboundWithMultiplex = (*Outbound)(nil)
 
 type Outbound struct {
 	outbound.Adapter
-	logger             logger.ContextLogger
-	dialer             N.Dialer
-	client             *vless.Client
-	encryption         *xrayencryption.ClientInstance
-	serverAddr         M.Socksaddr
-	multiplexDialer    *mux.Client
-	tlsConfig          tls.Config
-	tlsDialer          tls.Dialer
-	transport          adapter.V2RayClientTransport
-	packetAddr         bool
-	xudp               bool
-	xrayPacketEncoding bool
+	logger                 logger.ContextLogger
+	dialer                 N.Dialer
+	client                 *vless.Client
+	encryption             *xrayencryption.ClientInstance
+	serverAddr             M.Socksaddr
+	multiplexDialer        *mux.Client
+	tlsConfig              tls.Config
+	tlsDialer              tls.Dialer
+	transport              adapter.V2RayClientTransport
+	packetAddr             bool
+	xudp                   bool
+	xrayPacketEncoding     bool
+	xrayVisionRejectUDP443 bool
 }
 
 func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.VLESSOutboundOptions) (adapter.Outbound, error) {
@@ -101,6 +102,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		}
 	}
 	outbound.xrayPacketEncoding = options.XrayPacketEncoding
+	outbound.xrayVisionRejectUDP443 = options.XrayVisionRejectUDP443
 	outbound.client, err = vless.NewClient(options.UUID, options.Flow, logger)
 	if err != nil {
 		return nil, err
@@ -166,6 +168,9 @@ func (h *vlessDialer) DialContext(ctx context.Context, network string, destinati
 	if networkName != N.NetworkTCP && networkName != N.NetworkUDP {
 		return nil, E.Extend(N.ErrUnknownNetwork, network)
 	}
+	if networkName == N.NetworkUDP && h.xrayVisionRejectUDP443 && destination.Port == 443 {
+		return nil, E.New("Xray Vision rejects UDP/443")
+	}
 	if networkName == N.NetworkUDP && h.packetAddr && !h.useXUDP(destination) && destination.IsDomain() {
 		return nil, E.New("packetaddr: domain destination is not supported")
 	}
@@ -205,6 +210,9 @@ func (h *vlessDialer) DialContext(ctx context.Context, network string, destinati
 }
 
 func (h *vlessDialer) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
+	if h.xrayVisionRejectUDP443 && destination.Port == 443 {
+		return nil, E.New("Xray Vision rejects UDP/443")
+	}
 	h.logger.InfoContext(ctx, "outbound packet connection to ", destination)
 	if h.packetAddr && !h.useXUDP(destination) && destination.IsDomain() {
 		return nil, E.New("packetaddr: domain destination is not supported")
