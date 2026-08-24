@@ -1,0 +1,20 @@
+self-hosted-runner:
+  # Hosted labels introduced after actionlint v1.7.7's bundled label list.
+  labels:
+    - ubuntu-26.04
+    - macos-26
+
+config-variables: null
+
+paths:
+  .github/workflows/build.yml:
+    # GitHub Actions supports YAML anchors/aliases (September 2025) and the
+    # artifact-metadata permission (February 2026); actionlint v1.7.7 predates
+    # both workflow-syntax additions.
+    ignore:
+      - '"steps" section is missing in job "build_apple_app_store"'
+      - '"steps" section must be sequence node but got alias node'
+      - 'unknown permission scope "artifact-metadata"'
+  .github/workflows/linux.yml:
+    ignore:
+      - 'unknown permission scope "artifact-metadata"'
