@@ -37,6 +37,37 @@ func TestGunConnFrameRoundTrip(t *testing.T) {
 	}
 }
 
+func TestGunConnCloseWritePreservesResponseReader(t *testing.T) {
+	var responseWire bytes.Buffer
+	responseWriter := newGunConn(bytes.NewReader(nil), &responseWire, nil)
+	if _, err := responseWriter.Write([]byte("response")); err != nil {
+		t.Fatal(err)
+	}
+	requestReader, requestWriter := io.Pipe()
+	conn := newGunConn(bytes.NewReader(responseWire.Bytes()), requestWriter, nil)
+	requestDone := make(chan []byte, 1)
+	go func() {
+		request, _ := io.ReadAll(requestReader)
+		requestDone <- request
+	}()
+	if _, err := conn.Write([]byte("request")); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	if request := <-requestDone; len(request) == 0 {
+		t.Fatal("request stream was empty")
+	}
+	response := make([]byte, len("response"))
+	if _, err := io.ReadFull(conn, response); err != nil {
+		t.Fatal(err)
+	}
+	if string(response) != "response" {
+		t.Fatalf("response = %q", response)
+	}
+}
+
 func TestGunConnSkipsEmptyFrames(t *testing.T) {
 	var wire bytes.Buffer
 	writer := newGunConn(bytes.NewReader(nil), &wire, nil)

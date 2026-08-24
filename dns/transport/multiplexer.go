@@ -238,10 +238,12 @@ func (m *queryMultiplexer) dispatch(ctx context.Context, message *mDNS.Msg, call
 			return
 		}
 		go func() {
-			defer generation.workers.Done()
 			workerCtx, cancel := contextWithMultiplexerGeneration(ctx, generation)
 			response, err := m.exchangeSingle(workerCtx, message)
 			cancel()
+			// The callback is consumer code, not a generation worker. Releasing
+			// the worker lease first lets a cancellation callback safely call Close.
+			generation.workers.Done()
 			callback(response, err)
 		}()
 		return

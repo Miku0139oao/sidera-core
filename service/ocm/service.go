@@ -35,12 +35,15 @@ import (
 	"github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/responses"
 	"golang.org/x/net/http2"
+	"golang.org/x/sync/singleflight"
 )
 
 const (
 	maxTrackedRequestBodyBytes = 32 << 20
 	maxTrackedResponseBytes    = 8 << 20
 	maxTrackedSSELineBytes     = 1 << 20
+	tokenRefreshTimeout        = 30 * time.Second
+	maxConcurrentWebSockets    = 128
 )
 
 type boundedCapture struct {
@@ -206,24 +209,31 @@ func extractWeeklyCycleHint(headers http.Header) *WeeklyCycleHint {
 
 type Service struct {
 	boxService.Adapter
-	ctx            context.Context
-	logger         log.ContextLogger
-	credentialPath string
-	credentials    *oauthCredentials
-	users          []option.OCMUser
-	dialer         N.Dialer
-	httpClient     *http.Client
-	httpHeaders    http.Header
-	listener       *listener.Listener
-	tlsConfig      tls.ServerConfig
-	httpServer     *http.Server
-	userManager    *UserManager
-	accessMutex    sync.RWMutex
-	usageTracker   *AggregatedUsage
-	webSocketMutex sync.Mutex
-	webSocketGroup sync.WaitGroup
-	webSocketConns map[*webSocketSession]struct{}
-	shuttingDown   bool
+	ctx              context.Context
+	logger           log.ContextLogger
+	credentialPath   string
+	credentials      *oauthCredentials
+	users            []option.OCMUser
+	dialer           N.Dialer
+	httpClient       *http.Client
+	httpHeaders      http.Header
+	listener         *listener.Listener
+	tlsConfig        tls.ServerConfig
+	httpServer       *http.Server
+	userManager      *UserManager
+	accessMutex      sync.RWMutex
+	usageTracker     *AggregatedUsage
+	refreshCtx       context.Context
+	refreshCancel    context.CancelFunc
+	refreshGroup     singleflight.Group
+	refreshLifecycle sync.Mutex
+	refreshClosing   bool
+	refreshWG        sync.WaitGroup
+	webSocketSlots   chan struct{}
+	webSocketMutex   sync.Mutex
+	webSocketGroup   sync.WaitGroup
+	webSocketConns   map[*webSocketSession]struct{}
+	shuttingDown     bool
 }
 
 func NewService(ctx context.Context, logger log.ContextLogger, tag string, options option.OCMServiceOptions) (adapter.Service, error) {
@@ -266,6 +276,7 @@ func NewService(ctx context.Context, logger log.ContextLogger, tag string, optio
 		}
 	}
 
+	refreshCtx, refreshCancel := context.WithCancel(ctx)
 	service := &Service{
 		Adapter:        boxService.NewAdapter(C.TypeOCM, tag),
 		ctx:            ctx,
@@ -283,6 +294,9 @@ func NewService(ctx context.Context, logger log.ContextLogger, tag string, optio
 		}),
 		userManager:    userManager,
 		usageTracker:   usageTracker,
+		refreshCtx:     refreshCtx,
+		refreshCancel:  refreshCancel,
+		webSocketSlots: make(chan struct{}, maxConcurrentWebSockets),
 		webSocketConns: make(map[*webSocketSession]struct{}),
 	}
 
@@ -355,8 +369,12 @@ func (s *Service) Start(stage adapter.StartStage) error {
 	return nil
 }
 
-func (s *Service) getAccessToken() (string, error) {
+func (s *Service) getAccessToken(ctx context.Context) (string, error) {
 	s.accessMutex.RLock()
+	if s.credentials == nil {
+		s.accessMutex.RUnlock()
+		return "", net.ErrClosed
+	}
 	if !s.credentials.needsRefresh() {
 		token := s.credentials.getAccessToken()
 		s.accessMutex.RUnlock()
@@ -364,25 +382,66 @@ func (s *Service) getAccessToken() (string, error) {
 	}
 	s.accessMutex.RUnlock()
 
-	s.accessMutex.Lock()
-	defer s.accessMutex.Unlock()
-
-	if !s.credentials.needsRefresh() {
-		return s.credentials.getAccessToken(), nil
+	result := s.refreshGroup.DoChan("token", s.refreshAccessToken)
+	select {
+	case <-ctx.Done():
+		return "", context.Cause(ctx)
+	case <-s.refreshCtx.Done():
+		return "", context.Cause(s.refreshCtx)
+	case refreshed := <-result:
+		if refreshed.Err != nil {
+			return "", refreshed.Err
+		}
+		return refreshed.Val.(string), nil
 	}
+}
 
-	newCredentials, err := refreshToken(s.httpClient, s.credentials)
+func (s *Service) refreshAccessToken() (any, error) {
+	s.refreshLifecycle.Lock()
+	if s.refreshClosing {
+		s.refreshLifecycle.Unlock()
+		return "", net.ErrClosed
+	}
+	s.refreshWG.Add(1)
+	s.refreshLifecycle.Unlock()
+	defer s.refreshWG.Done()
+
+	s.accessMutex.RLock()
+	if s.credentials == nil {
+		s.accessMutex.RUnlock()
+		return "", net.ErrClosed
+	}
+	if !s.credentials.needsRefresh() {
+		token := s.credentials.getAccessToken()
+		s.accessMutex.RUnlock()
+		return token, nil
+	}
+	credentials := *s.credentials
+	if s.credentials.Tokens != nil {
+		tokens := *s.credentials.Tokens
+		credentials.Tokens = &tokens
+	}
+	if s.credentials.LastRefresh != nil {
+		lastRefresh := *s.credentials.LastRefresh
+		credentials.LastRefresh = &lastRefresh
+	}
+	s.accessMutex.RUnlock()
+
+	refreshCtx, cancel := context.WithTimeout(s.refreshCtx, tokenRefreshTimeout)
+	defer cancel()
+	newCredentials, err := refreshToken(refreshCtx, s.httpClient, &credentials)
 	if err != nil {
 		return "", err
 	}
-
+	if err = context.Cause(s.refreshCtx); err != nil {
+		return "", err
+	}
+	s.accessMutex.Lock()
 	s.credentials = newCredentials
-
-	err = platformWriteCredentials(s.ctx, newCredentials, s.credentialPath)
-	if err != nil {
+	s.accessMutex.Unlock()
+	if err = platformWriteCredentials(s.refreshCtx, newCredentials, s.credentialPath); err != nil {
 		s.logger.Warn("persist refreshed token: ", err)
 	}
-
 	return newCredentials.getAccessToken(), nil
 }
 
@@ -482,7 +541,7 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 	}
 
-	accessToken, err := s.getAccessToken()
+	accessToken, err := s.getAccessToken(r.Context())
 	if err != nil {
 		s.logger.Error("get access token: ", err)
 		writeJSONError(w, r, http.StatusUnauthorized, "authentication_error", "Authentication failed")
@@ -729,6 +788,12 @@ func (s *Service) handleResponseWithTracking(writer http.ResponseWriter, respons
 }
 
 func (s *Service) Close() error {
+	s.refreshLifecycle.Lock()
+	s.refreshClosing = true
+	if s.refreshCancel != nil {
+		s.refreshCancel()
+	}
+	s.refreshLifecycle.Unlock()
 	webSocketSessions := s.startWebSocketShutdown()
 
 	err := common.Close(
@@ -740,6 +805,7 @@ func (s *Service) Close() error {
 		session.Close()
 	}
 	s.webSocketGroup.Wait()
+	s.refreshWG.Wait()
 
 	s.httpClient.CloseIdleConnections()
 	if s.usageTracker != nil {

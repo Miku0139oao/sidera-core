@@ -161,6 +161,8 @@ func (c *HTTPConn) Upstream() any {
 	return c.Conn
 }
 
+var _ N.WriteCloser = (*HTTP2Conn)(nil)
+
 type HTTP2Conn struct {
 	stateAccess sync.Mutex
 	readAccess  sync.Mutex
@@ -171,6 +173,7 @@ type HTTP2Conn struct {
 	readyOnce   sync.Once
 	setupDone   bool
 	closed      bool
+	writeClosed bool
 	err         error
 	cancel      context.CancelCauseFunc
 	closeOnce   sync.Once
@@ -287,6 +290,28 @@ func (c *HTTP2Conn) Write(b []byte) (n int, err error) {
 	}
 	n, err = writer.Write(b)
 	return n, baderror.WrapH2(err)
+}
+
+func (c *HTTP2Conn) CloseWrite() error {
+	c.writeAccess.Lock()
+	defer c.writeAccess.Unlock()
+	c.stateAccess.Lock()
+	if c.closed {
+		c.stateAccess.Unlock()
+		return net.ErrClosed
+	}
+	if c.writeClosed {
+		c.stateAccess.Unlock()
+		return nil
+	}
+	c.writeClosed = true
+	writer := c.writer
+	c.writer = nil
+	c.stateAccess.Unlock()
+	if closer, loaded := writer.(io.Closer); loaded {
+		return baderror.WrapH2(closer.Close())
+	}
+	return nil
 }
 
 func (c *HTTP2Conn) Close() error {

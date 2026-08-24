@@ -79,6 +79,8 @@ assert_inputs() {
   if grep -R -n -- '@latest' Makefile .github/workflows; then
     fail "mutable @latest tool found in release/build entry points"
   fi
+  command -v node >/dev/null 2>&1 || fail "node is required for release workflow structure checks"
+  node script/check-release-workflows.mjs
 
   git diff --check
   go mod verify

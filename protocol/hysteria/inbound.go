@@ -143,7 +143,9 @@ func (h *Inbound) buildService(users []adapter.ManagedUser) (*hysteria.Service[s
 		if _, exists := userNameMap[user.Password]; exists {
 			return nil, nil, nil, E.New("duplicate password for user ", index)
 		}
-		userList[index] = user.Password
+		// The authenticated context carries the immutable identity assigned by
+		// this service generation, not a credential looked up in mutable state.
+		userList[index] = user.Name
 		passwordList[index] = user.Password
 		managedUsers[index] = adapter.ManagedUser{
 			Name:     user.Name,
@@ -235,13 +237,10 @@ func (h *Inbound) startService(service *hysteria.Service[string]) (*listener.Lis
 }
 
 func (h *Inbound) userName(ctx context.Context) string {
-	credential, loaded := auth.UserFromContext[string](ctx)
+	userName, loaded := auth.UserFromContext[string](ctx)
 	if !loaded {
 		return ""
 	}
-	h.userAccess.RLock()
-	userName := h.userNameMap[credential]
-	h.userAccess.RUnlock()
 	return userName
 }
 

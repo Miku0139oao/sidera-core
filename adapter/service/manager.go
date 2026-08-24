@@ -38,11 +38,13 @@ type Manager struct {
 	startingStage     adapter.StartStage
 	closing           bool
 	closed            bool
+	admissionStopped  bool
 	closeErr          error
 	stage             adapter.StartStage
 	runtimeActive     bool
 	runtimeCommitting bool
 	lifecycleDepth    int
+	closeCallbacks    int
 	lifecycleOwner    uint64
 	lifecycleKind     lifecycleOperation
 	services          []adapter.Service
@@ -113,7 +115,33 @@ func (m *Manager) Start(stage adapter.StartStage) error {
 	return nil
 }
 
-func (m *Manager) Close() (err error) {
+func (m *Manager) StopAdmission() (err error) {
+	m.access.Lock()
+	if m.closing || m.closed || m.lifecycleDepth > 0 {
+		m.access.Unlock()
+		return os.ErrClosed
+	}
+	m.admissionStopped = true
+	services := append([]adapter.Service(nil), m.services...)
+	m.access.Unlock()
+	for _, managedService := range services {
+		lifecycle, loaded := managedService.(adapter.ProducerQuiescenceLifecycle)
+		if !loaded {
+			continue
+		}
+		name := "service/" + managedService.Type() + "[" + managedService.Tag() + "]"
+		err = E.Append(err, lifecycle.StopAdmission(), func(err error) error {
+			return E.Cause(err, "stop admission for ", name)
+		})
+	}
+	return err
+}
+
+func (m *Manager) Close() error {
+	return m.CloseAfterProducerQuiescence()
+}
+
+func (m *Manager) CloseAfterProducerQuiescence() (err error) {
 	owner := currentGoroutineID()
 	m.access.Lock()
 	condition := m.conditionLocked()
@@ -131,6 +159,10 @@ func (m *Manager) Close() (err error) {
 	if m.lifecycleDepth > 0 && m.lifecycleOwner == owner {
 		m.access.Unlock()
 		return E.New("cannot close service manager from an active lifecycle callback")
+	}
+	if m.lifecycleDepth > 0 && m.closeCallbacks > 0 {
+		m.access.Unlock()
+		return os.ErrClosed
 	}
 	m.closing = true
 	for m.lifecycleDepth > 0 {
@@ -158,15 +190,32 @@ func (m *Manager) Close() (err error) {
 	}()
 
 	monitor := taskmonitor.New(m.logger, C.StopTimeout)
+	var firstPanic any
 	for _, managedService := range services {
 		name := "service/" + managedService.Type() + "[" + managedService.Tag() + "]"
 		done := adapter.LogElapsed(m.logger, "close ", name)
 		monitor.Start("close ", name)
-		err = E.Append(err, managedService.Close(), func(err error) error {
+		panicValue, closeErr := adapter.CloseWithPanic(func() error {
+			if lifecycle, loaded := managedService.(adapter.ProducerQuiescenceLifecycle); loaded {
+				return lifecycle.CloseAfterProducerQuiescence()
+			}
+			return managedService.Close()
+		})
+		err = E.Append(err, closeErr, func(err error) error {
 			return E.Cause(err, "close ", name)
 		})
+		if panicValue != nil {
+			if firstPanic == nil {
+				firstPanic = panicValue
+			} else {
+				err = errors.Join(err, E.New("additional panic while closing ", name, ": ", panicValue))
+			}
+		}
 		monitor.Finish()
 		done()
+	}
+	if firstPanic != nil {
+		panic(firstPanic)
 	}
 	return err
 }
@@ -475,6 +524,14 @@ func causeIfError(err error, message ...any) error {
 }
 
 func (m *Manager) closeService(managedService adapter.Service) error {
+	m.access.Lock()
+	m.closeCallbacks++
+	m.access.Unlock()
+	defer func() {
+		m.access.Lock()
+		m.closeCallbacks--
+		m.access.Unlock()
+	}()
 	return managedService.Close()
 }
 
@@ -490,7 +547,7 @@ func (m *Manager) beginLifecycle(kind lifecycleOperation, allowNestedStart bool)
 	m.access.Lock()
 	condition := m.conditionLocked()
 	for {
-		if m.closing || m.closed {
+		if m.closing || m.closed || m.admissionStopped {
 			m.access.Unlock()
 			return false, os.ErrClosed
 		}

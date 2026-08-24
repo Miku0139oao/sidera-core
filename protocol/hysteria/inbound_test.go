@@ -28,7 +28,7 @@ func TestManagedUserIdentityPublishedBeforeServiceStart(t *testing.T) {
 			[]adapter.ManagedUser{{Name: "new", Password: "new-password"}},
 			map[string]string{"new-password": "new"},
 			func(*hy.Service[string]) (*listener.Listener, error) {
-				started <- inbound.userName(auth.ContextWithUser(context.Background(), "new-password"))
+				started <- inbound.userName(auth.ContextWithUser(context.Background(), "new"))
 				<-release
 				return listener.New(listener.Options{}), nil
 			},
@@ -60,6 +60,14 @@ func TestManagedUserIdentityPublishedBeforeServiceStart(t *testing.T) {
 	_ = inbound.listener.Close()
 }
 
+func TestAuthenticatedIdentitySurvivesNewGenerationPublication(t *testing.T) {
+	inbound := &Inbound{userNameMap: map[string]string{"new-password": "new"}}
+	oldContext := auth.ContextWithUser(context.Background(), "old")
+	if got := inbound.userName(oldContext); got != "old" {
+		t.Fatalf("old authenticated identity changed after publication: %q", got)
+	}
+}
+
 func TestDuplicatePasswordLeavesActiveGenerationUnchanged(t *testing.T) {
 	inbound := &Inbound{
 		users:       []adapter.ManagedUser{{Name: "old", Password: "old-password"}},
@@ -80,7 +88,7 @@ func TestDuplicatePasswordLeavesActiveGenerationUnchanged(t *testing.T) {
 	if len(users) != 1 || users[0].Name != "old" {
 		t.Fatalf("duplicate update changed managed users: %+v", users)
 	}
-	if got := inbound.userName(auth.ContextWithUser(context.Background(), "old-password")); got != "old" {
+	if got := inbound.userName(auth.ContextWithUser(context.Background(), "old")); got != "old" {
 		t.Fatalf("duplicate update changed credential map: %q", got)
 	}
 }

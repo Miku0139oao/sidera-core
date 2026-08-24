@@ -2,6 +2,7 @@ package vless
 
 import (
 	"context"
+	"net/netip"
 	"testing"
 	"time"
 
@@ -21,6 +22,15 @@ func TestEncryptionHandshakeContextFollowsCancellation(t *testing.T) {
 		t.Fatal("encryption handshake context was not canceled")
 	}
 	cancelHandshake()
+}
+
+func TestImportedXrayVisionRejectsUDP443(t *testing.T) {
+	dialer := &vlessDialer{xrayVisionRejectUDP443: true}
+	destination := M.Socksaddr{Addr: netip.MustParseAddr("1.1.1.1"), Port: 443}
+	_, err := dialer.DialContext(t.Context(), "udp", destination)
+	require.ErrorContains(t, err, "rejects UDP/443")
+	_, err = dialer.ListenPacket(t.Context(), destination)
+	require.ErrorContains(t, err, "rejects UDP/443")
 }
 
 func TestXrayCompatiblePacketEncoding(t *testing.T) {

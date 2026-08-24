@@ -4,7 +4,6 @@ import (
 	"context"
 	"net"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/Miku0139oao/sidera-core/adapter"
@@ -19,7 +18,6 @@ import (
 	"golang.org/x/net/http2"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/keepalive"
-	gM "google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/peer"
 )
 
@@ -59,17 +57,7 @@ func (s *Server) Tun(server GunService_TunServer) error {
 	if remotePeer, loaded := peer.FromContext(server.Context()); loaded {
 		source = M.SocksaddrFromNet(remotePeer.Addr)
 	}
-	if grpcMetadata, loaded := gM.FromIncomingContext(server.Context()); loaded {
-		forwardFrom := strings.Join(grpcMetadata.Get("X-Forwarded-For"), ",")
-		if forwardFrom != "" {
-			for from := range strings.SplitSeq(forwardFrom, ",") {
-				originAddr := M.ParseSocksaddr(from)
-				if originAddr.IsValid() {
-					source = originAddr.Unwrap()
-				}
-			}
-		}
-	}
+
 	done := make(chan struct{})
 	go s.handler.NewConnectionEx(routeContext, conn, source, M.Socksaddr{}, N.OnceClose(func(it error) {
 		close(done)

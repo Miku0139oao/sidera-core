@@ -2,6 +2,7 @@ package inbound
 
 import (
 	"context"
+	"errors"
 	"os"
 	"sync"
 
@@ -26,6 +27,7 @@ type Manager struct {
 	closing        bool
 	closed         bool
 	mutations      int
+	closeCallbacks int
 	mutationOwners map[uint64]int
 	closeErr       error
 	stage          adapter.StartStage
@@ -100,6 +102,13 @@ func (m *Manager) Close() (err error) {
 		m.access.Unlock()
 		return E.New("cannot close inbound manager from an active lifecycle callback")
 	}
+	// A child callback may start Close on another goroutine and wait for it.
+	// Waiting for that mutation here would form a cycle; report a retryable
+	// closed state without claiming ownership of teardown.
+	if m.mutations > 0 && m.closeCallbacks > 0 {
+		m.access.Unlock()
+		return os.ErrClosed
+	}
 	m.closing = true
 	for m.mutations > 0 {
 		condition.Wait()
@@ -123,15 +132,27 @@ func (m *Manager) Close() (err error) {
 	}()
 
 	monitor := taskmonitor.New(m.logger, C.StopTimeout)
+	var firstPanic any
 	for _, inbound := range inbounds {
 		name := "inbound/" + inbound.Type() + "[" + inbound.Tag() + "]"
 		done := adapter.LogElapsed(m.logger, "close ", name)
 		monitor.Start("close ", name)
-		err = E.Append(err, inbound.Close(), func(err error) error {
+		panicValue, closeErr := adapter.CloseWithPanic(inbound.Close)
+		err = E.Append(err, closeErr, func(err error) error {
 			return E.Cause(err, "close ", name)
 		})
+		if panicValue != nil {
+			if firstPanic == nil {
+				firstPanic = panicValue
+			} else {
+				err = errors.Join(err, E.New("additional panic while closing ", name, ": ", panicValue))
+			}
+		}
 		monitor.Finish()
 		done()
+	}
+	if firstPanic != nil {
+		panic(firstPanic)
 	}
 	return err
 }
@@ -279,6 +300,14 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
 }
 
 func (m *Manager) closeInbound(inbound adapter.Inbound) error {
+	m.access.Lock()
+	m.closeCallbacks++
+	m.access.Unlock()
+	defer func() {
+		m.access.Lock()
+		m.closeCallbacks--
+		m.access.Unlock()
+	}()
 	return inbound.Close()
 }
 

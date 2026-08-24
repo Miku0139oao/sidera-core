@@ -3,6 +3,7 @@ package config
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	stdjson "encoding/json"
 	"maps"
 	"net"
@@ -451,8 +452,13 @@ func translateXray(ctx context.Context, content []byte) (option.Options, error) 
 			continue
 		}
 		vlessOptions, loaded := options.Outbounds[nativeOutboundIndex].Options.(*option.VLESSOutboundOptions)
-		if loaded && vlessOptions.Flow == "" {
-			vlessOptions.XrayPacketEncoding = true
+		if loaded {
+			switch vlessOptions.Flow {
+			case "":
+				vlessOptions.XrayPacketEncoding = true
+			case "xtls-rprx-vision":
+				vlessOptions.XrayVisionRejectUDP443 = true
+			}
 		}
 		nativeOutboundIndex++
 	}
@@ -658,6 +664,9 @@ func translateXrayVLESSInbound(source xrayVLESSInboundSettings) (map[string]any,
 		if user.ID == "" {
 			return nil, E.New("VLESS user ", index, " id is required")
 		}
+		if err := validateXrayUUIDOrAlias(user.ID); err != nil {
+			return nil, E.Cause(err, "invalid VLESS user ", index, " id")
+		}
 		if user.Level != 0 {
 			return nil, E.New("VLESS user level has no current Sidera equivalent")
 		}
@@ -690,6 +699,30 @@ func translateXrayVLESSInbound(source xrayVLESSInboundSettings) (map[string]any,
 		"users":      convertedUsers,
 		"decryption": source.Decryption,
 	}, nil
+}
+
+func validateXrayUUIDOrAlias(value string) error {
+	text := []byte(value)
+	if length := len(text); length < 32 || length > 36 {
+		if length == 0 || length > 30 {
+			return E.New("invalid Xray UUID or alias: ", value)
+		}
+		return nil
+	}
+	for _, groupLength := range [...]int{8, 4, 4, 4, 12} {
+		if len(text) > 0 && text[0] == '-' {
+			text = text[1:]
+		}
+		if len(text) < groupLength {
+			return E.New("invalid Xray UUID: ", value)
+		}
+		decoded := make([]byte, groupLength/2)
+		if _, err := hex.Decode(decoded, text[:groupLength]); err != nil {
+			return E.Cause(err, "invalid Xray UUID: ", value)
+		}
+		text = text[groupLength:]
+	}
+	return nil
 }
 
 func isDefaultXrayVisionSeed(seed []uint32) bool {
@@ -895,6 +928,9 @@ func translateXrayVLESS(source xrayVLESSSettings) (map[string]any, error) {
 	}
 	if address == "" || port == 0 || user.ID == "" {
 		return nil, E.New("VLESS server address, port, and user id are required")
+	}
+	if err := validateXrayUUIDOrAlias(user.ID); err != nil {
+		return nil, E.Cause(err, "invalid VLESS user id")
 	}
 	if user.Level != 0 || user.Email != "" {
 		return nil, E.New("VLESS user level/email metadata has no current Sidera equivalent")
@@ -1283,7 +1319,7 @@ func translateXrayGRPC(source *xrayGRPC) (map[string]any, error) {
 	}
 	result := map[string]any{"type": "grpc"}
 	if source.ServiceName != "" {
-		result["service_name"] = source.ServiceName
+		result["service_name"] = url.PathEscape(source.ServiceName)
 	}
 	if source.IdleTimeout > 0 {
 		result["idle_timeout"] = strconv.FormatInt(int64(source.IdleTimeout), 10) + "s"

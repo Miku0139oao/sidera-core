@@ -1,6 +1,7 @@
 package tuic
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -8,6 +9,7 @@ import (
 	"github.com/Miku0139oao/sidera-core/common/listener"
 	"github.com/Miku0139oao/sidera-core/option"
 	quicTUIC "github.com/sagernet/sing-quic/tuic"
+	"github.com/sagernet/sing/common/auth"
 )
 
 const (
@@ -38,7 +40,7 @@ func TestManagedUserIdentityPublishedBeforeServiceStart(t *testing.T) {
 				newUserID: {Name: "new", UUID: newUserID, Password: "new-password"},
 			},
 			func(*quicTUIC.Service[string]) (*listener.Listener, error) {
-				started <- inbound.userName(newUserID)
+				started <- authenticatedUserName(auth.ContextWithUser(context.Background(), "new"))
 				<-release
 				return listener.New(listener.Options{}), nil
 			},
@@ -68,6 +70,13 @@ func TestManagedUserIdentityPublishedBeforeServiceStart(t *testing.T) {
 		t.Fatal("managed-user update did not complete")
 	}
 	_ = inbound.listener.Close()
+}
+
+func TestAuthenticatedIdentitySurvivesNewGenerationPublication(t *testing.T) {
+	oldContext := auth.ContextWithUser(context.Background(), "old")
+	if got := authenticatedUserName(oldContext); got != "old" {
+		t.Fatalf("old authenticated identity changed after publication: %q", got)
+	}
 }
 
 func TestDuplicateUUIDLeavesActiveGenerationUnchanged(t *testing.T) {

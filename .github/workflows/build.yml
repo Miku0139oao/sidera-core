@@ -90,6 +90,33 @@ jobs:
         id: outputs
         run: |-
           echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  publish_provenance:
+    name: Verify immutable store publication source
+    if: github.event_name == 'workflow_dispatch' && (inputs.build == 'publish-android' || inputs.build == 'All' || inputs.build == 'Apple' || inputs.build == 'iOS' || inputs.build == 'macOS' || inputs.build == 'tvOS')
+    runs-on: ubuntu-latest
+    needs:
+      - release_gate
+      - calculate_version
+    steps:
+      - name: Checkout immutable workflow commit
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify release tag provenance
+        env:
+          RELEASE_VERSION: ${{ needs.calculate_version.outputs.version }}
+        run: |-
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          tag="v${RELEASE_VERSION}"
+          git ls-remote --exit-code --refs origin "refs/tags/${tag}" >/dev/null
+          git fetch --force --depth=1 origin "refs/tags/${tag}"
+          test "$(git rev-parse 'FETCH_HEAD^{commit}')" = "$GITHUB_SHA"
+
   build:
     name: Build binary
     if: github.event_name != 'workflow_dispatch' || inputs.build == 'All' || inputs.build == 'Binary'
@@ -841,6 +868,7 @@ jobs:
     runs-on: ubuntu-latest
     needs:
       - calculate_version
+      - publish_provenance
       - build_android_library
     steps:
       - name: Checkout
@@ -1566,6 +1594,7 @@ jobs:
     if: github.event_name == 'workflow_dispatch' && (inputs.build == 'All' || inputs.build == 'Apple' || inputs.build == 'iOS' || inputs.build == 'macOS' || inputs.build == 'tvOS')
     needs:
       - calculate_version
+      - publish_provenance
       - build_apple_library
     strategy:
       fail-fast: false
@@ -1603,8 +1632,10 @@ jobs:
             library_arch: ''
     steps: *build_apple_steps
   upload:
-    name: Upload builds
-    if: "always() && !failure() && !cancelled() && github.event_name == 'workflow_dispatch' && (inputs.build == 'All' || inputs.build == 'Binary' || inputs.build == 'Android' || inputs.build == 'Windows' || inputs.build == 'Linux' || inputs.build == 'Apple-release' || inputs.build == 'macOS-standalone' || inputs.build == 'iOS-jailbreak')"
+    name: Upload complete release inventory
+    # Partial build selections remain downloadable workflow artifacts, but may
+    # not replace a shared GitHub release or its checksum manifest.
+    if: "always() && !failure() && !cancelled() && github.event_name == 'workflow_dispatch' && inputs.build == 'All'"
     runs-on: ubuntu-latest
     permissions:
       contents: write

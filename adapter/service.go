@@ -13,6 +13,14 @@ type Service interface {
 	Tag() string
 }
 
+// ProducerQuiescenceLifecycle lets a service stop accepting control-plane
+// work before data-plane producers are closed, then finalize state after those
+// producers are quiescent.
+type ProducerQuiescenceLifecycle interface {
+	StopAdmission() error
+	CloseAfterProducerQuiescence() error
+}
+
 type ServiceRegistry interface {
 	option.ServiceOptionsRegistry
 	Create(ctx context.Context, logger log.ContextLogger, tag string, serviceType string, options any) (Service, error)
@@ -20,6 +28,7 @@ type ServiceRegistry interface {
 
 type ServiceManager interface {
 	Lifecycle
+	ProducerQuiescenceLifecycle
 	Services() []Service
 	Get(tag string) (Service, bool)
 	Remove(tag string) error

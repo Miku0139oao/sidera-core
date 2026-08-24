@@ -69,7 +69,7 @@ func TestRecursiveCloseDoesNotDeadlock(t *testing.T) {
 	}
 }
 
-func TestCloseWaitsForInFlightRemoval(t *testing.T) {
+func TestCloseDuringChildCleanupReturnsRetryableError(t *testing.T) {
 	inbound := &closeTestInbound{started: make(chan struct{}), release: make(chan struct{})}
 	manager := NewManager(log.NewNOPFactory().Logger(), nil, nil)
 	manager.inbounds = []adapter.Inbound{inbound}
@@ -85,14 +85,17 @@ func TestCloseWaitsForInFlightRemoval(t *testing.T) {
 	go func() { closeDone <- manager.Close() }()
 	select {
 	case err := <-closeDone:
-		t.Fatalf("Close returned before removal cleanup: %v", err)
-	case <-time.After(50 * time.Millisecond):
+		if !errors.Is(err, os.ErrClosed) {
+			t.Fatalf("Close during child cleanup = %v, want os.ErrClosed", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close during child cleanup blocked")
 	}
 	close(inbound.release)
 	if err := <-removeDone; err != nil {
 		t.Fatal(err)
 	}
-	if err := <-closeDone; err != nil {
+	if err := manager.Close(); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -274,6 +277,33 @@ func TestCreateRejectedAfterCloseClaim(t *testing.T) {
 	}
 }
 
+func TestAsyncCloseReentryDuringRemovalDoesNotDeadlock(t *testing.T) {
+	manager := NewManager(log.NewNOPFactory().Logger(), nil, nil)
+	inbound := &closeTestInbound{}
+	inbound.closeFunc = func() error {
+		reentered := make(chan error, 1)
+		go func() { reentered <- manager.Close() }()
+		select {
+		case err := <-reentered:
+			return err
+		case <-time.After(time.Second):
+			return errors.New("asynchronous Close reentry during removal deadlocked")
+		}
+	}
+	manager.inbounds = []adapter.Inbound{inbound}
+	manager.inboundByTag["test"] = inbound
+	result := make(chan error, 1)
+	go func() { result <- manager.Remove("test") }()
+	select {
+	case err := <-result:
+		if !errors.Is(err, os.ErrClosed) {
+			t.Fatalf("Remove error = %v, want os.ErrClosed", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Remove deadlocked with asynchronous Close reentry")
+	}
+}
+
 func TestAsyncCloseReentryDoesNotDeadlock(t *testing.T) {
 	manager := NewManager(log.NewNOPFactory().Logger(), nil, nil)
 	inbound := &closeTestInbound{}
@@ -301,6 +331,29 @@ func TestAsyncCloseReentryDoesNotDeadlock(t *testing.T) {
 	}
 	if err := manager.Close(); !errors.Is(err, os.ErrClosed) {
 		t.Fatalf("idempotent Close error = %v, want stored os.ErrClosed", err)
+	}
+}
+
+func TestCloseContinuesAfterChildPanic(t *testing.T) {
+	laterClosed := make(chan struct{})
+	first := &closeTestInbound{tag: "first", closeFunc: func() error { panic("first close panic") }}
+	second := &closeTestInbound{tag: "second", closeFunc: func() error { close(laterClosed); return nil }}
+	manager := NewManager(log.NewNOPFactory().Logger(), nil, nil)
+	manager.inbounds = []adapter.Inbound{first, second}
+	manager.inboundByTag["first"] = first
+	manager.inboundByTag["second"] = second
+	var panicValue any
+	func() {
+		defer func() { panicValue = recover() }()
+		_ = manager.Close()
+	}()
+	if panicValue == nil {
+		t.Fatal("Close did not propagate the first child panic")
+	}
+	select {
+	case <-laterClosed:
+	case <-time.After(time.Second):
+		t.Fatal("later child was not closed after an earlier panic")
 	}
 }
 

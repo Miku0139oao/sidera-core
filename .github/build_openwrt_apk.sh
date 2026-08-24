@@ -51,8 +51,15 @@ install -Dm644 "$PROJECT/release/completions/sidera.bash" "$ROOT_DIR/usr/share/b
 install -Dm644 "$PROJECT/release/completions/sidera.fish" "$ROOT_DIR/usr/share/fish/vendor_completions.d/sidera.fish"
 install -Dm644 "$PROJECT/release/completions/sidera.zsh" "$ROOT_DIR/usr/share/zsh/site-functions/_sidera"
 
-# License
+# License and source provenance
 install -Dm644 "$PROJECT/LICENSE" "$ROOT_DIR/usr/share/licenses/sidera/LICENSE"
+install -Dm644 "$PROJECT/NOTICE.md" "$ROOT_DIR/usr/share/doc/sidera/NOTICE.md"
+install -Dm644 "$PROJECT/UPSTREAM.md" "$ROOT_DIR/usr/share/doc/sidera/UPSTREAM.md"
+test -f "${BINARY_PATH}.buildinfo"
+install -Dm644 "${BINARY_PATH}.buildinfo" "$ROOT_DIR/usr/share/doc/sidera/sidera.buildinfo"
+for license_file in "$PROJECT"/release/licenses/*; do
+  install -Dm644 "$license_file" "$ROOT_DIR/usr/share/licenses/sidera/third-party/$(basename "$license_file")"
+done
 
 # APK metadata
 PACKAGES_DIR="$ROOT_DIR/lib/apk/packages"

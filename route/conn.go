@@ -34,6 +34,7 @@ type ConnectionManager struct {
 	logger      logger.ContextLogger
 	access      sync.Mutex
 	connections list.List[io.Closer]
+	closed      bool
 }
 
 func NewConnectionManager(logger logger.ContextLogger) *ConnectionManager {
@@ -68,12 +69,33 @@ func (m *ConnectionManager) CloseAll() {
 }
 
 func (m *ConnectionManager) Close() error {
-	m.CloseAll()
+	m.access.Lock()
+	if m.closed {
+		m.access.Unlock()
+		return nil
+	}
+	m.closed = true
+	var closers []io.Closer
+	for element := m.connections.Front(); element != nil; {
+		nextElement := element.Next()
+		closers = append(closers, element.Value)
+		m.connections.Remove(element)
+		element = nextElement
+	}
+	m.access.Unlock()
+	for _, closer := range closers {
+		common.Close(closer)
+	}
 	return nil
 }
 
 func (m *ConnectionManager) TrackConn(conn net.Conn) net.Conn {
 	m.access.Lock()
+	if m.closed {
+		m.access.Unlock()
+		_ = conn.Close()
+		return conn
+	}
 	element := m.connections.PushBack(conn)
 	m.access.Unlock()
 	return &trackedConn{
@@ -85,6 +107,11 @@ func (m *ConnectionManager) TrackConn(conn net.Conn) net.Conn {
 
 func (m *ConnectionManager) TrackPacketConn(conn net.PacketConn) net.PacketConn {
 	m.access.Lock()
+	if m.closed {
+		m.access.Unlock()
+		_ = conn.Close()
+		return conn
+	}
 	element := m.connections.PushBack(conn)
 	m.access.Unlock()
 	return &trackedPacketConn{
@@ -349,6 +376,32 @@ func (m *ConnectionManager) connectionCopy(ctx context.Context, source net.Conn,
 	}
 }
 
+func copyPacketExact(destination N.PacketWriter, source N.PacketReader) (n int64, err error) {
+	// A UDP datagram must be forwarded in full or not at all. The upstream copy
+	// fast path uses 8/16 KiB pooled buffers and some recvmmsg implementations
+	// ignore MSG_TRUNC, which can turn a valid large datagram into a corrupt
+	// prefix. A maximum-size managed buffer keeps packet boundaries exact.
+	const maxUDPPayloadSize = 65535
+	for {
+		buffer := buf.NewSize(maxUDPPayloadSize)
+		packetDestination, readErr := source.ReadPacket(buffer)
+		if readErr != nil {
+			buffer.Release()
+			return n, readErr
+		}
+		dataLen := buffer.Len()
+		if dataLen > maxUDPPayloadSize {
+			buffer.Release()
+			return n, E.New("UDP packet exceeds maximum payload size")
+		}
+		if writeErr := destination.WritePacket(buffer, packetDestination); writeErr != nil {
+			buffer.Leak()
+			return n, writeErr
+		}
+		n += int64(dataLen)
+	}
+}
+
 func (m *ConnectionManager) kickWriteHandshake(ctx context.Context, source net.Conn, destination net.Conn, serverFirst bool, direction bool, done *atomic.Bool, onClose N.CloseHandlerFunc) bool {
 	if !N.NeedHandshakeForWrite(destination) {
 		return false
@@ -408,7 +461,7 @@ func (m *ConnectionManager) kickWriteHandshake(ctx context.Context, source net.C
 }
 
 func (m *ConnectionManager) packetConnectionCopy(ctx context.Context, source N.PacketReader, destination N.PacketWriter, direction bool, done *atomic.Bool, onClose N.CloseHandlerFunc) {
-	_, err := bufio.CopyPacket(destination, source)
+	_, err := copyPacketExact(destination, source)
 	if !direction {
 		if err == nil {
 			m.logger.DebugContext(ctx, "packet upload finished")

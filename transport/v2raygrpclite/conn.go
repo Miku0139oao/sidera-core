@@ -35,6 +35,7 @@ type GunConn struct {
 	readyOnce     sync.Once
 	setupDone     bool
 	closed        bool
+	writeClosed   bool
 	err           error
 	cancel        context.CancelCauseFunc
 	readRemaining int
@@ -265,6 +266,28 @@ func writeAll(writer io.Writer, content []byte) error {
 
 func (c *GunConn) FrontHeadroom() int {
 	return 6 + binary.MaxVarintLen64
+}
+
+func (c *GunConn) CloseWrite() error {
+	c.writeAccess.Lock()
+	defer c.writeAccess.Unlock()
+	c.stateAccess.Lock()
+	if c.closed {
+		c.stateAccess.Unlock()
+		return net.ErrClosed
+	}
+	if c.writeClosed {
+		c.stateAccess.Unlock()
+		return nil
+	}
+	c.writeClosed = true
+	writer := c.writer
+	c.writer = nil
+	c.stateAccess.Unlock()
+	if closer, loaded := writer.(io.Closer); loaded {
+		return baderror.WrapH2(closer.Close())
+	}
+	return nil
 }
 
 func (c *GunConn) Close() error {

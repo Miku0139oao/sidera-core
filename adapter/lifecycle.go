@@ -99,6 +99,16 @@ func StartNamed(logger log.ContextLogger, stage StartStage, services []Lifecycle
 	return nil
 }
 
+// CloseWithPanic captures a child panic so an owner can continue closing the
+// remaining children before propagating the first panic.
+func CloseWithPanic(closeFunc func() error) (panicValue any, err error) {
+	defer func() {
+		panicValue = recover()
+	}()
+	err = closeFunc()
+	return nil, err
+}
+
 func LogElapsed(logger log.ContextLogger, description ...any) func() {
 	prefix := F.ToString(description...)
 	startTime := time.Now()

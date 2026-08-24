@@ -221,11 +221,17 @@ jobs:
           git check-ref-format --branch "$ref" >/dev/null
           echo "ref=$ref"
           echo "ref=$ref" >> "$GITHUB_OUTPUT"
-      - name: Checkout
+      - name: Checkout immutable workflow commit
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
         with:
-          ref: ${{ steps.ref.outputs.ref }}
+          ref: ${{ github.sha }}
           fetch-depth: 0
+          persist-credentials: false
+      - name: Verify immutable source
+        run: |-
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
       - name: Prepare
         run: |
           platform=${{ matrix.platform }}
@@ -300,11 +306,17 @@ jobs:
           git check-ref-format --branch "$ref" >/dev/null
           echo "ref=$ref"
           echo "ref=$ref" >> "$GITHUB_OUTPUT"
-      - name: Checkout
+      - name: Checkout immutable workflow commit
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
         with:
-          ref: ${{ steps.ref.outputs.ref }}
+          ref: ${{ github.sha }}
           fetch-depth: 0
+          persist-credentials: false
+      - name: Verify immutable source
+        run: |-
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
       - name: Detect track
         run: bash .github/detect_track.sh
       - name: Download digests

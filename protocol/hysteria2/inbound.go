@@ -258,7 +258,8 @@ func (h *Inbound) buildService(users []adapter.ManagedUser) (*hysteria2.Service[
 		if _, exists := userNameMap[user.Password]; exists {
 			return nil, nil, nil, E.New("duplicate password for user ", index)
 		}
-		userList[index] = user.Password
+		// Bind the authenticated context to this service generation's identity.
+		userList[index] = user.Name
 		passwordList[index] = user.Password
 		managedUsers[index] = adapter.ManagedUser{
 			Name:     user.Name,
@@ -349,13 +350,10 @@ func (h *Inbound) startService(service *hysteria2.Service[string]) (*listener.Li
 }
 
 func (h *Inbound) userName(ctx context.Context) string {
-	credential, loaded := auth.UserFromContext[string](ctx)
+	userName, loaded := auth.UserFromContext[string](ctx)
 	if !loaded {
 		return ""
 	}
-	h.userAccess.RLock()
-	userName := h.userNameMap[credential]
-	h.userAccess.RUnlock()
 	return userName
 }
 
