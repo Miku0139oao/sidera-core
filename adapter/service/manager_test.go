@@ -203,6 +203,7 @@ func TestCloseReturnsServiceErrors(t *testing.T) {
 	manager := NewManager(logger, registry)
 	require.NoError(t, manager.Create(context.Background(), logger, "close", "close-test", &option.StubOptions{}))
 	require.ErrorIs(t, manager.Close(), expected)
+	require.ErrorIs(t, manager.Close(), expected)
 }
 
 func TestCloseWaitsForRuntimeCommitAndPreventsActivation(t *testing.T) {
@@ -332,6 +333,163 @@ func TestStartFromCreateCallbackDoesNotDeadlock(t *testing.T) {
 	}
 	require.ErrorContains(t, startErr, "service update")
 	require.NoError(t, manager.Close())
+}
+
+func TestRemoveWaitsForBlockedServiceStart(t *testing.T) {
+	startEntered := make(chan struct{})
+	startRelease := make(chan struct{})
+	closeEntered := make(chan struct{})
+	registry := NewRegistry()
+	managedService := &managerLifecycleTestService{
+		Adapter: NewAdapter("barrier-test", "barrier"),
+		startFunc: func(adapter.StartStage) error {
+			close(startEntered)
+			<-startRelease
+			return nil
+		},
+		closeFunc: func() error {
+			close(closeEntered)
+			return nil
+		},
+	}
+	Register[option.StubOptions](registry, "barrier-test", func(context.Context, log.ContextLogger, string, option.StubOptions) (adapter.Service, error) {
+		return managedService, nil
+	})
+	logger := log.NewNOPFactory().Logger()
+	manager := NewManager(logger, registry)
+	require.NoError(t, manager.Create(context.Background(), logger, "barrier", "barrier-test", &option.StubOptions{}))
+
+	startDone := make(chan error, 1)
+	go func() { startDone <- manager.Start(adapter.StartStateInitialize) }()
+	select {
+	case <-startEntered:
+	case <-time.After(time.Second):
+		t.Fatal("Start callback did not enter")
+	}
+	removeDone := make(chan error, 1)
+	go func() { removeDone <- manager.Remove("barrier") }()
+	select {
+	case <-closeEntered:
+		t.Fatal("Remove closed a service while Start was blocked")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(startRelease)
+	require.NoError(t, <-startDone)
+	require.NoError(t, <-removeDone)
+}
+
+func TestServiceReplacementCloseFailureRetainsOwnershipAndAllowsGet(t *testing.T) {
+	expected := errors.New("old close failed")
+	created := 0
+	registry := NewRegistry()
+	logger := log.NewNOPFactory().Logger()
+	manager := NewManager(logger, registry)
+	var oldService *managerLifecycleTestService
+	var candidate *managerLifecycleTestService
+	Register[option.StubOptions](registry, "replace-test", func(context.Context, log.ContextLogger, string, option.StubOptions) (adapter.Service, error) {
+		created++
+		if created == 1 {
+			oldService = &managerLifecycleTestService{Adapter: NewAdapter("replace-test", "replace")}
+			oldService.closeFunc = func() error {
+				if current, loaded := manager.Get("replace"); !loaded || current != oldService {
+					return errors.New("Close callback could not reenter Get")
+				}
+				return expected
+			}
+			return oldService, nil
+		}
+		candidate = &managerLifecycleTestService{Adapter: NewAdapter("replace-test", "replace")}
+		return candidate, nil
+	})
+	require.NoError(t, manager.Create(context.Background(), logger, "replace", "replace-test", &option.StubOptions{}))
+	err := manager.Create(context.Background(), logger, "replace", "replace-test", &option.StubOptions{})
+	require.ErrorIs(t, err, expected)
+	current, loaded := manager.Get("replace")
+	require.True(t, loaded)
+	require.Same(t, oldService, current)
+	require.Equal(t, 1, candidate.closed)
+
+	oldService.closeFunc = nil
+	require.NoError(t, manager.Close())
+	require.Equal(t, 2, oldService.closed)
+}
+
+func TestRemoveClosesUnstartedServiceAndBlocksActiveRecreate(t *testing.T) {
+	created := 0
+	registry := NewRegistry()
+	Register[option.StubOptions](registry, "remove-test", func(context.Context, log.ContextLogger, string, option.StubOptions) (adapter.Service, error) {
+		created++
+		return &managerLifecycleTestService{Adapter: NewAdapter("remove-test", "remove")}, nil
+	})
+	logger := log.NewNOPFactory().Logger()
+	manager := NewManager(logger, registry)
+	require.NoError(t, manager.Create(context.Background(), logger, "remove", "remove-test", &option.StubOptions{}))
+	current, _ := manager.Get("remove")
+	require.NoError(t, manager.Remove("remove"))
+	require.Equal(t, 1, current.(*managerLifecycleTestService).closed)
+
+	require.NoError(t, manager.Create(context.Background(), logger, "remove", "remove-test", &option.StubOptions{}))
+	for _, stage := range adapter.ListStartStages {
+		require.NoError(t, manager.Start(stage))
+	}
+	require.NoError(t, manager.CommitRuntime(nil))
+	require.NoError(t, manager.Remove("remove"))
+	err := manager.Create(context.Background(), logger, "remove", "remove-test", &option.StubOptions{})
+	require.ErrorContains(t, err, "requires a full Box reload")
+	require.Equal(t, 2, created)
+	require.NoError(t, manager.Close())
+}
+
+func TestServiceAsyncCloseReentryAndIdempotentError(t *testing.T) {
+	manager := NewManager(log.NewNOPFactory().Logger(), nil)
+	managedService := &managerLifecycleTestService{Adapter: NewAdapter("close-test", "close")}
+	managedService.closeFunc = func() error {
+		reentered := make(chan error, 1)
+		go func() { reentered <- manager.Close() }()
+		select {
+		case err := <-reentered:
+			return err
+		case <-time.After(time.Second):
+			return errors.New("asynchronous Close reentry deadlocked")
+		}
+	}
+	manager.services = []adapter.Service{managedService}
+	manager.serviceByTag["close"] = managedService
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- manager.Close() }()
+	select {
+	case err := <-closeDone:
+		require.ErrorIs(t, err, os.ErrClosed)
+	case <-time.After(time.Second):
+		t.Fatal("manager Close deadlocked")
+	}
+	require.ErrorIs(t, manager.Close(), os.ErrClosed)
+	require.ErrorIs(t, manager.Start(adapter.StartStateInitialize), os.ErrClosed)
+	require.ErrorIs(t, manager.Remove("close"), os.ErrClosed)
+	require.ErrorIs(t, manager.Create(context.Background(), log.NewNOPFactory().Logger(), "close", "close-test", nil), os.ErrClosed)
+	require.ErrorIs(t, manager.CommitRuntime(nil), os.ErrClosed)
+}
+
+type managerLifecycleTestService struct {
+	Adapter
+	startFunc func(adapter.StartStage) error
+	closeFunc func() error
+	closed    int
+}
+
+func (s *managerLifecycleTestService) Start(stage adapter.StartStage) error {
+	if s.startFunc != nil {
+		return s.startFunc(stage)
+	}
+	return nil
+}
+
+func (s *managerLifecycleTestService) Close() error {
+	s.closed++
+	if s.closeFunc != nil {
+		return s.closeFunc()
+	}
+	return nil
 }
 
 type dynamicRuntimeTestService struct {

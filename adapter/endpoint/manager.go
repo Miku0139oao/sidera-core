@@ -27,7 +27,6 @@ type Manager struct {
 	mutations      int
 	mutationOwners map[uint64]int
 	closeErr       error
-	closeOwner     uint64
 	stage          adapter.StartStage
 	endpoints      []adapter.Endpoint
 	endpointByTag  map[string]adapter.Endpoint
@@ -49,29 +48,38 @@ func (m *Manager) Start(stage adapter.StartStage) error {
 		return err
 	}
 	defer m.finishMutation()
+
 	m.access.Lock()
-	defer m.access.Unlock()
-	if m.closed {
+	if m.closing || m.closed {
+		m.access.Unlock()
 		return os.ErrClosed
 	}
 	if m.started && m.stage >= stage {
+		m.access.Unlock()
 		panic("already started")
+	}
+	endpoints := append([]adapter.Endpoint(nil), m.endpoints...)
+	m.access.Unlock()
+
+	if stage != adapter.StartStateStart {
+		for _, endpoint := range endpoints {
+			name := "endpoint/" + endpoint.Type() + "[" + endpoint.Tag() + "]"
+			done := adapter.LogElapsed(m.logger, stage, " ", name)
+			err := adapter.LegacyStart(endpoint, stage)
+			done()
+			if err != nil {
+				return E.Cause(err, stage, " ", name)
+			}
+		}
+	}
+
+	m.access.Lock()
+	defer m.access.Unlock()
+	if m.closing || m.closed {
+		return os.ErrClosed
 	}
 	m.started = true
 	m.stage = stage
-	if stage == adapter.StartStateStart {
-		// started with outbound manager
-		return nil
-	}
-	for _, endpoint := range m.endpoints {
-		name := "endpoint/" + endpoint.Type() + "[" + endpoint.Tag() + "]"
-		done := adapter.LogElapsed(m.logger, stage, " ", name)
-		err := adapter.LegacyStart(endpoint, stage)
-		done()
-		if err != nil {
-			return E.Cause(err, stage, " ", name)
-		}
-	}
 	return nil
 }
 
@@ -79,29 +87,25 @@ func (m *Manager) Close() (err error) {
 	owner := G.Current()
 	m.access.Lock()
 	condition := m.conditionLocked()
-	if m.closing && owner != 0 && owner == m.closeOwner {
-		m.access.Unlock()
-		return os.ErrClosed
-	}
-	if m.mutationOwners[G.Current()] > 0 {
-		m.access.Unlock()
-		return E.New("cannot close endpoint manager from an active lifecycle callback")
-	}
-	for m.closing && !m.closed {
-		condition.Wait()
-	}
 	if m.closed {
 		closeErr := m.closeErr
 		m.access.Unlock()
 		return closeErr
 	}
+	if m.closing {
+		m.access.Unlock()
+		return os.ErrClosed
+	}
+	if m.mutationOwners[owner] > 0 {
+		m.access.Unlock()
+		return E.New("cannot close endpoint manager from an active lifecycle callback")
+	}
 	m.closing = true
-	m.closeOwner = owner
 	for m.mutations > 0 {
 		condition.Wait()
 	}
 	m.started = false
-	endpoints := m.endpoints
+	endpoints := append([]adapter.Endpoint(nil), m.endpoints...)
 	m.endpoints = nil
 	m.endpointByTag = make(map[string]adapter.Endpoint)
 	m.access.Unlock()
@@ -111,7 +115,6 @@ func (m *Manager) Close() (err error) {
 		m.closeErr = err
 		m.closing = false
 		m.closed = true
-		m.closeOwner = 0
 		condition.Broadcast()
 		m.access.Unlock()
 		if panicValue != nil {
@@ -141,8 +144,8 @@ func (m *Manager) Endpoints() []adapter.Endpoint {
 
 func (m *Manager) Get(tag string) (adapter.Endpoint, bool) {
 	m.access.Lock()
-	defer m.access.Unlock()
 	endpoint, found := m.endpointByTag[tag]
+	m.access.Unlock()
 	return endpoint, found
 }
 
@@ -151,8 +154,9 @@ func (m *Manager) Remove(tag string) error {
 		return err
 	}
 	defer m.finishMutation()
+
 	m.access.Lock()
-	if m.closed {
+	if m.closing || m.closed {
 		m.access.Unlock()
 		return os.ErrClosed
 	}
@@ -161,59 +165,115 @@ func (m *Manager) Remove(tag string) error {
 		m.access.Unlock()
 		return os.ErrInvalid
 	}
-	delete(m.endpointByTag, tag)
 	index := common.Index(m.endpoints, func(it adapter.Endpoint) bool {
 		return it == endpoint
 	})
 	if index == -1 {
+		m.access.Unlock()
 		panic("invalid endpoint index")
 	}
-	m.endpoints = append(m.endpoints[:index], m.endpoints[index+1:]...)
 	m.access.Unlock()
-	return endpoint.Close()
+
+	if err := m.closeEndpoint(endpoint); err != nil {
+		return err
+	}
+
+	m.access.Lock()
+	defer m.access.Unlock()
+	if current, loaded := m.endpointByTag[tag]; !loaded || current != endpoint {
+		return E.New("endpoint manager changed during removal: ", tag)
+	}
+	delete(m.endpointByTag, tag)
+	m.endpoints = append(m.endpoints[:index], m.endpoints[index+1:]...)
+	return nil
 }
 
-func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, outboundType string, options any) error {
+func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, endpointType string, options any) error {
 	if err := m.beginMutation(); err != nil {
 		return err
 	}
 	defer m.finishMutation()
-	endpoint, err := m.registry.Create(ctx, router, logger, tag, outboundType, options)
+
+	m.access.Lock()
+	if m.closing || m.closed {
+		m.access.Unlock()
+		return os.ErrClosed
+	}
+	started := m.started
+	managerStage := m.stage
+	m.access.Unlock()
+
+	endpoint, err := m.registry.Create(ctx, router, logger, tag, endpointType, options)
 	if err != nil {
 		return err
 	}
+	name := "endpoint/" + endpoint.Type() + "[" + endpoint.Tag() + "]"
+
 	m.access.Lock()
-	defer m.access.Unlock()
-	if m.closed {
-		return E.Errors(os.ErrClosed, endpoint.Close())
+	closing := m.closing || m.closed
+	m.access.Unlock()
+	if closing {
+		return E.Errors(os.ErrClosed, m.closeEndpoint(endpoint))
 	}
-	if m.started {
-		name := "endpoint/" + endpoint.Type() + "[" + endpoint.Tag() + "]"
+	if started {
 		for _, stage := range adapter.ListStartStages {
+			if stage > managerStage {
+				break
+			}
 			done := adapter.LogElapsed(m.logger, stage, " ", name)
 			err = adapter.LegacyStart(endpoint, stage)
 			done()
 			if err != nil {
-				return E.Errors(E.Cause(err, stage, " ", name), endpoint.Close())
+				return E.Errors(E.Cause(err, stage, " ", name), m.closeEndpoint(endpoint))
 			}
 		}
 	}
-	if existsEndpoint, loaded := m.endpointByTag[tag]; loaded {
-		err = existsEndpoint.Close()
-		if err != nil {
-			return E.Errors(E.Cause(err, "close endpoint/", existsEndpoint.Type(), "[", existsEndpoint.Tag(), "]"), endpoint.Close())
+
+	m.access.Lock()
+	if m.closing || m.closed {
+		m.access.Unlock()
+		return E.Errors(os.ErrClosed, m.closeEndpoint(endpoint))
+	}
+	existingEndpoint, replacing := m.endpointByTag[tag]
+	m.access.Unlock()
+
+	if replacing {
+		if err = m.closeEndpoint(existingEndpoint); err != nil {
+			return E.Errors(
+				E.Cause(err, "close endpoint/", existingEndpoint.Type(), "[", existingEndpoint.Tag(), "]"),
+				m.closeEndpoint(endpoint),
+			)
 		}
-		existsIndex := common.Index(m.endpoints, func(it adapter.Endpoint) bool {
-			return it == existsEndpoint
+	}
+
+	m.access.Lock()
+	if m.closing || m.closed {
+		m.access.Unlock()
+		return E.Errors(os.ErrClosed, m.closeEndpoint(endpoint))
+	}
+	currentEndpoint, stillExists := m.endpointByTag[tag]
+	if stillExists != replacing || stillExists && currentEndpoint != existingEndpoint || m.started != started || started && m.stage != managerStage {
+		m.access.Unlock()
+		return E.Errors(E.New("endpoint manager changed during create: ", tag), m.closeEndpoint(endpoint))
+	}
+	if replacing {
+		existingIndex := common.Index(m.endpoints, func(it adapter.Endpoint) bool {
+			return it == existingEndpoint
 		})
-		if existsIndex == -1 {
-			panic("invalid endpoint index")
+		if existingIndex == -1 {
+			m.access.Unlock()
+			return E.Errors(E.New("invalid endpoint index: ", tag), m.closeEndpoint(endpoint))
 		}
-		m.endpoints = append(m.endpoints[:existsIndex], m.endpoints[existsIndex+1:]...)
+		m.endpoints = append(m.endpoints[:existingIndex], m.endpoints[existingIndex+1:]...)
 	}
 	m.endpoints = append(m.endpoints, endpoint)
 	m.endpointByTag[tag] = endpoint
+	m.access.Unlock()
 	return nil
+}
+
+func (m *Manager) closeEndpoint(endpoint adapter.Endpoint) error {
+	return endpoint.Close()
 }
 
 func (m *Manager) conditionLocked() *sync.Cond {
@@ -226,11 +286,25 @@ func (m *Manager) conditionLocked() *sync.Cond {
 func (m *Manager) beginMutation() error {
 	owner := G.Current()
 	m.access.Lock()
-	if m.closing || m.closed {
-		m.access.Unlock()
-		return os.ErrClosed
+	condition := m.conditionLocked()
+	for {
+		if m.closing || m.closed {
+			m.access.Unlock()
+			return os.ErrClosed
+		}
+		if m.mutations == 0 {
+			break
+		}
+		if m.mutationOwners[owner] > 0 {
+			m.access.Unlock()
+			return E.New("cannot reenter endpoint manager lifecycle")
+		}
+		condition.Wait()
 	}
-	m.mutations++
+	if m.mutationOwners == nil {
+		m.mutationOwners = make(map[uint64]int)
+	}
+	m.mutations = 1
 	m.mutationOwners[owner]++
 	m.access.Unlock()
 	return nil
@@ -239,14 +313,12 @@ func (m *Manager) beginMutation() error {
 func (m *Manager) finishMutation() {
 	owner := G.Current()
 	m.access.Lock()
-	m.mutations--
-	if m.mutationOwners[owner] == 1 {
+	m.mutations = 0
+	if m.mutationOwners[owner] <= 1 {
 		delete(m.mutationOwners, owner)
 	} else {
 		m.mutationOwners[owner]--
 	}
-	if m.mutations == 0 {
-		m.conditionLocked().Broadcast()
-	}
+	m.conditionLocked().Broadcast()
 	m.access.Unlock()
 }

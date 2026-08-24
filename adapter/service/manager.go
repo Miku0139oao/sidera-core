@@ -18,112 +18,156 @@ import (
 
 var _ adapter.ServiceManager = (*Manager)(nil)
 
+type lifecycleOperation uint8
+
+const (
+	lifecycleNone lifecycleOperation = iota
+	lifecycleStart
+	lifecycleCreate
+	lifecycleRemove
+	lifecycleCommit
+)
+
 type Manager struct {
 	logger            log.ContextLogger
 	registry          adapter.ServiceRegistry
 	access            sync.Mutex
 	condition         *sync.Cond
 	started           bool
+	starting          bool
+	startingStage     adapter.StartStage
 	closing           bool
 	closed            bool
+	closeErr          error
 	stage             adapter.StartStage
 	runtimeActive     bool
 	runtimeCommitting bool
-	startInFlight     int
-	startOwner        uint64
+	lifecycleDepth    int
+	lifecycleOwner    uint64
+	lifecycleKind     lifecycleOperation
 	services          []adapter.Service
 	serviceByTag      map[string]adapter.Service
-	updates           map[string]bool
-	updateOwners      map[uint64]int
+	runtimeRemoved    map[string]bool
 }
 
 func NewManager(logger log.ContextLogger, registry adapter.ServiceRegistry) *Manager {
 	manager := &Manager{
-		logger:       logger,
-		registry:     registry,
-		serviceByTag: make(map[string]adapter.Service),
-		updates:      make(map[string]bool),
-		updateOwners: make(map[uint64]int),
+		logger:         logger,
+		registry:       registry,
+		serviceByTag:   make(map[string]adapter.Service),
+		runtimeRemoved: make(map[string]bool),
 	}
 	manager.condition = sync.NewCond(&manager.access)
 	return manager
 }
 
 func (m *Manager) Start(stage adapter.StartStage) error {
-	m.access.Lock()
-	if err := m.waitForLifecycleIdleLocked(); err != nil {
-		m.access.Unlock()
+	if _, err := m.beginLifecycle(lifecycleStart, false); err != nil {
 		return err
 	}
-	if m.runtimeCommitting {
+	defer m.finishLifecycle()
+
+	m.access.Lock()
+	if m.closing || m.closed {
 		m.access.Unlock()
-		return E.New("runtime commit in progress")
+		return os.ErrClosed
 	}
 	if m.runtimeActive {
 		m.access.Unlock()
 		return E.New("runtime is already active")
 	}
 	if m.started && m.stage >= stage {
+		m.access.Unlock()
 		panic("already started")
 	}
-	m.started = true
-	m.stage = stage
-	if stage == adapter.StartStateInitialize {
-		m.runtimeActive = false
-	}
-	m.startInFlight++
-	m.startOwner = currentGoroutineID()
+	m.starting = true
+	m.startingStage = stage
 	services := append([]adapter.Service(nil), m.services...)
 	m.access.Unlock()
-	defer m.finishStart()
-	for _, service := range services {
-		name := "service/" + service.Type() + "[" + service.Tag() + "]"
+	defer func() {
+		m.access.Lock()
+		m.starting = false
+		m.access.Unlock()
+	}()
+
+	for _, managedService := range services {
+		name := "service/" + managedService.Type() + "[" + managedService.Tag() + "]"
 		done := adapter.LogElapsed(m.logger, stage, " ", name)
-		err := adapter.LegacyStart(service, stage)
+		err := adapter.LegacyStart(managedService, stage)
 		done()
 		if err != nil {
 			return E.Cause(err, stage, " ", name)
 		}
 	}
+
+	m.access.Lock()
+	defer m.access.Unlock()
+	if m.closing || m.closed {
+		return os.ErrClosed
+	}
+	m.started = true
+	m.stage = stage
+	if stage == adapter.StartStateInitialize {
+		m.runtimeRemoved = make(map[string]bool)
+	}
 	return nil
 }
 
-func (m *Manager) Close() error {
+func (m *Manager) Close() (err error) {
+	owner := currentGoroutineID()
 	m.access.Lock()
-	for m.closing && !m.closed {
-		m.condition.Wait()
-	}
+	condition := m.conditionLocked()
 	if m.closed {
+		closeErr := m.closeErr
 		m.access.Unlock()
-		return nil
+		return closeErr
+	}
+	// Waiting here is unsafe: a service Close callback can start an
+	// asynchronous parent Close and wait for it.
+	if m.closing {
+		m.access.Unlock()
+		return os.ErrClosed
+	}
+	if m.lifecycleDepth > 0 && m.lifecycleOwner == owner {
+		m.access.Unlock()
+		return E.New("cannot close service manager from an active lifecycle callback")
 	}
 	m.closing = true
-	for m.runtimeCommitting || len(m.updates) > 0 || m.startInFlight > 0 {
-		m.condition.Wait()
+	for m.lifecycleDepth > 0 {
+		condition.Wait()
 	}
 	m.started = false
+	m.starting = false
 	m.runtimeActive = false
 	services := append([]adapter.Service(nil), m.services...)
 	m.services = nil
 	m.serviceByTag = make(map[string]adapter.Service)
+	m.runtimeRemoved = make(map[string]bool)
 	m.access.Unlock()
+	defer func() {
+		panicValue := recover()
+		m.access.Lock()
+		m.closeErr = err
+		m.closing = false
+		m.closed = true
+		condition.Broadcast()
+		m.access.Unlock()
+		if panicValue != nil {
+			panic(panicValue)
+		}
+	}()
+
 	monitor := taskmonitor.New(m.logger, C.StopTimeout)
-	var err error
-	for _, service := range services {
-		name := "service/" + service.Type() + "[" + service.Tag() + "]"
+	for _, managedService := range services {
+		name := "service/" + managedService.Type() + "[" + managedService.Tag() + "]"
 		done := adapter.LogElapsed(m.logger, "close ", name)
 		monitor.Start("close ", name)
-		err = E.Append(err, service.Close(), func(err error) error {
+		err = E.Append(err, managedService.Close(), func(err error) error {
 			return E.Cause(err, "close ", name)
 		})
 		monitor.Finish()
 		done()
 	}
-	m.access.Lock()
-	m.closing = false
-	m.closed = true
-	m.condition.Broadcast()
-	m.access.Unlock()
 	return err
 }
 
@@ -135,78 +179,100 @@ func (m *Manager) Services() []adapter.Service {
 
 func (m *Manager) Get(tag string) (adapter.Service, bool) {
 	m.access.Lock()
-	service, found := m.serviceByTag[tag]
+	managedService, found := m.serviceByTag[tag]
 	m.access.Unlock()
-	return service, found
+	return managedService, found
 }
 
 func (m *Manager) Remove(tag string) error {
+	if _, err := m.beginLifecycle(lifecycleRemove, false); err != nil {
+		return err
+	}
+	defer m.finishLifecycle()
+
 	m.access.Lock()
 	if m.closing || m.closed {
 		m.access.Unlock()
 		return os.ErrClosed
 	}
-	if m.runtimeCommitting {
-		m.access.Unlock()
-		return E.New("runtime commit in progress")
-	}
-	if m.updates[tag] {
-		m.access.Unlock()
-		return E.New("service update in progress: ", tag)
-	}
-	service, found := m.serviceByTag[tag]
+	managedService, found := m.serviceByTag[tag]
 	if !found {
 		m.access.Unlock()
 		return os.ErrInvalid
 	}
-	delete(m.serviceByTag, tag)
 	index := common.Index(m.services, func(it adapter.Service) bool {
-		return it == service
+		return it == managedService
 	})
 	if index == -1 {
+		m.access.Unlock()
 		panic("invalid service index")
 	}
-	m.services = append(m.services[:index], m.services[index+1:]...)
-	started := m.started
+	runtimeActive := m.runtimeActive
 	m.access.Unlock()
-	if started {
-		return service.Close()
+
+	// Every service is manager-owned as soon as it is published, regardless of
+	// whether Start has run. Retain publication if cleanup fails so Close can
+	// retry it.
+	if err := m.closeService(managedService); err != nil {
+		return err
+	}
+
+	m.access.Lock()
+	defer m.access.Unlock()
+	if current, loaded := m.serviceByTag[tag]; !loaded || current != managedService {
+		return E.New("service manager changed during removal: ", tag)
+	}
+	delete(m.serviceByTag, tag)
+	m.services = append(m.services[:index], m.services[index+1:]...)
+	if runtimeActive {
+		if m.runtimeRemoved == nil {
+			m.runtimeRemoved = make(map[string]bool)
+		}
+		m.runtimeRemoved[tag] = true
 	}
 	return nil
 }
 
 func (m *Manager) Create(ctx context.Context, logger log.ContextLogger, tag string, serviceType string, options any) error {
+	nestedStart, err := m.beginLifecycle(lifecycleCreate, true)
+	if err != nil {
+		return err
+	}
+	defer m.finishLifecycle()
+
 	m.access.Lock()
 	if m.closing || m.closed {
 		m.access.Unlock()
 		return os.ErrClosed
 	}
-	if m.runtimeCommitting {
-		m.access.Unlock()
-		return E.New("runtime commit in progress")
+	committedStarted := m.started
+	committedStage := m.stage
+	started := committedStarted
+	currentStage := committedStage
+	if nestedStart && m.starting {
+		started = true
+		currentStage = m.startingStage
 	}
-	if m.updates[tag] {
-		m.access.Unlock()
-		return E.New("service update in progress: ", tag)
-	}
-	m.updates[tag] = true
-	started := m.started
-	currentStage := m.stage
 	runtimeActive := m.runtimeActive
 	existingService, hasExisting := m.serviceByTag[tag]
-	if hasExisting && runtimeActive {
-		delete(m.updates, tag)
+	if runtimeActive && (hasExisting || m.runtimeRemoved[tag]) {
 		m.access.Unlock()
 		return E.New("replacing an active service requires a full Box reload: ", tag)
 	}
-	m.beginUpdateOwnerLocked()
 	m.access.Unlock()
-	defer m.finishUpdate(tag)
+
 	managedService, err := m.registry.Create(ctx, logger, tag, serviceType, options)
 	if err != nil {
 		return err
 	}
 	name := "service/" + managedService.Type() + "[" + managedService.Tag() + "]"
+
+	m.access.Lock()
+	closing := m.closing || m.closed
+	m.access.Unlock()
+	if closing {
+		return errors.Join(os.ErrClosed, causeIfError(m.closeService(managedService), "close ", name))
+	}
 	if started {
 		for _, stage := range adapter.ListStartStages {
 			if stage > currentStage {
@@ -216,7 +282,7 @@ func (m *Manager) Create(ctx context.Context, logger log.ContextLogger, tag stri
 			err = adapter.LegacyStart(managedService, stage)
 			done()
 			if err != nil {
-				return errors.Join(E.Cause(err, stage, " ", name), causeIfError(managedService.Close(), "close ", name))
+				return errors.Join(E.Cause(err, stage, " ", name), causeIfError(m.closeService(managedService), "close ", name))
 			}
 		}
 	}
@@ -226,11 +292,11 @@ func (m *Manager) Create(ctx context.Context, logger log.ContextLogger, tag stri
 	if runtimeActive {
 		activate, rollback, err = PrepareRuntime([]adapter.Service{managedService}, nil)
 		if err != nil {
-			return errors.Join(err, causeIfError(managedService.Close(), "close ", name))
+			return errors.Join(err, causeIfError(m.closeService(managedService), "close ", name))
 		}
 	}
 	if hasExisting {
-		if err = existingService.Close(); err != nil {
+		if err = m.closeService(existingService); err != nil {
 			var rollbackErr error
 			if rollback != nil {
 				rollbackErr = rollback()
@@ -238,20 +304,24 @@ func (m *Manager) Create(ctx context.Context, logger log.ContextLogger, tag stri
 			return errors.Join(
 				E.Cause(err, "close service/", existingService.Type(), "[", existingService.Tag(), "]"),
 				rollbackErr,
-				causeIfError(managedService.Close(), "close ", name),
+				causeIfError(m.closeService(managedService), "close ", name),
 			)
 		}
 	}
 
 	m.access.Lock()
 	currentService, stillExists := m.serviceByTag[tag]
-	if stillExists != hasExisting || stillExists && currentService != existingService || m.started != started || started && m.stage != currentStage || m.runtimeActive != runtimeActive || m.runtimeCommitting || m.closing || m.closed {
+	stateChanged := stillExists != hasExisting || stillExists && currentService != existingService || m.started != committedStarted || committedStarted && m.stage != committedStage || m.runtimeActive != runtimeActive || m.closing || m.closed
+	if nestedStart {
+		stateChanged = stateChanged || !m.starting || m.startingStage != currentStage
+	}
+	if stateChanged {
 		m.access.Unlock()
 		var rollbackErr error
 		if rollback != nil {
 			rollbackErr = rollback()
 		}
-		return errors.Join(E.New("service manager changed during update: ", tag), rollbackErr, causeIfError(managedService.Close(), "close ", name))
+		return errors.Join(E.New("service manager changed during update: ", tag), rollbackErr, causeIfError(m.closeService(managedService), "close ", name))
 	}
 	if hasExisting {
 		existingIndex := common.Index(m.services, func(it adapter.Service) bool {
@@ -263,12 +333,13 @@ func (m *Manager) Create(ctx context.Context, logger log.ContextLogger, tag stri
 			if rollback != nil {
 				rollbackErr = rollback()
 			}
-			return errors.Join(E.New("invalid service index: ", tag), rollbackErr, causeIfError(managedService.Close(), "close ", name))
+			return errors.Join(E.New("invalid service index: ", tag), rollbackErr, causeIfError(m.closeService(managedService), "close ", name))
 		}
 		m.services = append(m.services[:existingIndex], m.services[existingIndex+1:]...)
 	}
 	m.services = append(m.services, managedService)
 	m.serviceByTag[tag] = managedService
+	delete(m.runtimeRemoved, tag)
 	m.access.Unlock()
 	if activate != nil {
 		activate()
@@ -277,18 +348,19 @@ func (m *Manager) Create(ctx context.Context, logger log.ContextLogger, tag stri
 }
 
 func (m *Manager) CommitRuntime(beforeCommit func() (func() error, error)) error {
-	m.access.Lock()
-	if err := m.waitForLifecycleIdleLocked(); err != nil {
-		m.access.Unlock()
+	if _, err := m.beginLifecycle(lifecycleCommit, false); err != nil {
 		return err
+	}
+	defer m.finishLifecycle()
+
+	m.access.Lock()
+	if m.closing || m.closed {
+		m.access.Unlock()
+		return os.ErrClosed
 	}
 	if m.runtimeActive {
 		m.access.Unlock()
 		return E.New("runtime is already active")
-	}
-	if m.runtimeCommitting {
-		m.access.Unlock()
-		return E.New("runtime commit already in progress")
 	}
 	if !m.started || m.stage < adapter.StartStateStarted {
 		m.access.Unlock()
@@ -297,32 +369,24 @@ func (m *Manager) CommitRuntime(beforeCommit func() (func() error, error)) error
 	m.runtimeCommitting = true
 	services := append([]adapter.Service(nil), m.services...)
 	m.access.Unlock()
-
-	activate, rollback, err := PrepareRuntime(services, beforeCommit)
-	m.access.Lock()
-	if err != nil {
-		m.runtimeCommitting = false
-		m.condition.Broadcast()
-		m.access.Unlock()
-		return err
-	}
-	if m.closing || m.closed {
-		m.access.Unlock()
-		rollbackErr := rollback()
-		m.access.Lock()
-		m.runtimeCommitting = false
-		m.condition.Broadcast()
-		m.access.Unlock()
-		return errors.Join(os.ErrClosed, rollbackErr)
-	}
-	m.runtimeActive = true
-	m.access.Unlock()
 	defer func() {
 		m.access.Lock()
 		m.runtimeCommitting = false
-		m.condition.Broadcast()
+		m.conditionLocked().Broadcast()
 		m.access.Unlock()
 	}()
+
+	activate, rollback, err := PrepareRuntime(services, beforeCommit)
+	if err != nil {
+		return err
+	}
+	m.access.Lock()
+	if m.closing || m.closed {
+		m.access.Unlock()
+		return errors.Join(os.ErrClosed, rollback())
+	}
+	m.runtimeActive = true
+	m.access.Unlock()
 	activate()
 	return nil
 }
@@ -410,46 +474,64 @@ func causeIfError(err error, message ...any) error {
 	return E.Cause(err, message...)
 }
 
-func (m *Manager) waitForLifecycleIdleLocked() error {
-	gid := currentGoroutineID()
+func (m *Manager) closeService(managedService adapter.Service) error {
+	return managedService.Close()
+}
+
+func (m *Manager) conditionLocked() *sync.Cond {
+	if m.condition == nil {
+		m.condition = sync.NewCond(&m.access)
+	}
+	return m.condition
+}
+
+func (m *Manager) beginLifecycle(kind lifecycleOperation, allowNestedStart bool) (bool, error) {
+	owner := currentGoroutineID()
+	m.access.Lock()
+	condition := m.conditionLocked()
 	for {
 		if m.closing || m.closed {
-			return os.ErrClosed
+			m.access.Unlock()
+			return false, os.ErrClosed
 		}
-		if m.updateOwners[gid] > 0 || m.startInFlight > 0 && m.startOwner == gid {
-			return E.New("cannot start or commit runtime from a service update")
+		if m.lifecycleDepth == 0 {
+			m.lifecycleDepth = 1
+			m.lifecycleOwner = owner
+			m.lifecycleKind = kind
+			m.access.Unlock()
+			return false, nil
 		}
-		if len(m.updates) == 0 && m.startInFlight == 0 {
-			return nil
+		if m.lifecycleOwner == owner {
+			if allowNestedStart && kind == lifecycleCreate && m.lifecycleKind == lifecycleStart {
+				m.lifecycleDepth++
+				m.access.Unlock()
+				return true, nil
+			}
+			var message string
+			switch m.lifecycleKind {
+			case lifecycleCreate, lifecycleRemove:
+				message = "cannot start or commit runtime from a service update"
+			default:
+				message = "cannot reenter service manager lifecycle"
+			}
+			m.access.Unlock()
+			return false, E.New(message)
 		}
-		m.condition.Wait()
+		condition.Wait()
 	}
 }
 
-func (m *Manager) beginUpdateOwnerLocked() {
-	m.updateOwners[currentGoroutineID()]++
-}
-
-func (m *Manager) finishUpdate(tag string) {
+func (m *Manager) finishLifecycle() {
+	owner := currentGoroutineID()
 	m.access.Lock()
-	delete(m.updates, tag)
-	gid := currentGoroutineID()
-	if m.updateOwners[gid] > 1 {
-		m.updateOwners[gid]--
-	} else {
-		delete(m.updateOwners, gid)
+	if m.lifecycleOwner == owner && m.lifecycleDepth > 0 {
+		m.lifecycleDepth--
+		if m.lifecycleDepth == 0 {
+			m.lifecycleOwner = 0
+			m.lifecycleKind = lifecycleNone
+			m.conditionLocked().Broadcast()
+		}
 	}
-	m.condition.Broadcast()
-	m.access.Unlock()
-}
-
-func (m *Manager) finishStart() {
-	m.access.Lock()
-	m.startInFlight--
-	if m.startInFlight == 0 {
-		m.startOwner = 0
-	}
-	m.condition.Broadcast()
 	m.access.Unlock()
 }
 
