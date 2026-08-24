@@ -3,8 +3,9 @@
 This document records **unattested local engineering observations**, not
 marketing claims or publication-grade comparative evidence. The standalone
 harness and raw local runs are kept in the sibling
-`bench-sidera-xray-singbox` workspace, which is not a durable public evidence
-bundle. Every publishable run must identify clean source trees, exact build
+`bench-sidera-xray-singbox` Git repository. It is locally committed but has no
+publication remote, so its diagnostic bundles are not public evidence. Every
+publishable run must identify clean source trees, exact build
 commands and flags, configurations, binaries, raw samples, and the harness by
 commit and SHA-256.
 
@@ -15,23 +16,26 @@ scenarios, its own server. The sink exposes a duration-controlled stream.
 Connections are prepared before a shared start timestamp, so throughput no
 longer depends on repeated fixed-size HTTP bodies or EOF propagation.
 
-Metrics recorded by the engineering harness include:
+Metrics and correctness evidence recorded by the engineering harness include:
 
 - SOCKS CONNECT reply latency (not HTTP TTFB)
 - end-to-end HTTP TTFB
 - one- and eight-stream goodput
-- client/server sampled peak RSS on Linux
-- explicit correctness/error counts
+- UDP/XUDP byte-integrity, loss, duplicate and corruption accounting
+- DNS UDP, TCP and forced truncation-to-TCP fallback
+- Linux CPU/RSS/PSS/USS telemetry, with explicit unavailable status elsewhere
+- explicit process-readiness, cleanup and correctness/error counts
 
 All implementations use a SOCKS inbound and equivalent TLS trust/name checks.
 Xray is not singled out for a splice override. Cross-core CONNECT latency is
 reported but is not equivalent when one implementation lazily dials the
 upstream; TTFB is the intended end-to-end latency.
 
-These corrections do not make the retained runs publishable. The audited
-harness still requires stronger response/integrity validation, functional
-readiness, process-tree cleanup, balanced randomized blocks, aligned resource
-telemetry, and retained version-controlled provenance before comparative use.
+The harness now fails closed on response integrity, stale readiness,
+process-tree cleanup, incomplete bundles and missing publication pins. That
+does not make old retained runs publishable: they predate these gates, and a
+new comparative publication still requires predeclared hashes, a real harness
+remote, A/A calibration, balanced blocks and native Linux/two-host telemetry.
 
 ## 2026-08-24 WSL2 observations (unattested)
 
@@ -61,11 +65,9 @@ that observation cannot establish equivalence or a regression threshold. RSS
 values are sampled main-process `VmRSS`; they do not establish why the
 artifacts differ.
 
-An operator also reported a Windows smoke completing 10/10 REALITY requests in
-both directions (`Sidera client → Xray server` and `Xray client → Sidera
-server`). No content-addressed manifest, binary hashes, or retained `go test
--json` output accompanies that smoke, so it is an unattested local observation,
-not an interoperability attestation.
+The superseded early Windows smoke was unattested. A later integrated
+diagnostic bundle is recorded below with hashes and retained bidirectional
+interop output.
 
 Unattested values from local one-core run `20260824-one-core`
 (`taskset -c 0`, `GOMAXPROCS=1`):
@@ -80,10 +82,28 @@ That result directory has no colocated version manifest. It pins client,
 server, and sink to one CPU and is a stress smoke, not an isolated client
 CPU-cost measurement.
 
+## Final integrated correctness smoke
+
+Diagnostic bundle `20260824-131932-627705600-1099` used clean Sidera
+`2dd1db15`, sing-box `f60f3728`, Xray `6e3322d2`, and locally committed harness
+`35709aab`. All 27 implementation/scenario cells completed without a recorded
+error across SOCKS direct, VLESS TCP/TLS/REALITY, UDP direct, VLESS/XUDP, DNS
+UDP/TCP and DNS truncation fallback. REALITY interop passed in both directions.
+
+This was deliberately one short Windows block, so it is a correctness smoke,
+not comparative performance evidence. Its content-addressed files include:
+
+- `report.json` SHA-256 `ef3922296d691dd23984105c1dfde5db82fd5b627c29ec5b8c6622e4a41e19d7`;
+- `artifact-manifest.json` SHA-256 `065926ea299da991e72173ed41e62b2c01f473b3be5fbd4404a4be3f8467816c`;
+- bundle status `complete`, 156 records, zero failed cells; and
+- TUN status `scaffold_only_not_run` rather than a fabricated pass.
+
 ## Low-memory artifact observations (unattested)
 
 `release/LOW_MEMORY_BUILD_TAGS` defines an additive artifact for low-RAM
-systems. Unmanifested local smoke runs suggested:
+systems. Final stripped Windows builds from `2dd1db15` were 36,685,824 bytes
+versus 80,516,608 bytes full (54.44% smaller). This is an artifact-size fact,
+not an RSS or throughput claim. Earlier unmanifested local smoke runs suggested:
 
 - a stripped Linux binary of about 35 MiB versus 76 MiB full;
 - sampled SOCKS/VLESS client RSS about 17–19 MiB lower; and
@@ -101,12 +121,12 @@ silently stripped.
 Before making comparative, superiority, equivalence, or low-end-readiness
 claims:
 
-1. place the harness under version control and benchmark clean, immutable
-   commits using official Go 1.26.5;
+1. publish the committed harness to a pinned remote and benchmark clean,
+   immutable commits using official Go 1.26.5;
 2. retain source archives, complete commands/environments/configurations, raw
    samples, logs, and SHA-256 values for every source tree, harness, and binary;
-3. fix the remaining harness response-integrity, early-EOF, readiness,
-   process-tree cleanup, port-isolation, and Windows telemetry limitations;
+3. run on native Linux for PID ownership and PSS/USS/CPU evidence; Windows
+   intentionally marks those publication telemetry fields unavailable;
 4. run balanced randomized paired blocks only after byte-identical A/A noise
    calibration, preserving failed pairs as infrastructure failures;
 5. collect CPU seconds/GiB, PSS/USS, Go heap/GC, idle/load/drain memory, errors,
