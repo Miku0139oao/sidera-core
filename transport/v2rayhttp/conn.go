@@ -9,6 +9,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Miku0139oao/sidera-core/log"
@@ -28,6 +29,11 @@ type HTTPConn struct {
 	requestWritten bool
 	responseRead   bool
 	responseCache  *buf.Buffer
+	readAccess     sync.Mutex
+	writeAccess    sync.Mutex
+	closed         atomic.Bool
+	closeOnce      sync.Once
+	closeErr       error
 }
 
 func NewHTTP1Conn(conn net.Conn, request *http.Request) *HTTPConn {
@@ -41,13 +47,22 @@ func NewHTTP1Conn(conn net.Conn, request *http.Request) *HTTPConn {
 }
 
 func (c *HTTPConn) Read(b []byte) (n int, err error) {
+	if len(b) == 0 {
+		return 0, nil
+	}
+	c.readAccess.Lock()
+	defer c.readAccess.Unlock()
+	if c.closed.Load() {
+		return 0, net.ErrClosed
+	}
 	if !c.responseRead {
 		reader := std_bufio.NewReader(c.Conn)
 		response, err := http.ReadResponse(reader, c.request)
 		if err != nil {
 			return 0, E.Cause(err, "read response")
 		}
-		if response.StatusCode != 200 {
+		if response.StatusCode != http.StatusOK {
+			response.Body.Close()
 			return 0, E.New("v2ray-http: unexpected status: ", response.Status)
 		}
 		if cacheLen := reader.Buffered(); cacheLen > 0 {
@@ -55,6 +70,7 @@ func (c *HTTPConn) Read(b []byte) (n int, err error) {
 			_, err = c.responseCache.ReadFullFrom(reader, cacheLen)
 			if err != nil {
 				c.responseCache.Release()
+				c.responseCache = nil
 				return 0, E.Cause(err, "read cache")
 			}
 		}
@@ -74,9 +90,13 @@ func (c *HTTPConn) Read(b []byte) (n int, err error) {
 }
 
 func (c *HTTPConn) Write(b []byte) (int, error) {
+	c.writeAccess.Lock()
+	defer c.writeAccess.Unlock()
+	if c.closed.Load() {
+		return 0, net.ErrClosed
+	}
 	if !c.requestWritten {
-		err := c.writeRequest(b)
-		if err != nil {
+		if err := c.writeRequest(b); err != nil {
 			return 0, E.Cause(err, "write request")
 		}
 		c.requestWritten = true
@@ -88,40 +108,52 @@ func (c *HTTPConn) Write(b []byte) (int, error) {
 func (c *HTTPConn) writeRequest(payload []byte) error {
 	writer := bufio.NewBufferedWriter(c.Conn, buf.New())
 	const CRLF = "\r\n"
-	_, err := writer.Write([]byte(F.ToString(c.request.Method, " ", c.request.URL.RequestURI(), " HTTP/1.1", CRLF)))
-	if err != nil {
+	if _, err := writer.Write([]byte(F.ToString(c.request.Method, " ", c.request.URL.RequestURI(), " HTTP/1.1", CRLF))); err != nil {
 		return err
 	}
 	for key, value := range c.request.Header {
-		_, err = writer.Write([]byte(F.ToString(key, ": ", strings.Join(value, ", "), CRLF)))
-		if err != nil {
+		if _, err := writer.Write([]byte(F.ToString(key, ": ", strings.Join(value, ", "), CRLF))); err != nil {
 			return err
 		}
 	}
-	_, err = writer.Write([]byte(CRLF))
-	if err != nil {
+	if _, err := writer.Write([]byte(CRLF)); err != nil {
 		return err
 	}
-	_, err = writer.Write(payload)
-	if err != nil {
+	if _, err := writer.Write(payload); err != nil {
 		return err
 	}
-	err = writer.Fallthrough()
-	if err != nil {
-		return err
-	}
-	return nil
+	return writer.Fallthrough()
+}
+
+func (c *HTTPConn) Close() error {
+	c.closeOnce.Do(func() {
+		c.closed.Store(true)
+		c.closeErr = c.Conn.Close()
+		c.readAccess.Lock()
+		if c.responseCache != nil {
+			c.responseCache.Release()
+			c.responseCache = nil
+		}
+		c.readAccess.Unlock()
+	})
+	return c.closeErr
 }
 
 func (c *HTTPConn) ReaderReplaceable() bool {
+	c.readAccess.Lock()
+	defer c.readAccess.Unlock()
 	return c.responseRead
 }
 
 func (c *HTTPConn) WriterReplaceable() bool {
+	c.writeAccess.Lock()
+	defer c.writeAccess.Unlock()
 	return c.requestWritten
 }
 
 func (c *HTTPConn) NeedHandshake() bool {
+	c.writeAccess.Lock()
+	defer c.writeAccess.Unlock()
 	return !c.requestWritten
 }
 
@@ -130,50 +162,155 @@ func (c *HTTPConn) Upstream() any {
 }
 
 type HTTP2Conn struct {
-	reader io.Reader
-	writer io.Writer
-	create chan struct{}
-	err    error
+	stateAccess sync.Mutex
+	readAccess  sync.Mutex
+	writeAccess sync.Mutex
+	reader      io.Reader
+	writer      io.Writer
+	ready       chan struct{}
+	readyOnce   sync.Once
+	setupDone   bool
+	closed      bool
+	err         error
+	cancel      context.CancelCauseFunc
+	closeOnce   sync.Once
+	closeErr    error
 }
 
-func NewHTTPConn(reader io.Reader, writer io.Writer) HTTP2Conn {
-	return HTTP2Conn{
-		reader: reader,
-		writer: writer,
+func NewHTTPConn(reader io.Reader, writer io.Writer) *HTTP2Conn {
+	conn := &HTTP2Conn{
+		reader:    reader,
+		writer:    writer,
+		ready:     make(chan struct{}),
+		setupDone: true,
 	}
+	conn.signalReady()
+	return conn
 }
 
-func NewLateHTTPConn(writer io.Writer) *HTTP2Conn {
+func NewLateHTTPConn(writer io.Writer, cancelFunctions ...context.CancelCauseFunc) *HTTP2Conn {
+	var cancel context.CancelCauseFunc
+	if len(cancelFunctions) > 0 {
+		cancel = cancelFunctions[0]
+	}
 	return &HTTP2Conn{
-		create: make(chan struct{}),
+		ready:  make(chan struct{}),
 		writer: writer,
+		cancel: cancel,
 	}
+}
+
+func (c *HTTP2Conn) signalReady() {
+	c.readyOnce.Do(func() { close(c.ready) })
 }
 
 func (c *HTTP2Conn) Setup(reader io.Reader, err error) {
-	c.reader = reader
+	c.stateAccess.Lock()
+	if c.setupDone || c.closed {
+		c.stateAccess.Unlock()
+		common.Close(reader)
+		c.signalReady()
+		return
+	}
+	c.setupDone = true
+	if reader == nil && err == nil {
+		err = io.ErrUnexpectedEOF
+	}
+	if err == nil {
+		c.reader = reader
+	}
 	c.err = err
-	close(c.create)
+	writer := c.writer
+	cancel := c.cancel
+	c.stateAccess.Unlock()
+	c.signalReady()
+	if err != nil {
+		common.Close(reader)
+		if cancel != nil {
+			cancel(err)
+		}
+		closePipeWriter(writer, err)
+	}
+}
+
+func (c *HTTP2Conn) awaitReader() (io.Reader, error) {
+	<-c.ready
+	c.stateAccess.Lock()
+	defer c.stateAccess.Unlock()
+	if c.closed {
+		return nil, net.ErrClosed
+	}
+	if c.err != nil {
+		return nil, c.err
+	}
+	if c.reader == nil {
+		return nil, net.ErrClosed
+	}
+	return c.reader, nil
+}
+
+func (c *HTTP2Conn) writerForWrite() (io.Writer, error) {
+	c.stateAccess.Lock()
+	defer c.stateAccess.Unlock()
+	if c.closed {
+		return nil, net.ErrClosed
+	}
+	if c.err != nil {
+		return nil, c.err
+	}
+	if c.writer == nil {
+		return nil, net.ErrClosed
+	}
+	return c.writer, nil
 }
 
 func (c *HTTP2Conn) Read(b []byte) (n int, err error) {
-	if c.reader == nil {
-		<-c.create
-		if c.err != nil {
-			return 0, c.err
-		}
+	if len(b) == 0 {
+		return 0, nil
 	}
-	n, err = c.reader.Read(b)
+	c.readAccess.Lock()
+	defer c.readAccess.Unlock()
+	reader, err := c.awaitReader()
+	if err != nil {
+		return 0, err
+	}
+	n, err = reader.Read(b)
 	return n, baderror.WrapH2(err)
 }
 
 func (c *HTTP2Conn) Write(b []byte) (n int, err error) {
-	n, err = c.writer.Write(b)
+	c.writeAccess.Lock()
+	defer c.writeAccess.Unlock()
+	writer, err := c.writerForWrite()
+	if err != nil {
+		return 0, err
+	}
+	n, err = writer.Write(b)
 	return n, baderror.WrapH2(err)
 }
 
 func (c *HTTP2Conn) Close() error {
-	return common.Close(c.reader, c.writer)
+	c.closeOnce.Do(func() {
+		c.stateAccess.Lock()
+		c.closed = true
+		c.err = net.ErrClosed
+		reader := c.reader
+		writer := c.writer
+		cancel := c.cancel
+		c.stateAccess.Unlock()
+		if cancel != nil {
+			cancel(net.ErrClosed)
+		}
+		c.signalReady()
+		c.closeErr = common.Close(reader, writer)
+	})
+	return c.closeErr
+}
+
+func closePipeWriter(writer io.Writer, err error) {
+	if pipeWriter, isPipeWriter := writer.(*io.PipeWriter); isPipeWriter {
+		_ = pipeWriter.CloseWithError(err)
+	}
 }
 
 func (c *HTTP2Conn) LocalAddr() net.Addr {
@@ -201,22 +338,28 @@ func (c *HTTP2Conn) NeedAdditionalReadDeadline() bool {
 }
 
 type ServerHTTPConn struct {
-	HTTP2Conn
+	*HTTP2Conn
 	Flusher http.Flusher
 }
 
 func (c *ServerHTTPConn) Write(b []byte) (n int, err error) {
-	n, err = c.writer.Write(b)
+	c.writeAccess.Lock()
+	defer c.writeAccess.Unlock()
+	writer, err := c.writerForWrite()
+	if err != nil {
+		return 0, err
+	}
+	n, err = writer.Write(b)
 	if err == nil {
 		c.Flusher.Flush()
 	}
-	return
+	return n, baderror.WrapH2(err)
 }
 
 type HTTP2ConnWrapper struct {
 	N.ExtendedConn
 	access sync.Mutex
-	closed bool
+	closed atomic.Bool
 }
 
 func NewHTTP2Wrapper(conn net.Conn) *HTTP2ConnWrapper {
@@ -228,7 +371,7 @@ func NewHTTP2Wrapper(conn net.Conn) *HTTP2ConnWrapper {
 func (w *HTTP2ConnWrapper) Write(p []byte) (n int, err error) {
 	w.access.Lock()
 	defer w.access.Unlock()
-	if w.closed {
+	if w.closed.Load() {
 		return 0, net.ErrClosed
 	}
 	return w.ExtendedConn.Write(p)
@@ -237,16 +380,15 @@ func (w *HTTP2ConnWrapper) Write(p []byte) (n int, err error) {
 func (w *HTTP2ConnWrapper) WriteBuffer(buffer *buf.Buffer) error {
 	w.access.Lock()
 	defer w.access.Unlock()
-	if w.closed {
+	if w.closed.Load() {
+		buffer.Release()
 		return net.ErrClosed
 	}
 	return w.ExtendedConn.WriteBuffer(buffer)
 }
 
 func (w *HTTP2ConnWrapper) CloseWrapper() {
-	w.access.Lock()
-	defer w.access.Unlock()
-	w.closed = true
+	w.closed.Store(true)
 }
 
 func (w *HTTP2ConnWrapper) Close() error {

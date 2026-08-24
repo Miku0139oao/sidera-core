@@ -119,6 +119,7 @@ func (c *Client) dialHTTP(ctx context.Context) (net.Conn, error) {
 }
 
 func (c *Client) dialHTTP2(ctx context.Context) (net.Conn, error) {
+	requestContext, cancel := context.WithCancelCause(ctx)
 	pipeInReader, pipeInWriter := io.Pipe()
 	request := &http.Request{
 		Method: c.method,
@@ -126,7 +127,7 @@ func (c *Client) dialHTTP2(ctx context.Context) (net.Conn, error) {
 		URL:    &c.requestURL,
 		Header: c.headers.Clone(),
 	}
-	request = request.WithContext(ctx)
+	request = request.WithContext(requestContext)
 	switch hostLen := len(c.host); hostLen {
 	case 0:
 		// https://github.com/v2fly/v2ray-core/blob/master/transport/internet/http/config.go#L13
@@ -136,7 +137,7 @@ func (c *Client) dialHTTP2(ctx context.Context) (net.Conn, error) {
 	default:
 		request.Host = c.host[rand.Intn(hostLen)]
 	}
-	conn := NewLateHTTPConn(pipeInWriter)
+	conn := NewLateHTTPConn(pipeInWriter, cancel)
 	go func() {
 		response, err := c.transport.RoundTrip(request)
 		if err != nil {

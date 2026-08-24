@@ -12,6 +12,7 @@ import (
 	"github.com/Miku0139oao/sidera-core/common/tls"
 	"github.com/Miku0139oao/sidera-core/option"
 	"github.com/Miku0139oao/sidera-core/transport/v2rayhttp"
+	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
@@ -65,8 +66,8 @@ func NewClient(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opt
 			return dialer.DialContext(ctx, network, M.ParseSocksaddr(addr))
 		}
 	} else {
-		if len(tlsConfig.NextProtos()) == 0 {
-			tlsConfig.SetNextProtos([]string{http2.NextProtoTLS})
+		if !common.Contains(tlsConfig.NextProtos(), http2.NextProtoTLS) {
+			tlsConfig.SetNextProtos(append([]string{http2.NextProtoTLS}, tlsConfig.NextProtos()...))
 		}
 		tlsDialer := tls.NewDialer(dialer, tlsConfig)
 		client.transport.DialTLSContext = func(ctx context.Context, network, addr string, cfg *tls.STDConfig) (net.Conn, error) {
@@ -78,16 +79,17 @@ func NewClient(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opt
 }
 
 func (c *Client) DialContext(ctx context.Context) (net.Conn, error) {
+	requestContext, cancel := context.WithCancelCause(ctx)
 	pipeInReader, pipeInWriter := io.Pipe()
 	request := &http.Request{
 		Method: http.MethodPost,
 		Body:   pipeInReader,
 		URL:    c.url,
-		Header: defaultClientHeader,
+		Header: defaultClientHeader.Clone(),
 		Host:   c.host,
 	}
-	request = request.WithContext(ctx)
-	conn := newLateGunConn(pipeInWriter)
+	request = request.WithContext(requestContext)
+	conn := newLateGunConn(pipeInWriter, cancel)
 	go func() {
 		response, err := c.transport.RoundTrip(request)
 		if err != nil {

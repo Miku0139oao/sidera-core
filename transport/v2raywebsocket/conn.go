@@ -14,7 +14,6 @@ import (
 	C "github.com/Miku0139oao/sidera-core/constant"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/buf"
-	"github.com/sagernet/sing/common/debug"
 	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
 	"github.com/sagernet/ws"
@@ -28,69 +27,81 @@ type WebsocketConn struct {
 	reader         *wsutil.Reader
 	controlHandler wsutil.FrameHandlerFunc
 	remoteAddr     net.Addr
+	readAccess     sync.Mutex
+	writeAccess    sync.Mutex
+	closed         atomic.Bool
+	closeOnce      sync.Once
+	closeErr       error
 }
 
 func NewConn(conn net.Conn, remoteAddr net.Addr, state ws.State) *WebsocketConn {
-	controlHandler := wsutil.ControlFrameHandler(conn, state)
-	return &WebsocketConn{
-		Conn:  conn,
-		state: state,
-		reader: &wsutil.Reader{
-			Source:          conn,
-			State:           state,
-			SkipHeaderCheck: !debug.Enabled,
-			OnIntermediate:  controlHandler,
-		},
-		controlHandler: controlHandler,
-		remoteAddr:     remoteAddr,
-		Writer:         NewWriter(conn, state),
+	websocketConn := &WebsocketConn{
+		Conn:       conn,
+		state:      state,
+		remoteAddr: remoteAddr,
+		Writer:     NewWriter(conn, state),
 	}
+	websocketConn.controlHandler = websocketConn.handleControl
+	websocketConn.reader = &wsutil.Reader{
+		Source:          conn,
+		State:           state,
+		SkipHeaderCheck: false,
+		OnIntermediate:  websocketConn.controlHandler,
+	}
+	return websocketConn
 }
 
 func (c *WebsocketConn) Close() error {
-	c.Conn.SetWriteDeadline(time.Now().Add(C.TCPTimeout))
-	frame := ws.NewCloseFrame(ws.NewCloseFrameBody(
-		ws.StatusNormalClosure, "",
-	))
-	if c.state == ws.StateClientSide {
-		frame = ws.MaskFrameInPlace(frame)
-	}
-	ws.WriteFrame(c.Conn, frame)
-	c.Conn.Close()
-	return nil
+	c.closeOnce.Do(func() {
+		c.closed.Store(true)
+		_ = c.Conn.SetWriteDeadline(time.Now().Add(C.TCPTimeout))
+		c.writeAccess.Lock()
+		frameErr := c.Writer.writeFrame(ws.OpClose, ws.NewCloseFrameBody(ws.StatusNormalClosure, ""))
+		c.writeAccess.Unlock()
+		closeErr := c.Conn.Close()
+		if frameErr != nil {
+			c.closeErr = frameErr
+		} else {
+			c.closeErr = closeErr
+		}
+	})
+	return c.closeErr
 }
 
 func (c *WebsocketConn) Read(b []byte) (n int, err error) {
+	if len(b) == 0 {
+		return 0, nil
+	}
+	c.readAccess.Lock()
+	defer c.readAccess.Unlock()
+	if c.closed.Load() {
+		return 0, net.ErrClosed
+	}
 	var header ws.Header
 	for {
 		n, err = c.reader.Read(b)
 		if n > 0 {
-			err = nil
-			return
+			return n, nil
 		}
 		if !E.IsMulti(err, io.EOF, wsutil.ErrNoFrameAdvance) {
-			err = wrapWsError(err)
-			return
+			return 0, wrapWsError(err)
 		}
 		header, err = wrapWsError0(c.reader.NextFrame())
 		if err != nil {
-			return
+			return 0, err
 		}
 		if header.OpCode.IsControl() {
-			if header.Length > 128 {
-				err = wsutil.ErrFrameTooLarge
-				return
+			if header.Length > ws.MaxControlFramePayloadSize {
+				return 0, wsutil.ErrFrameTooLarge
 			}
-			err = wrapWsError(c.controlHandler(header, c.reader))
-			if err != nil {
-				return
+			if err = wrapWsError(c.controlHandler(header, c.reader)); err != nil {
+				return 0, err
 			}
 			continue
 		}
 		if header.OpCode&ws.OpBinary == 0 {
-			err = wrapWsError(c.reader.Discard())
-			if err != nil {
-				return
+			if err = wrapWsError(c.reader.Discard()); err != nil {
+				return 0, err
 			}
 			continue
 		}
@@ -98,12 +109,70 @@ func (c *WebsocketConn) Read(b []byte) (n int, err error) {
 }
 
 func (c *WebsocketConn) Write(p []byte) (n int, err error) {
-	err = wrapWsError(wsutil.WriteMessage(c.Conn, c.state, ws.OpBinary, p))
-	if err != nil {
-		return
+	c.writeAccess.Lock()
+	defer c.writeAccess.Unlock()
+	if c.closed.Load() {
+		return 0, net.ErrClosed
 	}
-	n = len(p)
-	return
+	if err = wrapWsError(c.Writer.Write(p)); err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
+
+func (c *WebsocketConn) WriteBuffer(buffer *buf.Buffer) error {
+	c.writeAccess.Lock()
+	defer c.writeAccess.Unlock()
+	if c.closed.Load() {
+		buffer.Release()
+		return net.ErrClosed
+	}
+	return wrapWsError(c.Writer.WriteBuffer(buffer))
+}
+
+func (c *WebsocketConn) handleControl(header ws.Header, reader io.Reader) error {
+	payload := make([]byte, int(header.Length))
+	if _, err := io.ReadFull(reader, payload); err != nil {
+		return err
+	}
+	switch header.OpCode {
+	case ws.OpPing:
+		return c.writeControl(ws.OpPong, payload)
+	case ws.OpPong:
+		return nil
+	case ws.OpClose:
+		if len(payload) == 0 {
+			if err := c.writeControl(ws.OpClose, nil); err != nil {
+				return err
+			}
+			return wsutil.ClosedError{Code: ws.StatusNoStatusRcvd}
+		}
+		if len(payload) == 1 {
+			err := E.New("invalid close frame payload length")
+			_ = c.writeControl(ws.OpClose, ws.NewCloseFrameBody(ws.StatusProtocolError, err.Error()))
+			return err
+		}
+		code, reason := ws.ParseCloseFrameData(payload)
+		if err := ws.CheckCloseFrameData(code, reason); err != nil {
+			_ = c.writeControl(ws.OpClose, ws.NewCloseFrameBody(ws.StatusProtocolError, err.Error()))
+			return err
+		}
+		if err := c.writeControl(ws.OpClose, payload); err != nil {
+			return err
+		}
+		return wsutil.ClosedError{Code: code, Reason: reason}
+	default:
+		return wsutil.ErrNotControlFrame
+	}
+}
+
+func (c *WebsocketConn) writeControl(opCode ws.OpCode, payload []byte) error {
+	c.writeAccess.Lock()
+	defer c.writeAccess.Unlock()
+	if c.closed.Load() {
+		return net.ErrClosed
+	}
+	return c.Writer.writeFrame(opCode, payload)
 }
 
 func (c *WebsocketConn) RemoteAddr() net.Addr {
@@ -135,26 +204,57 @@ func (c *WebsocketConn) Upstream() any {
 
 type EarlyWebsocketConn struct {
 	*Client
-	ctx    context.Context
-	conn   atomic.Pointer[WebsocketConn]
-	access sync.Mutex
-	create chan struct{}
-	err    error
+	ctx         context.Context
+	cancel      context.CancelCauseFunc
+	conn        atomic.Pointer[WebsocketConn]
+	setupAccess sync.Mutex
+	stateAccess sync.Mutex
+	ready       chan struct{}
+	readyOnce   sync.Once
+	setupDone   bool
+	closed      bool
+	err         error
+	pending     *WebsocketConn
+	closeOnce   sync.Once
+	closeErr    error
+}
+
+func newEarlyWebsocketConn(client *Client, ctx context.Context) *EarlyWebsocketConn {
+	ownedContext, cancel := context.WithCancelCause(ctx)
+	return &EarlyWebsocketConn{
+		Client: client,
+		ctx:    ownedContext,
+		cancel: cancel,
+		ready:  make(chan struct{}),
+	}
 }
 
 func (c *EarlyWebsocketConn) Read(b []byte) (n int, err error) {
+	if len(b) == 0 {
+		return 0, nil
+	}
 	conn := c.conn.Load()
 	if conn == nil {
-		<-c.create
-		if c.err != nil {
-			return 0, c.err
-		}
+		<-c.ready
+		c.stateAccess.Lock()
+		err = c.err
+		closed := c.closed
 		conn = c.conn.Load()
+		c.stateAccess.Unlock()
+		if closed {
+			return 0, net.ErrClosed
+		}
+		if err != nil {
+			return 0, err
+		}
+		if conn == nil {
+			return 0, net.ErrClosed
+		}
 	}
 	return wrapWsError0(conn.Read(b))
 }
 
-func (c *EarlyWebsocketConn) writeRequest(content []byte) error {
+func (c *EarlyWebsocketConn) writeRequest(content []byte) (*WebsocketConn, error) {
 	var (
 		earlyData []byte
 		lateData  []byte
@@ -182,17 +282,57 @@ func (c *EarlyWebsocketConn) writeRequest(content []byte) error {
 		conn, err = c.dialContext(c.ctx, &c.requestURL, c.headers)
 	}
 	if err != nil {
-		return err
+		return nil, err
 	}
+	c.stateAccess.Lock()
+	if c.closed || c.setupDone {
+		c.stateAccess.Unlock()
+		conn.Close()
+		return nil, net.ErrClosed
+	}
+	c.pending = conn
+	c.stateAccess.Unlock()
 	if len(lateData) > 0 {
-		_, err = conn.Write(lateData)
-		if err != nil {
+		if _, err = conn.Write(lateData); err != nil {
 			conn.Close()
-			return err
+			return conn, err
 		}
 	}
-	c.conn.Store(conn)
-	return nil
+	return conn, nil
+}
+
+func (c *EarlyWebsocketConn) finishSetup(conn *WebsocketConn, setupErr error) error {
+	c.stateAccess.Lock()
+	if c.pending == conn {
+		c.pending = nil
+	}
+	if c.closed || c.setupDone {
+		c.stateAccess.Unlock()
+		if conn != nil {
+			conn.Close()
+		}
+		return net.ErrClosed
+	}
+	c.setupDone = true
+	c.err = setupErr
+	if setupErr == nil {
+		c.conn.Store(conn)
+	}
+	c.stateAccess.Unlock()
+	c.readyOnce.Do(func() { close(c.ready) })
+	if setupErr != nil && conn != nil {
+		conn.Close()
+	}
+	return setupErr
+}
+
+func (c *EarlyWebsocketConn) terminalError() error {
+	c.stateAccess.Lock()
+	defer c.stateAccess.Unlock()
+	if c.closed {
+		return net.ErrClosed
+	}
+	return c.err
 }
 
 func (c *EarlyWebsocketConn) Write(b []byte) (n int, err error) {
@@ -200,20 +340,19 @@ func (c *EarlyWebsocketConn) Write(b []byte) (n int, err error) {
 	if conn != nil {
 		return wrapWsError0(conn.Write(b))
 	}
-	c.access.Lock()
-	defer c.access.Unlock()
+	c.setupAccess.Lock()
+	defer c.setupAccess.Unlock()
 	conn = c.conn.Load()
-	if c.err != nil {
-		return 0, c.err
-	}
 	if conn != nil {
 		return wrapWsError0(conn.Write(b))
 	}
-	err = c.writeRequest(b)
-	c.err = err
-	close(c.create)
+	if err = c.terminalError(); err != nil {
+		return 0, err
+	}
+	conn, err = c.writeRequest(b)
+	err = c.finishSetup(conn, err)
 	if err != nil {
-		return
+		return 0, err
 	}
 	return len(b), nil
 }
@@ -223,27 +362,41 @@ func (c *EarlyWebsocketConn) WriteBuffer(buffer *buf.Buffer) error {
 	if conn != nil {
 		return wrapWsError(conn.WriteBuffer(buffer))
 	}
-	c.access.Lock()
-	defer c.access.Unlock()
-	if c.err != nil {
-		return c.err
-	}
+	c.setupAccess.Lock()
+	defer c.setupAccess.Unlock()
 	conn = c.conn.Load()
 	if conn != nil {
 		return wrapWsError(conn.WriteBuffer(buffer))
 	}
-	err := c.writeRequest(buffer.Bytes())
-	c.err = err
-	close(c.create)
-	return err
+	if err := c.terminalError(); err != nil {
+		buffer.Release()
+		return err
+	}
+	defer buffer.Release()
+	conn, err := c.writeRequest(buffer.Bytes())
+	return c.finishSetup(conn, err)
 }
 
 func (c *EarlyWebsocketConn) Close() error {
-	conn := c.conn.Load()
-	if conn == nil {
-		return nil
-	}
-	return conn.Close()
+	c.closeOnce.Do(func() {
+		c.stateAccess.Lock()
+		c.closed = true
+		c.setupDone = true
+		c.err = net.ErrClosed
+		conn := c.conn.Load()
+		pending := c.pending
+		c.pending = nil
+		c.stateAccess.Unlock()
+		c.cancel(net.ErrClosed)
+		c.readyOnce.Do(func() { close(c.ready) })
+		if pending != nil && pending != conn {
+			c.closeErr = pending.Close()
+		}
+		if conn != nil {
+			c.closeErr = conn.Close()
+		}
+	})
+	return c.closeErr
 }
 
 func (c *EarlyWebsocketConn) LocalAddr() net.Addr {

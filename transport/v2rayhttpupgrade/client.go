@@ -72,11 +72,27 @@ func NewClient(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opt
 	}, nil
 }
 
-func (c *Client) DialContext(ctx context.Context) (net.Conn, error) {
+func (c *Client) DialContext(ctx context.Context) (result net.Conn, resultErr error) {
 	conn, err := c.dialer.DialContext(ctx, N.NetworkTCP, c.serverAddr)
 	if err != nil {
 		return nil, err
 	}
+	rawConn := conn
+	cancellationDone := make(chan struct{})
+	stopCancellation := context.AfterFunc(ctx, func() {
+		rawConn.Close()
+		close(cancellationDone)
+	})
+	defer func() {
+		if !stopCancellation() {
+			<-cancellationDone
+			if resultErr == nil {
+				result.Close()
+				result = nil
+				resultErr = context.Cause(ctx)
+			}
+		}
+	}()
 	request := &http.Request{
 		Method: http.MethodGet,
 		URL:    &c.requestURL,
@@ -103,10 +119,11 @@ func (c *Client) DialContext(ctx context.Context) (net.Conn, error) {
 		response.Body.Close()
 		return nil, E.New("v2ray-http-upgrade: unexpected status: ", response.Status)
 	}
-	if bufReader.Buffered() > 0 {
-		buffer := buf.NewSize(bufReader.Buffered())
-		_, err = buffer.ReadFullFrom(bufReader, buffer.Len())
+	if cacheLen := bufReader.Buffered(); cacheLen > 0 {
+		buffer := buf.NewSize(cacheLen)
+		_, err = buffer.ReadFullFrom(bufReader, cacheLen)
 		if err != nil {
+			buffer.Release()
 			conn.Close()
 			return nil, err
 		}
