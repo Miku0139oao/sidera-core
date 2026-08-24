@@ -1043,6 +1043,9 @@ func translateXrayInboundReality(source *xrayReality) (map[string]any, error) {
 	}
 	if source.MinClientVer != "" {
 		reality["min_client_version"] = source.MinClientVer
+	} else {
+		// Match Xray's default capability gate for omitted minClientVer.
+		reality["min_client_version"] = "26.3.27"
 	}
 	if source.MaxClientVer != "" {
 		reality["max_client_version"] = source.MaxClientVer

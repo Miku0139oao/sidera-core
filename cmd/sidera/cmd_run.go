@@ -223,14 +223,20 @@ func rejectXrayConfigOutput(optionsList []*OptionsEntry, operation string) error
 	return nil
 }
 
-func create(options option.Options, runtimePath string, persistRuntime bool) (*box.Box, context.CancelFunc, error) {
+func create(parentContext context.Context, options option.Options, runtimePath string, persistRuntime bool) (*box.Box, context.CancelFunc, error) {
 	if disableColor {
 		if options.Log == nil {
 			options.Log = &option.LogOptions{}
 		}
 		options.Log.DisableColor = true
 	}
-	ctx, cancel := context.WithCancel(globalCtx)
+	if parentContext == nil {
+		parentContext = globalCtx
+	}
+	if err := parentContext.Err(); err != nil {
+		return nil, nil, err
+	}
+	ctx, cancel := context.WithCancel(parentContext)
 	var beforeRuntimeCommit func() (func() error, error)
 	if persistRuntime && runtimePath != "" {
 		beforeRuntimeCommit = func() (func() error, error) {
@@ -261,24 +267,13 @@ func create(options option.Options, runtimePath string, persistRuntime bool) (*b
 		return nil, nil, E.Cause(err, "create service")
 	}
 
-	osSignals := make(chan os.Signal, 1)
-	// SIGHUP belongs exclusively to the run loop so a reload request cannot
-	// cancel the live instance before its replacement has been validated.
-	signal.Notify(osSignals, os.Interrupt, syscall.SIGTERM)
-	defer func() {
-		signal.Stop(osSignals)
-		close(osSignals)
-	}()
 	startCtx, finishStart := context.WithCancel(context.Background())
-	go func() {
-		_, loaded := <-osSignals
-		if loaded {
-			cancel()
-			closeMonitor(startCtx)
-		}
-	}()
+	stopStartMonitor := context.AfterFunc(parentContext, func() {
+		closeMonitor(startCtx)
+	})
 	err = instance.Start()
 	finishStart()
+	stopStartMonitor()
 	if err != nil {
 		cancel()
 		return nil, nil, E.Cause(err, "start service")
@@ -316,31 +311,41 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	osSignals := make(chan os.Signal, 1)
-	signal.Notify(osSignals, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
-	defer signal.Stop(osSignals)
+	terminationContext, stopTermination := signal.NotifyContext(globalCtx, os.Interrupt, syscall.SIGTERM)
+	defer stopTermination()
+	reloadSignals := make(chan os.Signal, 1)
+	signal.Notify(reloadSignals, syscall.SIGHUP)
+	defer signal.Stop(reloadSignals)
 	var instance *box.Box
 	var cancel context.CancelFunc
 	if usingRuntimeFallback {
 		var loadedPath string
 		var priorErr error
-		instance, cancel, options, loadedPath, priorErr, err = startRuntimeFallback(runtimePath)
+		instance, cancel, options, loadedPath, priorErr, err = startRuntimeFallback(terminationContext, runtimePath)
 		if err == nil {
 			log.Error(errors.Join(E.Cause(desiredLoadErr, "load desired configuration; using last-known-good runtime configuration at ", loadedPath), priorErr))
 		}
 	} else {
-		instance, cancel, options, err = startDesiredOrRuntimeFallback(options, runtimePath)
+		instance, cancel, options, err = startDesiredOrRuntimeFallback(terminationContext, options, runtimePath)
 	}
 	if err != nil {
 		return err
 	}
+	shutdown := func() {
+		closeErr := closeInstance(instance, cancel)
+		if closeErr != nil {
+			log.Error(E.Cause(closeErr, "Sidera Core did not close properly"))
+		}
+	}
 	for {
-		osSignal := <-osSignals
-		if osSignal != syscall.SIGHUP {
-			err = closeInstance(instance, cancel)
-			if err != nil {
-				log.Error(E.Cause(err, "Sidera Core did not close properly"))
-			}
+		select {
+		case <-terminationContext.Done():
+			shutdown()
+			return nil
+		case <-reloadSignals:
+		}
+		if terminationContext.Err() != nil {
+			shutdown()
 			return nil
 		}
 
@@ -352,14 +357,21 @@ func run() error {
 			log.Error(E.Cause(reloadErr, "reload service"))
 			continue
 		}
+		if terminationContext.Err() != nil {
+			shutdown()
+			return nil
+		}
 
 		closeErr := closeInstance(instance, cancel)
 		if closeErr != nil {
 			log.Error(E.Cause(closeErr, "close previous service during reload"))
 		}
+		if terminationContext.Err() != nil {
+			return nil
+		}
 		storeSnapshot, snapshotErr := captureDashboardStoreFiles(options, candidate)
 		if snapshotErr != nil {
-			instance, cancel, err = create(options, "", false)
+			instance, cancel, err = create(terminationContext, options, "", false)
 			if err != nil {
 				return errors.Join(E.Cause(snapshotErr, "snapshot dashboard store"), E.Cause(err, "restore previous service"))
 			}
@@ -367,7 +379,7 @@ func run() error {
 			continue
 		}
 
-		candidateInstance, candidateCancel, candidateErr := create(candidate, runtimePath, true)
+		candidateInstance, candidateCancel, candidateErr := create(terminationContext, candidate, runtimePath, true)
 		if candidateErr == nil {
 			options = candidate
 			instance = candidateInstance
@@ -380,7 +392,7 @@ func run() error {
 		if verifyStoreErr != nil {
 			return errors.Join(E.Cause(candidateErr, "start reloaded service"), restoreStoreErr, E.Cause(verifyStoreErr, "verify restored dashboard store"))
 		}
-		instance, cancel, err = create(options, "", false)
+		instance, cancel, err = create(terminationContext, options, "", false)
 		if err != nil {
 			return errors.Join(E.Cause(candidateErr, "start reloaded service"), restoreStoreErr, E.Cause(err, "restore previous service"))
 		}
@@ -406,12 +418,12 @@ func includeRuntimeFallbackNetworkNamespaces(options option.Options, runtimePath
 	return options
 }
 
-func startDesiredOrRuntimeFallback(options option.Options, runtimePath string) (*box.Box, context.CancelFunc, option.Options, error) {
+func startDesiredOrRuntimeFallback(ctx context.Context, options option.Options, runtimePath string) (*box.Box, context.CancelFunc, option.Options, error) {
 	storeSnapshot, err := captureDashboardStoreFiles(options)
 	if err != nil {
 		return nil, nil, option.Options{}, E.Cause(err, "snapshot dashboard store")
 	}
-	instance, cancel, desiredErr := create(options, runtimePath, true)
+	instance, cancel, desiredErr := create(ctx, options, runtimePath, true)
 	if desiredErr == nil {
 		return instance, cancel, options, nil
 	}
@@ -421,7 +433,7 @@ func startDesiredOrRuntimeFallback(options option.Options, runtimePath string) (
 	if verifyErr != nil {
 		return nil, nil, option.Options{}, errors.Join(E.Cause(desiredErr, "start desired configuration"), restoreErr, E.Cause(verifyErr, "verify restored activation files"))
 	}
-	instance, cancel, fallback, loadedPath, priorErr, fallbackErr := startRuntimeFallback(runtimePath)
+	instance, cancel, fallback, loadedPath, priorErr, fallbackErr := startRuntimeFallback(ctx, runtimePath)
 	if fallbackErr != nil {
 		return nil, nil, option.Options{}, errors.Join(E.Cause(desiredErr, "start desired configuration"), restoreErr, fallbackErr)
 	}
@@ -433,7 +445,7 @@ func startDesiredOrRuntimeFallback(options option.Options, runtimePath string) (
 	return instance, cancel, fallback, nil
 }
 
-func startRuntimeFallback(runtimePath string) (*box.Box, context.CancelFunc, option.Options, string, error, error) {
+func startRuntimeFallback(ctx context.Context, runtimePath string) (*box.Box, context.CancelFunc, option.Options, string, error, error) {
 	if runtimePath == "" {
 		return nil, nil, option.Options{}, "", nil, E.New("last-known-good runtime configuration path is not configured")
 	}
@@ -452,7 +464,7 @@ func startRuntimeFallback(runtimePath string) (*box.Box, context.CancelFunc, opt
 			attemptErrors = errors.Join(attemptErrors, E.Cause(err, "snapshot dashboard store for runtime configuration at ", candidatePath))
 			continue
 		}
-		instance, cancel, startErr := create(options, "", false)
+		instance, cancel, startErr := create(ctx, options, "", false)
 		if startErr == nil {
 			return instance, cancel, options, candidatePath, attemptErrors, nil
 		}

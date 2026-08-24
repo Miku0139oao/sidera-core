@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/Miku0139oao/sidera-core/adapter"
+	"github.com/sagernet/sing/common"
 )
 
 type RuleSetUpdater struct {
@@ -65,7 +66,7 @@ func (u *RuleSetUpdater) loopUpdate() {
 			nextUpdates[i] = now.Add(ruleSet.updateInterval)
 			updated = true
 		}
-		if updated {
+		if updated && common.LowMemory {
 			runtime.GC()
 		}
 		timer.Reset(waitUntilNext(nextUpdates))

@@ -51,9 +51,11 @@ func validateConfigOptions(options option.Options) error {
 		Options:        options,
 		ValidationOnly: true,
 	})
-	if err == nil {
-		instance.Close()
+	if err != nil {
+		cancel()
+		return err
 	}
+	closeErr := instance.Close()
 	cancel()
-	return err
+	return closeErr
 }

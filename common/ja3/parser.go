@@ -264,16 +264,22 @@ func (j *ClientHello) parseExtensions(exs []byte) error {
 				return &ParseError{LengthErr, 19}
 			}
 			versionsLen := int(sex[0])
+			if versionsLen%2 != 0 || versionsLen != len(sex)-1 {
+				return &ParseError{LengthErr, 19}
+			}
 			for i := 0; i < versionsLen; i += 2 {
-				versions = append(versions, binary.BigEndian.Uint16(sex[1:][i:]))
+				versions = append(versions, binary.BigEndian.Uint16(sex[1+i:1+i+2]))
 			}
 		case signatureAlgorithmsExtensionType:
 			if len(sex) < signatureAlgorithmsExtensionHeaderLen {
 				return &ParseError{LengthErr, 20}
 			}
-			ssaLen := binary.BigEndian.Uint16(sex)
-			for i := 0; i < int(ssaLen); i += 2 {
-				signatureAlgorithms = append(signatureAlgorithms, binary.BigEndian.Uint16(sex[2:][i:]))
+			ssaLen := int(binary.BigEndian.Uint16(sex))
+			if ssaLen%2 != 0 || ssaLen != len(sex)-2 {
+				return &ParseError{LengthErr, 20}
+			}
+			for i := 0; i < ssaLen; i += 2 {
+				signatureAlgorithms = append(signatureAlgorithms, binary.BigEndian.Uint16(sex[2+i:2+i+2]))
 			}
 		}
 		exs = exs[4+exLen:]
@@ -298,50 +304,30 @@ func (j *ClientHello) marshalJA3() {
 	byteString = strconv.AppendUint(byteString, uint64(j.Version), 10)
 	byteString = append(byteString, commaByte)
 
-	// Cipher Suites
-	if len(j.CipherSuites) != 0 {
-		for _, val := range j.CipherSuites {
-			if val&GreaseBitmask != 0x0A0A {
+	appendUint16List := func(values []uint16) {
+		start := len(byteString)
+		for _, value := range values {
+			if value&GreaseBitmask == 0x0A0A {
 				continue
 			}
-			byteString = strconv.AppendUint(byteString, uint64(val), 10)
+			byteString = strconv.AppendUint(byteString, uint64(value), 10)
 			byteString = append(byteString, dashByte)
 		}
-		// Replace last dash with a comma
-		byteString[len(byteString)-1] = commaByte
-	} else {
-		byteString = append(byteString, commaByte)
+		if len(byteString) == start {
+			byteString = append(byteString, commaByte)
+		} else {
+			byteString[len(byteString)-1] = commaByte
+		}
 	}
+
+	// Cipher Suites
+	appendUint16List(j.CipherSuites)
 
 	// Extensions
-	if len(j.Extensions) != 0 {
-		for _, val := range j.Extensions {
-			if val&GreaseBitmask != 0x0A0A {
-				continue
-			}
-			byteString = strconv.AppendUint(byteString, uint64(val), 10)
-			byteString = append(byteString, dashByte)
-		}
-		// Replace last dash with a comma
-		byteString[len(byteString)-1] = commaByte
-	} else {
-		byteString = append(byteString, commaByte)
-	}
+	appendUint16List(j.Extensions)
 
 	// Elliptic curves
-	if len(j.EllipticCurves) != 0 {
-		for _, val := range j.EllipticCurves {
-			if val&GreaseBitmask != 0x0A0A {
-				continue
-			}
-			byteString = strconv.AppendUint(byteString, uint64(val), 10)
-			byteString = append(byteString, dashByte)
-		}
-		// Replace last dash with a comma
-		byteString[len(byteString)-1] = commaByte
-	} else {
-		byteString = append(byteString, commaByte)
-	}
+	appendUint16List(j.EllipticCurves)
 
 	// ECPF
 	if len(j.EllipticCurvePF) != 0 {

@@ -7,6 +7,8 @@ import (
 	"maps"
 	"net/http"
 	"os"
+	"runtime"
+	"sync"
 	"time"
 
 	"github.com/Miku0139oao/sidera-core/adapter"
@@ -63,6 +65,12 @@ type Box struct {
 	httpClientService   adapter.LifecycleService
 	internalService     []adapter.LifecycleService
 	done                chan struct{}
+	closeAccess         sync.Mutex
+	closeDone           chan struct{}
+	closeOwner          uint64
+	closeErr            error
+	closing             bool
+	closed              bool
 	beforeRuntimeCommit func() (func() error, error)
 }
 
@@ -494,6 +502,7 @@ func New(options Options) (*Box, error) {
 		logger:              logFactory.Logger(),
 		internalService:     internalServices,
 		done:                make(chan struct{}),
+		closeDone:           make(chan struct{}),
 		beforeRuntimeCommit: options.BeforeRuntimeCommit,
 	}, nil
 }
@@ -648,13 +657,50 @@ func (s *Box) start() error {
 	return nil
 }
 
-func (s *Box) Close() error {
-	select {
-	case <-s.done:
-		return os.ErrClosed
-	default:
-		close(s.done)
+func (s *Box) Close() (err error) {
+	owner := boxGoroutineID()
+	s.closeAccess.Lock()
+	if s.closed {
+		closeErr := s.closeErr
+		s.closeAccess.Unlock()
+		return errors.Join(os.ErrClosed, closeErr)
 	}
+	if s.closing {
+		if owner != 0 && owner == s.closeOwner {
+			s.closeAccess.Unlock()
+			return os.ErrClosed
+		}
+		closeDone := s.closeDone
+		s.closeAccess.Unlock()
+		<-closeDone
+		s.closeAccess.Lock()
+		closeErr := s.closeErr
+		s.closeAccess.Unlock()
+		return errors.Join(os.ErrClosed, closeErr)
+	}
+	s.closing = true
+	s.closeOwner = owner
+	s.closeAccess.Unlock()
+
+	defer func() {
+		panicValue := recover()
+		s.closeAccess.Lock()
+		s.closeErr = err
+		s.closing = false
+		s.closed = true
+		s.closeOwner = 0
+		close(s.closeDone)
+		s.closeAccess.Unlock()
+		if panicValue != nil {
+			panic(panicValue)
+		}
+	}()
+	err = s.close()
+	return err
+}
+
+func (s *Box) close() error {
+	close(s.done)
 	var err error
 	if s.debugHTTPServer != nil {
 		err = E.Append(err, s.debugHTTPServer.Close(), func(err error) error {
@@ -704,6 +750,24 @@ func (s *Box) Close() error {
 	})
 	done()
 	return err
+}
+
+func boxGoroutineID() uint64 {
+	var buffer [64]byte
+	length := runtime.Stack(buffer[:], false)
+	const prefix = "goroutine "
+	if length <= len(prefix) {
+		return 0
+	}
+	var id uint64
+	for index := len(prefix); index < length; index++ {
+		value := buffer[index]
+		if value < '0' || value > '9' {
+			break
+		}
+		id = id*10 + uint64(value-'0')
+	}
+	return id
 }
 
 func (s *Box) Network() adapter.NetworkManager {

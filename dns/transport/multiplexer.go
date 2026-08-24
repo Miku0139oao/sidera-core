@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -42,7 +43,6 @@ type queryMultiplexer struct {
 	connection *ConnPool[*multiplexConn]
 
 	queryAccess sync.Mutex
-	queryId     uint16
 	queries     map[uint16]*pendingQuery
 
 	reuseState     atomic.Int32
@@ -338,17 +338,16 @@ func (m *queryMultiplexer) dialConn(ctx context.Context) (*multiplexConn, error)
 func (m *queryMultiplexer) register(ctx context.Context, connCtx context.Context, conn *multiplexConn, message *mDNS.Msg, callback func(response *mDNS.Msg, err error), retryReadError bool) (uint16, error) {
 	m.queryAccess.Lock()
 	defer m.queryAccess.Unlock()
-	start := m.queryId
-	for {
-		m.queryId++
-		if _, exists := m.queries[m.queryId]; !exists {
+	queryId := mDNS.Id()
+	for attempts := 0; ; attempts++ {
+		if _, exists := m.queries[queryId]; !exists {
 			break
 		}
-		if m.queryId == start {
+		if attempts == 1<<16-1 {
 			return 0, E.New("no available query ID")
 		}
+		queryId++
 	}
-	queryId := m.queryId
 	pending := &pendingQuery{
 		conn:      conn,
 		message:   message,
@@ -397,9 +396,24 @@ func (m *queryMultiplexer) take(queryId uint16) *pendingQuery {
 }
 
 func (m *queryMultiplexer) complete(queryId uint16, response *mDNS.Msg, err error, releaseConn bool) {
-	pending := m.take(queryId)
-	if pending == nil {
-		return
+	var pending *pendingQuery
+	if response != nil && err == nil {
+		m.queryAccess.Lock()
+		candidate := m.queries[queryId]
+		if candidate == nil || validateDNSResponse(candidate.message, response) != nil {
+			m.queryAccess.Unlock()
+			return
+		}
+		delete(m.queries, queryId)
+		m.queryAccess.Unlock()
+		candidate.stopContext()
+		candidate.stopConn()
+		pending = candidate
+	} else {
+		pending = m.take(queryId)
+		if pending == nil {
+			return
+		}
 	}
 	if releaseConn {
 		m.connection.Release(pending.conn, true)
@@ -408,6 +422,28 @@ func (m *queryMultiplexer) complete(queryId uint16, response *mDNS.Msg, err erro
 		response.Id = pending.message.Id
 	}
 	pending.callback(response, err)
+}
+
+func validateDNSResponse(query *mDNS.Msg, response *mDNS.Msg) error {
+	if !response.Response {
+		return E.New("DNS response has the query bit set")
+	}
+	if response.Opcode != query.Opcode {
+		return E.New("DNS response opcode does not match query")
+	}
+	if len(response.Question) == 0 && response.Rcode != mDNS.RcodeSuccess {
+		return nil
+	}
+	if len(response.Question) != len(query.Question) {
+		return E.New("DNS response question count does not match query")
+	}
+	for index, question := range query.Question {
+		responseQuestion := response.Question[index]
+		if question.Qtype != responseQuestion.Qtype || question.Qclass != responseQuestion.Qclass || !strings.EqualFold(question.Name, responseQuestion.Name) {
+			return E.New("DNS response question does not match query")
+		}
+	}
+	return nil
 }
 
 func (m *queryMultiplexer) completeContextDone(queryId uint16, ctx context.Context) {

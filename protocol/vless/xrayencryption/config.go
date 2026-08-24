@@ -176,13 +176,13 @@ func parseSecondsRange(value string) (int64, int64, error) {
 	trimmed := strings.TrimSuffix(value, "s")
 	parts := strings.SplitN(trimmed, "-", 2)
 	from, err := strconv.ParseInt(parts[0], 10, 64)
-	if err != nil || from < 0 {
+	if err != nil || from < 0 || from > 1<<16-1 {
 		return 0, 0, fmt.Errorf("xray encryption: invalid seconds range %q", value)
 	}
 	var to int64
 	if len(parts) == 2 {
 		to, err = strconv.ParseInt(parts[1], 10, 64)
-		if err != nil || to < 0 {
+		if err != nil || to < 0 || to > 1<<16-1 || to < from {
 			return 0, 0, fmt.Errorf("xray encryption: invalid seconds range %q", value)
 		}
 	}

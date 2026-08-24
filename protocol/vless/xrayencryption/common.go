@@ -48,6 +48,8 @@ type CommonConn struct {
 	AEAD        *AEAD
 	PeerAEAD    *AEAD
 	PeerPadding []byte
+	readAccess  sync.Mutex
+	writeAccess sync.Mutex
 	rawInput    bytes.Buffer
 	input       bytes.Reader
 }
@@ -66,6 +68,8 @@ func (c *CommonConn) UpstreamReader() any { return c.Conn }
 func (c *CommonConn) UpstreamWriter() any { return c.Conn }
 
 func (c *CommonConn) Write(b []byte) (int, error) {
+	c.writeAccess.Lock()
+	defer c.writeAccess.Unlock()
 	if len(b) == 0 {
 		return 0, nil
 	}
@@ -102,6 +106,8 @@ func (c *CommonConn) Write(b []byte) (int, error) {
 }
 
 func (c *CommonConn) Read(b []byte) (int, error) {
+	c.readAccess.Lock()
+	defer c.readAccess.Unlock()
 	if len(b) == 0 {
 		return 0, nil
 	}

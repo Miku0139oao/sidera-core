@@ -1,6 +1,7 @@
 NAME = sidera
 COMMIT = $(shell git rev-parse --short HEAD)
 TAGS ?= $(shell cat release/DEFAULT_BUILD_TAGS_OTHERS)
+LOW_MEMORY_TAGS ?= $(shell cat release/LOW_MEMORY_BUILD_TAGS)
 GOTOOLCHAIN ?= go1.26.5
 export GOTOOLCHAIN
 
@@ -16,10 +17,13 @@ PREFIX ?= $(shell go env GOPATH)
 SING_FFI ?= sing-ffi
 LIBBOX_FFI_CONFIG ?= ./experimental/libbox/ffi.json
 
-.PHONY: test release docs build schema
+.PHONY: test release docs build build_low_memory schema
 
 build:
 	go build $(MAIN_PARAMS) $(MAIN)
+
+build_low_memory:
+	go build -o $(NAME)-low-memory $(PARAMS) -tags "$(LOW_MEMORY_TAGS)" $(MAIN)
 
 race:
 	go build -race $(MAIN_PARAMS) $(MAIN)

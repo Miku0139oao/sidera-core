@@ -12,6 +12,7 @@ import (
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/baderror"
 	"github.com/sagernet/sing/common/buf"
+	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
 	"github.com/sagernet/sing/common/varbin"
 )
@@ -77,20 +78,31 @@ func (c *GunConn) read(b []byte) (n int, err error) {
 		return
 	}
 
-	_, err = c.reader.Discard(6)
-	if err != nil {
-		return
-	}
+	for c.readRemaining == 0 {
+		var header [6]byte
+		_, err = io.ReadFull(c.reader, header[:])
+		if err != nil {
+			return
+		}
+		if header[0] != 0 || header[5] != 0x0A {
+			return 0, E.New("v2ray gRPC lite: invalid frame header")
+		}
 
-	dataLen, err := binary.ReadUvarint(c.reader)
-	if err != nil {
-		return
+		dataLen, readErr := binary.ReadUvarint(c.reader)
+		if readErr != nil {
+			return 0, readErr
+		}
+		frameLen := 1 + uint64(varbin.UvarintLen(dataLen)) + dataLen
+		if frameLen != uint64(binary.BigEndian.Uint32(header[1:5])) {
+			return 0, E.New("v2ray gRPC lite: invalid frame length")
+		}
+		if dataLen > uint64(^uint(0)>>1) {
+			return 0, E.New("v2ray gRPC lite: frame is too large")
+		}
+		c.readRemaining = int(dataLen)
 	}
-
-	readLen := int(dataLen)
-	c.readRemaining = readLen
-	if len(b) > readLen {
-		b = b[:readLen]
+	if len(b) > c.readRemaining {
+		b = b[:c.readRemaining]
 	}
 
 	n, err = c.reader.Read(b)
@@ -100,10 +112,15 @@ func (c *GunConn) read(b []byte) (n int, err error) {
 
 func (c *GunConn) Write(b []byte) (n int, err error) {
 	varLen := varbin.UvarintLen(uint64(len(b)))
-	buffer := buf.NewSize(6 + varLen + len(b))
+	frameLen := 1 + varLen + len(b)
+	if uint64(frameLen) > uint64(^uint32(0)) {
+		return 0, E.New("v2ray gRPC lite: frame is too large")
+	}
+	buffer := buf.NewSize(5 + frameLen)
+	defer buffer.Release()
 	header := buffer.Extend(6 + varLen)
 	header[0] = 0x00
-	binary.BigEndian.PutUint32(header[1:5], uint32(1+varLen+len(b)))
+	binary.BigEndian.PutUint32(header[1:5], uint32(frameLen))
 	header[5] = 0x0A
 	binary.PutUvarint(header[6:], uint64(len(b)))
 	common.Must1(buffer.Write(b))
@@ -121,9 +138,13 @@ func (c *GunConn) WriteBuffer(buffer *buf.Buffer) error {
 	defer buffer.Release()
 	dataLen := buffer.Len()
 	varLen := varbin.UvarintLen(uint64(dataLen))
+	frameLen := 1 + varLen + dataLen
+	if uint64(frameLen) > uint64(^uint32(0)) {
+		return E.New("v2ray gRPC lite: frame is too large")
+	}
 	header := buffer.ExtendHeader(6 + varLen)
 	header[0] = 0x00
-	binary.BigEndian.PutUint32(header[1:5], uint32(1+varLen+dataLen))
+	binary.BigEndian.PutUint32(header[1:5], uint32(frameLen))
 	header[5] = 0x0A
 	binary.PutUvarint(header[6:], uint64(dataLen))
 	err := common.Error(c.writer.Write(buffer.Bytes()))

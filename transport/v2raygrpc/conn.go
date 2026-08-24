@@ -16,9 +16,11 @@ var _ net.Conn = (*GRPCConn)(nil)
 
 type GRPCConn struct {
 	GunService
-	cache     []byte
-	cancel    context.CancelCauseFunc
-	closeOnce sync.Once
+	cache       []byte
+	cancel      context.CancelCauseFunc
+	readAccess  sync.Mutex
+	writeAccess sync.Mutex
+	closeOnce   sync.Once
 }
 
 func NewGRPCConn(service GunService, cancel context.CancelCauseFunc) *GRPCConn {
@@ -33,6 +35,8 @@ func NewGRPCConn(service GunService, cancel context.CancelCauseFunc) *GRPCConn {
 }
 
 func (c *GRPCConn) Read(b []byte) (n int, err error) {
+	c.readAccess.Lock()
+	defer c.readAccess.Unlock()
 	if len(c.cache) > 0 {
 		n = copy(b, c.cache)
 		c.cache = c.cache[n:]
@@ -51,6 +55,8 @@ func (c *GRPCConn) Read(b []byte) (n int, err error) {
 }
 
 func (c *GRPCConn) Write(b []byte) (n int, err error) {
+	c.writeAccess.Lock()
+	defer c.writeAccess.Unlock()
 	err = baderror.WrapGRPC(c.Send(&Hunk{Data: b}))
 	if err != nil {
 		return

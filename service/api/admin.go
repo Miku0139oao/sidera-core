@@ -740,8 +740,8 @@ func (a *adminAPI) start() error {
 	}
 	a.startedAt = time.Now()
 	if a.traffic != nil {
-		a.removeTrafficOpenHook = a.traffic.AddOpenHook(a.recordTrafficOpen)
-		a.removeTrafficHook = a.traffic.AddCloseHook(a.recordTraffic)
+		a.removeTrafficOpenHook = a.traffic.AddOpenHookQuiescent(a.recordTrafficOpen)
+		a.removeTrafficHook = a.traffic.AddCloseHookQuiescent(a.recordTraffic)
 		for _, metadata := range a.traffic.Connections() {
 			a.recordTrafficOpen(metadata)
 		}

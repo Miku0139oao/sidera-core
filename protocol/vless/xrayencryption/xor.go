@@ -11,6 +11,7 @@ import (
 	"crypto/cipher"
 	"errors"
 	"net"
+	"sync"
 
 	N "github.com/sagernet/sing/common/network"
 
@@ -29,12 +30,14 @@ func NewCTR(key, iv []byte) cipher.Stream {
 
 type XorConn struct {
 	net.Conn
-	CTR       cipher.Stream
-	PeerCTR   cipher.Stream
-	OutSkip   int
-	OutHeader []byte
-	InSkip    int
-	InHeader  []byte
+	CTR         cipher.Stream
+	PeerCTR     cipher.Stream
+	OutSkip     int
+	OutHeader   []byte
+	InSkip      int
+	InHeader    []byte
+	readAccess  sync.Mutex
+	writeAccess sync.Mutex
 }
 
 var (
@@ -59,6 +62,8 @@ func (c *XorConn) UpstreamReader() any { return c.Conn }
 func (c *XorConn) UpstreamWriter() any { return c.Conn }
 
 func (c *XorConn) Write(b []byte) (int, error) {
+	c.writeAccess.Lock()
+	defer c.writeAccess.Unlock()
 	if len(b) == 0 {
 		return 0, nil
 	}
@@ -90,6 +95,8 @@ func (c *XorConn) Write(b []byte) (int, error) {
 }
 
 func (c *XorConn) Read(b []byte) (int, error) {
+	c.readAccess.Lock()
+	defer c.readAccess.Unlock()
 	if len(b) == 0 {
 		return 0, nil
 	}
