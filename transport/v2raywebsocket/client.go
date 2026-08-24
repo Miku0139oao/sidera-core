@@ -73,37 +73,63 @@ func NewClient(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opt
 	}, nil
 }
 
-func (c *Client) dialContext(ctx context.Context, requestURL *url.URL, headers http.Header) (*WebsocketConn, error) {
+func (c *Client) dialContext(ctx context.Context, requestURL *url.URL, headers http.Header) (result *WebsocketConn, resultErr error) {
 	conn, err := c.dialer.DialContext(ctx, N.NetworkTCP, c.serverAddr)
 	if err != nil {
 		return nil, err
 	}
+	rawConn := conn
+	cancellationDone := make(chan struct{})
+	stopCancellation := context.AfterFunc(ctx, func() {
+		rawConn.Close()
+		close(cancellationDone)
+	})
+	defer func() {
+		if !stopCancellation() {
+			<-cancellationDone
+			if resultErr == nil {
+				result.Close()
+				result = nil
+				resultErr = context.Cause(ctx)
+			}
+		}
+	}()
+
 	var deadlineConn net.Conn
 	if deadline.NeedAdditionalReadDeadline(conn) {
 		deadlineConn = deadline.NewConn(conn)
 	} else {
 		deadlineConn = conn
 	}
-	deadlineConn.SetDeadline(time.Now().Add(C.TCPTimeout))
-	var protocols []string
-	if protocolHeader := headers.Get("Sec-WebSocket-Protocol"); protocolHeader != "" {
-		protocols = []string{protocolHeader}
-		headers.Del("Sec-WebSocket-Protocol")
+	if err = deadlineConn.SetDeadline(time.Now().Add(C.TCPTimeout)); err != nil {
+		conn.Close()
+		return nil, err
 	}
-	reader, _, err := ws.Dialer{Header: ws.HandshakeHeaderHTTP(headers), Protocols: protocols}.Upgrade(deadlineConn, requestURL)
-	deadlineConn.SetDeadline(time.Time{})
+	dialHeaders := headers.Clone()
+	var protocols []string
+	if protocolHeader := dialHeaders.Get("Sec-WebSocket-Protocol"); protocolHeader != "" {
+		protocols = []string{protocolHeader}
+		dialHeaders.Del("Sec-WebSocket-Protocol")
+	}
+	reader, _, err := ws.Dialer{Header: ws.HandshakeHeaderHTTP(dialHeaders), Protocols: protocols}.Upgrade(deadlineConn, requestURL)
+	if clearErr := deadlineConn.SetDeadline(time.Time{}); err == nil && clearErr != nil {
+		err = clearErr
+	}
 	if err != nil {
 		conn.Close()
 		return nil, err
 	}
 	if reader != nil {
-		buffer := buf.NewSize(reader.Buffered())
-		_, err = buffer.ReadFullFrom(reader, buffer.Len())
-		if err != nil {
-			conn.Close()
-			return nil, err
+		if cacheLen := reader.Buffered(); cacheLen > 0 {
+			buffer := buf.NewSize(cacheLen)
+			_, err = buffer.ReadFullFrom(reader, cacheLen)
+			if err != nil {
+				buffer.Release()
+				conn.Close()
+				return nil, err
+			}
+			conn = bufio.NewCachedConn(conn, buffer)
 		}
-		conn = bufio.NewCachedConn(conn, buffer)
 	}
 	return NewConn(conn, nil, ws.StateClientSide), nil
 }
@@ -116,7 +142,7 @@ func (c *Client) DialContext(ctx context.Context) (net.Conn, error) {
 		}
 		return conn, nil
 	} else {
-		return &EarlyWebsocketConn{Client: c, ctx: ctx, create: make(chan struct{})}, nil
+		return newEarlyWebsocketConn(c, ctx), nil
 	}
 }
 
