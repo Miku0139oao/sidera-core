@@ -251,13 +251,9 @@ func (h *vlessDialer) dialServer(ctx context.Context) (net.Conn, error) {
 	if h.encryption == nil {
 		return conn, nil
 	}
-	clearDeadline, err := setEncryptionHandshakeDeadline(ctx, conn)
-	if err != nil {
-		conn.Close()
-		return nil, E.Cause(err, "set VLESS encryption deadline")
-	}
-	encryptedConn, err := h.encryption.Handshake(conn)
-	clearDeadline()
+	handshakeCtx, cancelHandshake := encryptionHandshakeContext(ctx)
+	encryptedConn, err := h.encryption.HandshakeContext(handshakeCtx, conn)
+	cancelHandshake()
 	if err != nil {
 		conn.Close()
 		return nil, E.Cause(err, "VLESS encryption handshake")

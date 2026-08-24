@@ -70,7 +70,9 @@ func (c *XorConn) Write(b []byte) (int, error) {
 	if c.CTR == nil {
 		return 0, errors.New("xray encryption: missing outbound XOR stream")
 	}
-	for remaining := b; ; {
+
+	encoded := append([]byte(nil), b...)
+	for remaining := encoded; ; {
 		if len(remaining) <= c.OutSkip {
 			c.OutSkip -= len(remaining)
 			break
@@ -88,10 +90,7 @@ func (c *XorConn) Write(b []byte) (int, error) {
 		c.CTR.XORKeyStream(remaining[:need], remaining[:need])
 		remaining = remaining[need:]
 	}
-	if err := writeFull(c.Conn, b); err != nil {
-		return 0, err
-	}
-	return len(b), nil
+	return writeFullCount(c.Conn, encoded)
 }
 
 func (c *XorConn) Read(b []byte) (int, error) {

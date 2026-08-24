@@ -225,14 +225,9 @@ func (h *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
 		conn = tlsConn
 	}
 	if h.decryption != nil {
-		clearDeadline, err := setEncryptionHandshakeDeadline(ctx, conn)
-		if err != nil {
-			h.logger.ErrorContext(ctx, E.Cause(err, "process connection from ", metadata.Source, ": set VLESS decryption deadline"))
-			N.CloseOnHandshakeFailure(conn, onClose, err)
-			return
-		}
-		decryptedConn, err := h.decryption.Handshake(conn, nil)
-		clearDeadline()
+		handshakeCtx, cancelHandshake := encryptionHandshakeContext(ctx)
+		decryptedConn, err := h.decryption.HandshakeContext(handshakeCtx, conn, nil)
+		cancelHandshake()
 		if err != nil {
 			h.logger.ErrorContext(ctx, E.Cause(err, "process connection from ", metadata.Source, ": VLESS decryption handshake"))
 			N.CloseOnHandshakeFailure(conn, onClose, err)
