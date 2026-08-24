@@ -98,6 +98,35 @@ not comparative performance evidence. Its content-addressed files include:
 - bundle status `complete`, 156 records, zero failed cells; and
 - TUN status `scaffold_only_not_run` rather than a fabricated pass.
 
+## Balanced A/A diagnostic
+
+Bundle `20260824-142746-653115700-957` used final Sidera `cfa87adc`, two
+byte-identical Sidera treatments, sing-box and Xray in four seeded balanced
+rounds for VLESS TCP and REALITY. All 32 cells and bidirectional REALITY
+interop passed. Median point estimates were:
+
+| Scenario / core | TTFB p50 | 1 stream | 8 streams |
+| --- | ---: | ---: | ---: |
+| VLESS TCP / Sidera combined | 2.12 ms | 0.99 Gbps | 8.52 Gbps |
+| VLESS TCP / sing-box | 2.04 ms | 1.02 Gbps | 8.50 Gbps |
+| VLESS TCP / Xray | 2.14 ms | 1.42 Gbps | 8.61 Gbps |
+| REALITY / Sidera combined | 5.20 ms | 1.20 Gbps | 7.60 Gbps |
+| REALITY / sing-box | 4.61 ms | 1.14 Gbps | 7.63 Gbps |
+| REALITY / Xray | 5.22 ms | 1.07 Gbps | 5.06 Gbps |
+
+The byte-identical Sidera A/A median absolute variation was 2.01% / 7.80% /
+4.22% for TCP TTFB / 1-stream / 8-stream, and 11.30% / 7.99% / 0.73% for the
+same REALITY metrics. This demonstrates why the point estimates cannot support
+fine-grained latency or single-stream claims. The bundle is complete with 207
+records; `report.json` SHA-256 is
+`23655cf5fd406dfda08da6486120fbfdf359ef66db821ee716e01dc3bc32758b` and
+`artifact-manifest.json` SHA-256 is
+`680ceb1b834bf0c960574815cf92354a01efdaf9b2afae903ffadc073638d694`.
+
+A privileged WSL preflight separately confirmed CAP_NET_ADMIN, `/dev/net/tun`,
+`ip`, `tc netem`, cgroup v2 and namespace create/delete. The TUN execution
+cells remain explicitly `planned_not_run`; readiness is not a performance pass.
+
 ## Low-memory artifact observations (unattested)
 
 `release/LOW_MEMORY_BUILD_TAGS` defines an additive artifact for low-RAM
