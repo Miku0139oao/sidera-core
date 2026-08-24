@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/Miku0139oao/sidera-core/log"
+	"github.com/sagernet/sing/common/buf"
+	M "github.com/sagernet/sing/common/metadata"
 
 	"github.com/stretchr/testify/require"
 )
@@ -48,6 +50,45 @@ func tcpConnPair(t *testing.T) (*net.TCPConn, *net.TCPConn) {
 		t.Fatal("accept timed out")
 	}
 	return nil, nil
+}
+
+type onePacketReader struct {
+	payload []byte
+	read    bool
+}
+
+func (r *onePacketReader) ReadPacket(buffer *buf.Buffer) (M.Socksaddr, error) {
+	if r.read {
+		return M.Socksaddr{}, io.EOF
+	}
+	r.read = true
+	_, err := buffer.Write(r.payload)
+	return M.Socksaddr{Port: 53}, err
+}
+
+type headroomPacketWriter struct {
+	front   int
+	payload []byte
+}
+
+func (w *headroomPacketWriter) FrontHeadroom() int { return w.front }
+func (w *headroomPacketWriter) WritePacket(buffer *buf.Buffer, _ M.Socksaddr) error {
+	if buffer.Start() < w.front {
+		return errors.New("missing packet headroom")
+	}
+	w.payload = append([]byte(nil), buffer.Bytes()...)
+	buffer.Release()
+	return nil
+}
+
+func TestCopyPacketExactPreservesDestinationHeadroom(t *testing.T) {
+	payload := []byte("packet")
+	reader := &onePacketReader{payload: payload}
+	writer := &headroomPacketWriter{front: 16}
+	n, err := copyPacketExact(writer, reader)
+	require.ErrorIs(t, err, io.EOF)
+	require.EqualValues(t, len(payload), n)
+	require.Equal(t, payload, writer.payload)
 }
 
 func TestConnectionManagerRejectsLateRegistrationsAfterClose(t *testing.T) {
