@@ -31,11 +31,12 @@ import (
 var _ adapter.ConnectionManager = (*ConnectionManager)(nil)
 
 type ConnectionManager struct {
-	logger      logger.ContextLogger
-	access      sync.Mutex
-	connections list.List[io.Closer]
-	relayGroup  sync.WaitGroup
-	closed      bool
+	logger         logger.ContextLogger
+	access         sync.Mutex
+	connections    list.List[io.Closer]
+	operationGroup sync.WaitGroup
+	relayGroup     sync.WaitGroup
+	closed         bool
 }
 
 func NewConnectionManager(logger logger.ContextLogger) *ConnectionManager {
@@ -87,6 +88,7 @@ func (m *ConnectionManager) Close() error {
 	for _, closer := range closers {
 		common.Close(closer)
 	}
+	m.operationGroup.Wait()
 	m.relayGroup.Wait()
 	return nil
 }
@@ -124,6 +126,11 @@ func (m *ConnectionManager) TrackPacketConn(conn net.PacketConn) net.PacketConn 
 }
 
 func (m *ConnectionManager) NewConnection(ctx context.Context, this N.Dialer, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
+	if !m.beginOperation() {
+		N.CloseOnHandshakeFailure(conn, onClose, net.ErrClosed)
+		return
+	}
+	defer m.operationGroup.Done()
 	ctx = adapter.WithContext(ctx, &metadata)
 	var (
 		remoteConn net.Conn
@@ -199,6 +206,11 @@ func (m *ConnectionManager) NewConnection(ctx context.Context, this N.Dialer, co
 }
 
 func (m *ConnectionManager) NewPacketConnection(ctx context.Context, this N.Dialer, conn N.PacketConn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
+	if !m.beginOperation() {
+		N.CloseOnHandshakeFailure(conn, onClose, net.ErrClosed)
+		return
+	}
+	defer m.operationGroup.Done()
 	ctx = adapter.WithContext(ctx, &metadata)
 	var (
 		remotePacketConn   net.PacketConn
@@ -326,6 +338,16 @@ func (m *ConnectionManager) NewPacketConnection(ctx context.Context, this N.Dial
 		defer m.relayGroup.Done()
 		m.packetConnectionCopy(ctx, destination, conn, true, &done, onClose)
 	}()
+}
+
+func (m *ConnectionManager) beginOperation() bool {
+	m.access.Lock()
+	defer m.access.Unlock()
+	if m.closed {
+		return false
+	}
+	m.operationGroup.Add(1)
+	return true
 }
 
 func (m *ConnectionManager) beginRelays(count int) bool {

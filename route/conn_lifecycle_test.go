@@ -91,6 +91,26 @@ func TestCopyPacketExactPreservesDestinationHeadroom(t *testing.T) {
 	require.Equal(t, payload, writer.payload)
 }
 
+func TestConnectionManagerCloseJoinsSetupOperations(t *testing.T) {
+	manager := NewConnectionManager(log.NewNOPFactory().NewLogger("connection-test"))
+	require.True(t, manager.beginOperation())
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- manager.Close() }()
+	select {
+	case err := <-closeDone:
+		t.Fatalf("Close returned before setup completion: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	manager.operationGroup.Done()
+	select {
+	case err := <-closeDone:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("Close did not join setup completion")
+	}
+	require.False(t, manager.beginOperation())
+}
+
 func TestConnectionManagerCloseJoinsActiveRelays(t *testing.T) {
 	manager := NewConnectionManager(log.NewNOPFactory().NewLogger("connection-test"))
 	require.True(t, manager.beginRelays(1))
