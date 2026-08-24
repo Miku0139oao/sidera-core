@@ -145,6 +145,47 @@ func TestLateConstructorFailureClosesPreviouslyCreatedChild(t *testing.T) {
 	}
 }
 
+func TestBoxCloseDefersBusyManagerWithoutDeadlock(t *testing.T) {
+	inboundRegistry := boxInbound.NewRegistry()
+	var instance *box.Box
+	boxInbound.Register[option.StubOptions](inboundRegistry, "box-reentry-test", func(context.Context, adapter.Router, log.ContextLogger, string, option.StubOptions) (adapter.Inbound, error) {
+		return &boxReentryTestInbound{
+			Adapter: boxInbound.NewAdapter("box-reentry-test", "test"),
+			closeFunc: func() error {
+				result := make(chan error, 1)
+				go func() { result <- instance.Close() }()
+				select {
+				case err := <-result:
+					return err
+				case <-time.After(time.Second):
+					return errors.New("Box.Close deadlocked during manager callback")
+				}
+			},
+		}, nil
+	})
+	ctx := include.Context(t.Context())
+	ctx = service.ContextWith[adapter.InboundRegistry](ctx, inboundRegistry)
+	ctx = service.ContextWith[option.InboundOptionsRegistry](ctx, inboundRegistry)
+	var err error
+	instance, err = box.New(box.Options{
+		Context: ctx,
+		Options: option.Options{Inbounds: []option.Inbound{{Type: "box-reentry-test", Tag: "test", Options: &option.StubOptions{}}}},
+	})
+	require.NoError(t, err)
+	removeDone := make(chan error, 1)
+	go func() { removeDone <- instance.Inbound().Remove("test") }()
+	select {
+	case err = <-removeDone:
+		require.ErrorIs(t, err, adapter.ErrLifecycleBusy)
+	case <-time.After(time.Second):
+		t.Fatal("manager removal deadlocked with Box.Close reentry")
+	}
+	require.Eventually(t, func() bool {
+		_, loaded := instance.Inbound().Get("test")
+		return !loaded
+	}, time.Second, 10*time.Millisecond)
+}
+
 func TestCloseQuiescesTrafficProducersBeforeServiceFinalization(t *testing.T) {
 	var events []string
 	serviceRegistry := boxService.NewRegistry()
@@ -278,6 +319,14 @@ func TestRuntimeCommitRollsBackEarlierCommits(t *testing.T) {
 		"commit:first", "commit:second", "rollback:first", "rollback:snapshot",
 	}, events)
 }
+
+type boxReentryTestInbound struct {
+	boxInbound.Adapter
+	closeFunc func() error
+}
+
+func (i *boxReentryTestInbound) Start(adapter.StartStage) error { return nil }
+func (i *boxReentryTestInbound) Close() error                   { return i.closeFunc() }
 
 type producerQuiescenceTestService struct {
 	boxService.Adapter

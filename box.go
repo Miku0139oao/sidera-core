@@ -666,6 +666,7 @@ func (s *Box) start() error {
 }
 
 func (s *Box) Close() (err error) {
+	var retryClose bool
 	s.closeAccess.Lock()
 	if s.closed {
 		closeErr := s.closeErr
@@ -684,16 +685,27 @@ func (s *Box) Close() (err error) {
 	defer func() {
 		panicValue := recover()
 		s.closeAccess.Lock()
-		s.closeErr = err
 		s.closing = false
-		s.closed = true
+		if retryClose {
+			s.closeErr = nil
+			s.closed = false
+		} else {
+			s.closeErr = err
+			s.closed = true
+		}
 		s.closeAccess.Unlock()
+		if retryClose {
+			time.AfterFunc(10*time.Millisecond, func() { _ = s.Close() })
+		}
 		if panicValue != nil {
 			panic(panicValue)
 		}
 	}()
 	var closePanic any
 	closePanic, err = s.closeResources()
+	if errors.Is(err, adapter.ErrLifecycleBusy) {
+		retryClose = true
+	}
 	if closePanic != nil {
 		panic(closePanic)
 	}
@@ -705,10 +717,7 @@ func (s *Box) closeResources() (firstPanic any, err error) {
 		close(s.done)
 		s.done = nil
 	}
-	closeResource := func(name string, closeFunc func() error) {
-		done := adapter.LogElapsed(s.logger, "close ", name)
-		panicValue, childErr := closeBoxResource(closeFunc)
-		done()
+	recordCloseResult := func(name string, panicValue any, childErr error) {
 		if childErr != nil {
 			err = errors.Join(err, E.Cause(childErr, "close ", name))
 		}
@@ -720,40 +729,47 @@ func (s *Box) closeResources() (firstPanic any, err error) {
 			}
 		}
 	}
-	retryManagerClose := func(closeFunc func() error) error {
-		for {
-			err := closeFunc()
-			if !errors.Is(err, adapter.ErrLifecycleBusy) {
-				return err
-			}
-			time.Sleep(time.Millisecond)
+	closeResource := func(name string, closeFunc func() error) {
+		done := adapter.LogElapsed(s.logger, "close ", name)
+		panicValue, childErr := closeBoxResource(closeFunc)
+		done()
+		recordCloseResult(name, panicValue, childErr)
+	}
+	closeManagerResource := func(name string, closeFunc func() error) bool {
+		done := adapter.LogElapsed(s.logger, "close ", name)
+		panicValue, childErr := closeBoxResource(closeFunc)
+		done()
+		if errors.Is(childErr, adapter.ErrLifecycleBusy) {
+			return false
 		}
+		recordCloseResult(name, panicValue, childErr)
+		return true
 	}
 	if s.debugHTTPServer != nil {
 		closeResource("debug HTTP server", s.debugHTTPServer.Close)
 		s.debugHTTPServer = nil
 	}
-	if s.service != nil {
-		closeResource("service admission", func() error { return retryManagerClose(s.service.StopAdmission) })
+	if s.service != nil && !closeManagerResource("service admission", s.service.StopAdmission) {
+		return firstPanic, adapter.ErrLifecycleBusy
 	}
-	if s.inbound != nil {
-		closeResource("inbound", func() error { return retryManagerClose(s.inbound.Close) })
+	if s.inbound != nil && !closeManagerResource("inbound", s.inbound.Close) {
+		return firstPanic, adapter.ErrLifecycleBusy
 	}
 	if s.connection != nil {
 		closeResource("connection", s.connection.Close)
 		s.connection = nil
 	}
-	if s.service != nil {
-		closeResource("service", func() error { return retryManagerClose(s.service.CloseAfterProducerQuiescence) })
+	if s.service != nil && !closeManagerResource("service", s.service.CloseAfterProducerQuiescence) {
+		return firstPanic, adapter.ErrLifecycleBusy
 	}
-	if s.certificateProvider != nil {
-		closeResource("certificate-provider", func() error { return retryManagerClose(s.certificateProvider.Close) })
+	if s.certificateProvider != nil && !closeManagerResource("certificate-provider", s.certificateProvider.Close) {
+		return firstPanic, adapter.ErrLifecycleBusy
 	}
-	if s.endpoint != nil {
-		closeResource("endpoint", func() error { return retryManagerClose(s.endpoint.Close) })
+	if s.endpoint != nil && !closeManagerResource("endpoint", s.endpoint.Close) {
+		return firstPanic, adapter.ErrLifecycleBusy
 	}
-	if s.outbound != nil {
-		closeResource("outbound", func() error { return retryManagerClose(s.outbound.Close) })
+	if s.outbound != nil && !closeManagerResource("outbound", s.outbound.Close) {
+		return firstPanic, adapter.ErrLifecycleBusy
 	}
 	if s.router != nil {
 		closeResource("router", s.router.Close)
@@ -761,8 +777,8 @@ func (s *Box) closeResources() (firstPanic any, err error) {
 	if s.dnsRouter != nil {
 		closeResource("dns-router", s.dnsRouter.Close)
 	}
-	if s.dnsTransport != nil {
-		closeResource("dns-transport", func() error { return retryManagerClose(s.dnsTransport.Close) })
+	if s.dnsTransport != nil && !closeManagerResource("dns-transport", s.dnsTransport.Close) {
+		return firstPanic, adapter.ErrLifecycleBusy
 	}
 	if s.network != nil {
 		closeResource("network", s.network.Close)
