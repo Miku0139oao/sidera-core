@@ -3,10 +3,8 @@ package cachefile
 import (
 	"net/netip"
 	"os"
-	"time"
 
 	"github.com/Miku0139oao/sidera-core/adapter"
-	C "github.com/Miku0139oao/sidera-core/constant"
 	"github.com/sagernet/bbolt"
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
@@ -59,13 +57,37 @@ func (c *CacheFile) FakeIPSaveMetadata(metadata *adapter.FakeIPMetadata) error {
 }
 
 func (c *CacheFile) FakeIPSaveMetadataAsync(metadata *adapter.FakeIPMetadata) {
-	if c.saveMetadataTimer == nil {
-		c.saveMetadataTimer = time.AfterFunc(C.FakeIPMetadataSaveInterval, func() {
-			_ = c.FakeIPSaveMetadata(metadata)
-		})
-	} else {
-		c.saveMetadataTimer.Reset(C.FakeIPMetadataSaveInterval)
+	if metadata == nil {
+		return
 	}
+	c.persistenceAccess.Lock()
+	if !c.persistenceStarted || c.persistenceClosing {
+		shouldLog := c.rejectPersistenceLocked()
+		c.persistenceAccess.Unlock()
+		logPersistenceRejection(c.logger, "FakeIP metadata", os.ErrClosed, shouldLog)
+		return
+	}
+	entry := c.metadataSave
+	additionalEntries := 0
+	additionalBytes := 0
+	if entry.metadata == nil {
+		additionalEntries = 1
+		additionalBytes = metadataPersistenceSize
+	}
+	if !c.queueAvailableLocked(additionalEntries, additionalBytes) {
+		shouldLog := c.rejectPersistenceLocked()
+		c.persistenceAccess.Unlock()
+		logPersistenceRejection(c.logger, "FakeIP metadata", errPersistenceOverloaded, shouldLog)
+		return
+	}
+	entry.metadata = cloneFakeIPMetadata(metadata)
+	entry.sequence++
+	entry.generation = c.fakeIPGeneration
+	c.metadataSave = entry
+	c.pendingEntries += additionalEntries
+	c.pendingBytes += additionalBytes
+	c.persistenceAccess.Unlock()
+	c.notifyPersistenceWorker()
 }
 
 func (c *CacheFile) FakeIPStore(address netip.Addr, domain string) error {
@@ -96,44 +118,57 @@ func (c *CacheFile) FakeIPStore(address netip.Addr, domain string) error {
 	})
 }
 
-func (c *CacheFile) FakeIPStoreAsync(address netip.Addr, domain string, logger logger.Logger) {
-	c.saveFakeIPAccess.Lock()
-	if oldDomain, loaded := c.saveDomain[address]; loaded {
+func (c *CacheFile) FakeIPStoreAsync(address netip.Addr, domain string, targetLogger logger.Logger) {
+	c.persistenceAccess.Lock()
+	if !c.persistenceStarted || c.persistenceClosing {
+		shouldLog := c.rejectPersistenceLocked()
+		c.persistenceAccess.Unlock()
+		logPersistenceRejection(targetLogger, "FakeIP", os.ErrClosed, shouldLog)
+		return
+	}
+	entry, loaded := c.saveFakeIP[address]
+	additionalEntries := 0
+	additionalBytes := len(domain) - len(entry.domain)
+	if !loaded {
+		additionalEntries = 1
+		additionalBytes = len(domain) + 64
+	}
+	if !c.queueAvailableLocked(additionalEntries, additionalBytes) {
+		shouldLog := c.rejectPersistenceLocked()
+		c.persistenceAccess.Unlock()
+		logPersistenceRejection(targetLogger, "FakeIP", errPersistenceOverloaded, shouldLog)
+		return
+	}
+	if loaded && entry.domain != domain {
 		if address.Is4() {
-			delete(c.saveAddress4, oldDomain)
-		} else {
-			delete(c.saveAddress6, oldDomain)
+			if savedAddress, exists := c.saveAddress4[entry.domain]; exists && savedAddress == address {
+				delete(c.saveAddress4, entry.domain)
+			}
+		} else if savedAddress, exists := c.saveAddress6[entry.domain]; exists && savedAddress == address {
+			delete(c.saveAddress6, entry.domain)
 		}
 	}
-	c.saveDomain[address] = domain
+	entry.domain = domain
+	entry.sequence++
+	entry.generation = c.fakeIPGeneration
+	c.saveFakeIP[address] = entry
 	if address.Is4() {
 		c.saveAddress4[domain] = address
 	} else {
 		c.saveAddress6[domain] = address
 	}
-	c.saveFakeIPAccess.Unlock()
-	go func() {
-		err := c.FakeIPStore(address, domain)
-		if err != nil {
-			logger.Warn("save FakeIP cache: ", err)
-		}
-		c.saveFakeIPAccess.Lock()
-		delete(c.saveDomain, address)
-		if address.Is4() {
-			delete(c.saveAddress4, domain)
-		} else {
-			delete(c.saveAddress6, domain)
-		}
-		c.saveFakeIPAccess.Unlock()
-	}()
+	c.pendingEntries += additionalEntries
+	c.pendingBytes += additionalBytes
+	c.persistenceAccess.Unlock()
+	c.notifyPersistenceWorker()
 }
 
 func (c *CacheFile) FakeIPLoad(address netip.Addr) (string, bool) {
-	c.saveFakeIPAccess.RLock()
-	cachedDomain, cached := c.saveDomain[address]
-	c.saveFakeIPAccess.RUnlock()
+	c.persistenceAccess.Lock()
+	entry, cached := c.saveFakeIP[address]
+	c.persistenceAccess.Unlock()
 	if cached {
-		return cachedDomain, true
+		return entry.domain, true
 	}
 	var domain string
 	_ = c.view(func(tx *bbolt.Tx) error {
@@ -152,13 +187,13 @@ func (c *CacheFile) FakeIPLoadDomain(domain string, isIPv6 bool) (netip.Addr, bo
 		cachedAddress netip.Addr
 		cached        bool
 	)
-	c.saveFakeIPAccess.RLock()
+	c.persistenceAccess.Lock()
 	if !isIPv6 {
 		cachedAddress, cached = c.saveAddress4[domain]
 	} else {
 		cachedAddress, cached = c.saveAddress6[domain]
 	}
-	c.saveFakeIPAccess.RUnlock()
+	c.persistenceAccess.Unlock()
 	if cached {
 		return cachedAddress, true
 	}
@@ -180,6 +215,23 @@ func (c *CacheFile) FakeIPLoadDomain(domain string, isIPv6 bool) (netip.Addr, bo
 }
 
 func (c *CacheFile) FakeIPReset() error {
+	c.persistenceOperation.Lock()
+	defer c.persistenceOperation.Unlock()
+	c.persistenceAccess.Lock()
+	c.fakeIPGeneration++
+	for _, entry := range c.saveFakeIP {
+		c.pendingEntries--
+		c.pendingBytes -= fakeIPPersistenceSize(entry)
+	}
+	clear(c.saveFakeIP)
+	clear(c.saveAddress4)
+	clear(c.saveAddress6)
+	if c.metadataSave.metadata != nil {
+		c.pendingEntries--
+		c.pendingBytes -= metadataPersistenceSize
+		c.metadataSave = saveMetadataEntry{}
+	}
+	c.persistenceAccess.Unlock()
 	return c.batch(func(tx *bbolt.Tx) error {
 		err := tx.DeleteBucket(bucketFakeIP)
 		if err != nil {

@@ -2,11 +2,15 @@ package ocm
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"os"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -61,10 +65,21 @@ type AggregatedUsage struct {
 	ctx          context.Context
 	filePath     string
 	logger       log.ContextLogger
-	lastSaveTime time.Time
-	pendingSave  bool
-	saveTimer    *time.Timer
-	saveMutex    sync.Mutex
+
+	saveMutex      sync.Mutex
+	saveWriter     func([]byte) error
+	workerAccess   sync.Mutex
+	workerWake     chan struct{}
+	workerDone     chan struct{}
+	closeDone      chan struct{}
+	workerStarted  bool
+	closing        bool
+	closed         bool
+	dirty          bool
+	generation     uint64
+	lastSaveTime   time.Time
+	saveInterval   time.Duration
+	persistenceErr error
 }
 
 type UsageStatsJSON struct {
@@ -867,6 +882,15 @@ func roundCost(cost float64) float64 {
 	return math.Round(cost*100) / 100
 }
 
+const (
+	maxRetainedUsagePeriods      = 52
+	maxRetainedUsageCombinations = 4096
+	maxUsageFileBytes            = 64 << 20
+	maxUsageModelBytes           = 256
+	maxUsageUserBytes            = 256
+	maxUsageServiceTierBytes     = 64
+)
+
 func normalizeCombinations(combinations []CostCombination) {
 	for index := range combinations {
 		combinations[index].ServiceTier = normalizeServiceTier(combinations[index].ServiceTier)
@@ -879,7 +903,88 @@ func normalizeCombinations(combinations []CostCombination) {
 	}
 }
 
-func addUsageToCombinations(combinations *[]CostCombination, model string, serviceTier string, contextWindow int, weekStartUnix int64, user string, inputTokens, outputTokens, cachedTokens int64) {
+func mergeUsageStats(target *UsageStats, source UsageStats) {
+	target.RequestCount += source.RequestCount
+	target.InputTokens += source.InputTokens
+	target.OutputTokens += source.OutputTokens
+	target.CachedTokens += source.CachedTokens
+}
+
+func mergeCostCombination(target *CostCombination, source CostCombination) {
+	mergeUsageStats(&target.Total, source.Total)
+	if target.ByUser == nil {
+		target.ByUser = make(map[string]UsageStats)
+	}
+	for user, sourceStats := range source.ByUser {
+		targetStats := target.ByUser[user]
+		mergeUsageStats(&targetStats, sourceStats)
+		target.ByUser[user] = targetStats
+	}
+}
+
+func pruneUsagePeriods(combinations *[]CostCombination) {
+	weekSet := make(map[int64]struct{})
+	for _, combination := range *combinations {
+		if combination.WeekStartUnix > 0 {
+			weekSet[combination.WeekStartUnix] = struct{}{}
+		}
+	}
+	if len(weekSet) <= maxRetainedUsagePeriods {
+		return
+	}
+	weeks := make([]int64, 0, len(weekSet))
+	for week := range weekSet {
+		weeks = append(weeks, week)
+	}
+	sort.Slice(weeks, func(i, j int) bool { return weeks[i] > weeks[j] })
+	retainedWeeks := make(map[int64]struct{}, maxRetainedUsagePeriods)
+	for _, week := range weeks[:maxRetainedUsagePeriods] {
+		retainedWeeks[week] = struct{}{}
+	}
+
+	type rollupKey struct {
+		model         string
+		serviceTier   string
+		contextWindow int
+	}
+	result := make([]CostCombination, 0, len(*combinations))
+	rollups := make(map[rollupKey]int)
+	for _, combination := range *combinations {
+		if combination.WeekStartUnix > 0 {
+			if _, retained := retainedWeeks[combination.WeekStartUnix]; !retained {
+				continue
+			}
+		}
+		if combination.WeekStartUnix == 0 {
+			key := rollupKey{combination.Model, combination.ServiceTier, combination.ContextWindow}
+			if index, exists := rollups[key]; exists {
+				mergeCostCombination(&result[index], combination)
+				continue
+			}
+			rollups[key] = len(result)
+		}
+		result = append(result, combination)
+	}
+	for _, combination := range *combinations {
+		if combination.WeekStartUnix <= 0 {
+			continue
+		}
+		if _, retained := retainedWeeks[combination.WeekStartUnix]; retained {
+			continue
+		}
+		key := rollupKey{combination.Model, combination.ServiceTier, combination.ContextWindow}
+		if index, exists := rollups[key]; exists {
+			mergeCostCombination(&result[index], combination)
+			continue
+		}
+		combination.WeekStartUnix = 0
+		rollups[key] = len(result)
+		result = append(result, combination)
+	}
+	*combinations = result
+}
+
+func addUsageToCombinations(combinations *[]CostCombination, model string, serviceTier string, contextWindow int, weekStartUnix int64, user string, inputTokens, outputTokens, cachedTokens int64) bool {
 	var matchedCombination *CostCombination
 	for index := range *combinations {
 		combination := &(*combinations)[index]
@@ -894,6 +999,9 @@ func addUsageToCombinations(combinations *[]CostCombination, model string, servi
 	}
 
 	if matchedCombination == nil {
+		if len(*combinations) >= maxRetainedUsageCombinations {
+			return false
+		}
 		newCombination := CostCombination{
 			Model:         model,
 			ServiceTier:   serviceTier,
@@ -919,6 +1027,7 @@ func addUsageToCombinations(combinations *[]CostCombination, model string, servi
 		userStats.CachedTokens += cachedTokens
 		matchedCombination.ByUser[user] = userStats
 	}
+	return true
 }
 
 func buildCombinationJSON(combinations []CostCombination, aggregateUserCosts map[string]float64) ([]CostCombinationJSON, float64) {
@@ -1075,12 +1184,23 @@ func (u *AggregatedUsage) Load() error {
 	u.LastUpdated = time.Time{}
 	u.Combinations = nil
 
-	data, err := filemanager.ReadFile(u.ctx, u.filePath)
+	file, err := filemanager.OpenFile(u.ctx, u.filePath, os.O_RDONLY, 0)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
 		}
 		return err
+	}
+	data, oversized, readErr := readBoundedBody(file, maxUsageFileBytes)
+	closeErr := file.Close()
+	if readErr != nil {
+		return readErr
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	if oversized {
+		return E.New("usage history file exceeds limit")
 	}
 
 	var temp struct {
@@ -1093,34 +1213,53 @@ func (u *AggregatedUsage) Load() error {
 		return err
 	}
 
+	normalizeCombinations(temp.Combinations)
+	pruneUsagePeriods(&temp.Combinations)
+	if len(temp.Combinations) > maxRetainedUsageCombinations {
+		return E.New("usage history combination limit exceeded")
+	}
 	u.LastUpdated = temp.LastUpdated
 	u.Combinations = temp.Combinations
-	normalizeCombinations(u.Combinations)
-
 	return nil
 }
 
 func (u *AggregatedUsage) Save() error {
-	jsonData := u.ToJSON()
+	u.saveMutex.Lock()
+	defer u.saveMutex.Unlock()
 
+	jsonData := u.ToJSON()
 	data, err := json.MarshalIndent(jsonData, "", "  ")
 	if err != nil {
 		return err
 	}
+	if u.saveWriter != nil {
+		return u.saveWriter(data)
+	}
+	return u.writeUsageFile(data)
+}
 
-	tmpFile := u.filePath + ".tmp"
-	err = filemanager.WriteFile(u.ctx, tmpFile, data, 0o644)
+func (u *AggregatedUsage) writeUsageFile(data []byte) error {
+	var randomSuffix [8]byte
+	if _, err := rand.Read(randomSuffix[:]); err != nil {
+		return err
+	}
+	tmpFile := u.filePath + ".tmp." + hex.EncodeToString(randomSuffix[:])
+	file, err := filemanager.OpenFile(u.ctx, tmpFile, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 	if err != nil {
 		return err
 	}
-	defer filemanager.Remove(u.ctx, tmpFile)
-	err = filemanager.Rename(u.ctx, tmpFile, u.filePath)
-	if err == nil {
-		u.saveMutex.Lock()
-		u.lastSaveTime = time.Now()
-		u.saveMutex.Unlock()
+	_, writeErr := file.Write(data)
+	closeErr := file.Close()
+	if writeErr != nil {
+		_ = filemanager.Remove(u.ctx, tmpFile)
+		return writeErr
 	}
-	return err
+	if closeErr != nil {
+		_ = filemanager.Remove(u.ctx, tmpFile)
+		return closeErr
+	}
+	defer filemanager.Remove(u.ctx, tmpFile)
+	return filemanager.Rename(u.ctx, tmpFile, u.filePath)
 }
 
 func (u *AggregatedUsage) AddUsage(model string, contextWindow int, inputTokens, outputTokens, cachedTokens int64, serviceTier string, user string) error {
@@ -1131,6 +1270,15 @@ func (u *AggregatedUsage) AddUsageWithCycleHint(model string, contextWindow int,
 	if model == "" {
 		return E.New("model cannot be empty")
 	}
+	if len(model) > maxUsageModelBytes {
+		return E.New("model exceeds usage history limit")
+	}
+	if len(user) > maxUsageUserBytes {
+		return E.New("user exceeds usage history limit")
+	}
+	if len(serviceTier) > maxUsageServiceTierBytes {
+		return E.New("service tier exceeds usage history limit")
+	}
 	if contextWindow <= 0 {
 		return E.New("contextWindow must be positive")
 	}
@@ -1140,63 +1288,156 @@ func (u *AggregatedUsage) AddUsageWithCycleHint(model string, contextWindow int,
 		observedAt = time.Now()
 	}
 
+	u.workerAccess.Lock()
+	if u.closing || u.closed {
+		u.workerAccess.Unlock()
+		return os.ErrClosed
+	}
 	u.mutex.Lock()
-	defer u.mutex.Unlock()
-
-	u.LastUpdated = observedAt
 	weekStartUnix := deriveWeekStartUnix(cycleHint)
-
-	addUsageToCombinations(&u.Combinations, model, normalizedServiceTier, contextWindow, weekStartUnix, user, inputTokens, outputTokens, cachedTokens)
-
-	go u.scheduleSave()
-
+	pruneUsagePeriods(&u.Combinations)
+	if !addUsageToCombinations(&u.Combinations, model, normalizedServiceTier, contextWindow, weekStartUnix, user, inputTokens, outputTokens, cachedTokens) {
+		u.mutex.Unlock()
+		u.workerAccess.Unlock()
+		return E.New("usage history combination limit reached")
+	}
+	pruneUsagePeriods(&u.Combinations)
+	u.LastUpdated = observedAt
+	u.mutex.Unlock()
+	u.generation++
+	u.dirty = true
+	u.startSaveWorkerLocked()
+	u.workerAccess.Unlock()
+	u.notifySaveWorker()
 	return nil
 }
 
-func (u *AggregatedUsage) scheduleSave() {
-	const saveInterval = time.Minute
-
-	u.saveMutex.Lock()
-	defer u.saveMutex.Unlock()
-
-	timeSinceLastSave := time.Since(u.lastSaveTime)
-
-	if timeSinceLastSave >= saveInterval {
-		go u.saveAsync()
-		return
-	}
-
-	if u.pendingSave {
-		return
-	}
-
-	u.pendingSave = true
-	remainingTime := saveInterval - timeSinceLastSave
-
-	u.saveTimer = time.AfterFunc(remainingTime, func() {
-		u.saveMutex.Lock()
-		u.pendingSave = false
-		u.saveMutex.Unlock()
-		u.saveAsync()
-	})
+func (u *AggregatedUsage) startSaveWorker() {
+	u.workerAccess.Lock()
+	u.startSaveWorkerLocked()
+	u.workerAccess.Unlock()
 }
 
-func (u *AggregatedUsage) saveAsync() {
-	err := u.Save()
-	if err != nil {
-		if u.logger != nil {
-			u.logger.Error("save usage statistics: ", err)
+func (u *AggregatedUsage) startSaveWorkerLocked() {
+	if u.workerStarted || u.closing || u.closed {
+		return
+	}
+	if u.workerWake == nil {
+		u.workerWake = make(chan struct{}, 1)
+	}
+	if u.workerDone == nil {
+		u.workerDone = make(chan struct{})
+	}
+	if u.closeDone == nil {
+		u.closeDone = make(chan struct{})
+	}
+	if u.saveInterval <= 0 {
+		u.saveInterval = time.Minute
+	}
+	u.workerStarted = true
+	go u.runSaveWorker()
+}
+
+func (u *AggregatedUsage) notifySaveWorker() {
+	u.workerAccess.Lock()
+	wake := u.workerWake
+	u.workerAccess.Unlock()
+	if wake == nil {
+		return
+	}
+	select {
+	case wake <- struct{}{}:
+	default:
+	}
+}
+
+func (u *AggregatedUsage) runSaveWorker() {
+	defer close(u.workerDone)
+	for {
+		u.workerAccess.Lock()
+		if u.closing {
+			u.workerAccess.Unlock()
+			return
+		}
+		if !u.dirty {
+			wake := u.workerWake
+			u.workerAccess.Unlock()
+			<-wake
+			continue
+		}
+		delay := u.saveInterval - time.Since(u.lastSaveTime)
+		if u.lastSaveTime.IsZero() || delay <= 0 {
+			targetGeneration := u.generation
+			u.dirty = false
+			u.workerAccess.Unlock()
+			err := u.Save()
+			u.workerAccess.Lock()
+			u.lastSaveTime = time.Now()
+			if err != nil || u.generation != targetGeneration {
+				u.dirty = true
+			}
+			if err != nil {
+				u.persistenceErr = err
+			}
+			u.workerAccess.Unlock()
+			if err != nil && u.logger != nil {
+				u.logger.Error("save usage statistics: ", err)
+			}
+			continue
+		}
+		wake := u.workerWake
+		u.workerAccess.Unlock()
+		timer := time.NewTimer(delay)
+		select {
+		case <-wake:
+			timer.Stop()
+		case <-timer.C:
 		}
 	}
 }
 
-func (u *AggregatedUsage) cancelPendingSave() {
-	u.saveMutex.Lock()
-	defer u.saveMutex.Unlock()
-
-	if u.saveTimer != nil {
-		u.saveTimer.Stop()
-		u.saveTimer = nil
+func (u *AggregatedUsage) closeAndSave() error {
+	u.workerAccess.Lock()
+	if u.closing || u.closed {
+		done := u.closeDone
+		u.workerAccess.Unlock()
+		if done != nil {
+			<-done
+		}
+		u.workerAccess.Lock()
+		err := u.persistenceErr
+		u.workerAccess.Unlock()
+		return err
 	}
-	u.pendingSave = false
+	if u.closeDone == nil {
+		u.closeDone = make(chan struct{})
+	}
+	u.closing = true
+	workerStarted := u.workerStarted
+	workerDone := u.workerDone
+	wake := u.workerWake
+	u.workerAccess.Unlock()
+	if wake != nil {
+		select {
+		case wake <- struct{}{}:
+		default:
+		}
+	}
+	if workerStarted {
+		<-workerDone
+	}
+
+	finalErr := u.Save()
+	u.workerAccess.Lock()
+	if finalErr == nil {
+		u.persistenceErr = nil
+	} else {
+		u.persistenceErr = errors.Join(u.persistenceErr, finalErr)
+	}
+	u.closed = true
+	u.closing = false
+	close(u.closeDone)
+	err := u.persistenceErr
+	u.workerAccess.Unlock()
+	return err
 }

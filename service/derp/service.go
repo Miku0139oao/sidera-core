@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -15,6 +16,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Miku0139oao/sidera-core/adapter"
@@ -64,6 +66,19 @@ type Service struct {
 	stunListener         *listener.Listener
 	tlsConfig            tls.ServerConfig
 	server               *derpserver.Server
+	httpServer           *http.Server
+	stunConn             *net.UDPConn
+	meshClients          []*derphttp.Client
+	meshMonitors         []*netmon.Monitor
+	verifyHTTPClients    []*http.Client
+	runContext           context.Context
+	runCancel            context.CancelFunc
+	workerGroup          sync.WaitGroup
+	lifecycleAccess      sync.Mutex
+	closing              bool
+	closed               bool
+	closeDone            chan struct{}
+	closeErr             error
 	configPath           string
 	verifyClientEndpoint []string
 	verifyClientURL      []*option.DERPVerifyClientURLOptions
@@ -131,20 +146,32 @@ func NewService(ctx context.Context, logger log.ContextLogger, tag string, optio
 		meshKey:              options.MeshPSK,
 		meshKeyPath:          options.MeshPSKFile,
 		meshWith:             options.MeshWith,
+		closeDone:            make(chan struct{}),
 	}, nil
 }
 
 func (d *Service) Start(stage adapter.StartStage) error {
+	d.lifecycleAccess.Lock()
+	defer d.lifecycleAccess.Unlock()
+	if d.closing || d.closed {
+		return os.ErrClosed
+	}
+
 	switch stage {
 	case adapter.StartStateStart:
+		if d.runContext != nil {
+			return d.failStartLocked(E.New("DERP service already started"))
+		}
+		d.runContext, d.runCancel = context.WithCancel(d.ctx)
 		config, err := readDERPConfig(d.ctx, filemanager.BasePath(d.ctx, d.configPath))
 		if err != nil {
-			return err
+			return d.failStartLocked(err)
 		}
 
 		server := derpserver.New(config.PrivateKey, func(format string, args ...any) {
 			d.logger.Debug(fmt.Sprintf(format, args...))
 		})
+		d.server = server
 
 		if len(d.verifyClientURL) > 0 {
 			var httpClients []*http.Client
@@ -153,11 +180,12 @@ func (d *Service) Start(stage adapter.StartStage) error {
 			for index, verifyOptions := range d.verifyClientURL {
 				transport, createErr := httpClientManager.ResolveTransport(d.ctx, d.logger, verifyOptions.HTTPClientOptions)
 				if createErr != nil {
-					return E.Cause(createErr, "verify_client_url[", index, "]")
+					return d.failStartLocked(E.Cause(createErr, "verify_client_url[", index, "]"))
 				}
 				httpClients = append(httpClients, &http.Client{Transport: transport})
 				urls = append(urls, verifyOptions.URL)
 			}
+			d.verifyHTTPClients = httpClients
 			server.SetVerifyClientHTTPClient(httpClients)
 			server.SetVerifyClientURL(urls)
 		}
@@ -165,18 +193,15 @@ func (d *Service) Start(stage adapter.StartStage) error {
 		if d.meshKey != "" {
 			server.SetMeshKey(d.meshKey)
 		} else if d.meshKeyPath != "" {
-			var meshKeyContent []byte
-			meshKeyContent, err = filemanager.ReadFile(d.ctx, d.meshKeyPath)
-			if err != nil {
-				return err
+			meshKeyContent, readErr := filemanager.ReadFile(d.ctx, d.meshKeyPath)
+			if readErr != nil {
+				return d.failStartLocked(readErr)
 			}
-			err = checkMeshKey(string(meshKeyContent))
-			if err != nil {
-				return E.Cause(err, "invalid mesh_psk_path file")
+			if keyErr := checkMeshKey(string(meshKeyContent)); keyErr != nil {
+				return d.failStartLocked(E.Cause(keyErr, "invalid mesh_psk_path file"))
 			}
 			server.SetMeshKey(string(meshKeyContent))
 		}
-		d.server = server
 
 		derpMux := http.NewServeMux()
 		derpHandler := derpserver.Handler(server)
@@ -185,30 +210,28 @@ func (d *Service) Start(stage adapter.StartStage) error {
 
 		homeHandler, ok := getHomeHandler(d.home)
 		if !ok {
-			return E.New("invalid home value: ", d.home)
+			return d.failStartLocked(E.New("invalid home value: ", d.home))
 		}
 
 		derpMux.HandleFunc("/derp/probe", derpserver.ProbeHandler)
 		derpMux.HandleFunc("/derp/latency-check", derpserver.ProbeHandler)
-		derpMux.HandleFunc("/bootstrap-dns", tsweb.BrowserHeaderHandlerFunc(handleBootstrapDNS(d.ctx)))
+		derpMux.HandleFunc("/bootstrap-dns", tsweb.BrowserHeaderHandlerFunc(handleBootstrapDNS(d.runContext)))
 		derpMux.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			tsweb.AddBrowserHeaders(w)
 			homeHandler.ServeHTTP(w, r)
 		}))
 		derpMux.Handle("/robots.txt", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			tsweb.AddBrowserHeaders(w)
-			io.WriteString(w, "User-agent: *\nDisallow: /\n")
+			_, _ = io.WriteString(w, "User-agent: *\nDisallow: /\n")
 		}))
 		derpMux.Handle("/generate_204", http.HandlerFunc(derpserver.ServeNoContent))
 
-		err = d.tlsConfig.Start()
-		if err != nil {
-			return err
+		if err = d.tlsConfig.Start(); err != nil {
+			return d.failStartLocked(err)
 		}
-
 		tcpListener, err := d.listener.ListenTCP()
 		if err != nil {
-			return err
+			return d.failStartLocked(err)
 		}
 		if len(d.tlsConfig.NextProtos()) == 0 {
 			d.tlsConfig.SetNextProtos([]string{http2.NextProtoTLS, "http/1.1"})
@@ -216,34 +239,52 @@ func (d *Service) Start(stage adapter.StartStage) error {
 			d.tlsConfig.SetNextProtos(append([]string{http2.NextProtoTLS}, d.tlsConfig.NextProtos()...))
 		}
 		tcpListener = aTLS.NewListener(tcpListener, d.tlsConfig)
-		httpServer := &http.Server{
-			Handler: h2c.NewHandler(derpMux, &http2.Server{}),
-		}
-		go httpServer.Serve(tcpListener)
+		d.httpServer = &http.Server{Handler: h2c.NewHandler(derpMux, &http2.Server{})}
+		d.workerGroup.Add(1)
+		go func(server *http.Server, listener net.Listener) {
+			defer d.workerGroup.Done()
+			serveErr := server.Serve(listener)
+			if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) && !E.IsClosedOrCanceled(serveErr) {
+				d.logger.Error("DERP HTTP server: ", serveErr)
+			}
+		}(d.httpServer, tcpListener)
 
 		if d.stunListener != nil {
-			stunConn, err := d.stunListener.ListenUDP()
-			if err != nil {
-				return err
+			packetConn, listenErr := d.stunListener.ListenUDP()
+			if listenErr != nil {
+				return d.failStartLocked(listenErr)
 			}
-			go d.loopSTUNPacket(stunConn.(*net.UDPConn))
+			stunConn, isUDP := packetConn.(*net.UDPConn)
+			if !isUDP {
+				_ = packetConn.Close()
+				return d.failStartLocked(E.New("unexpected STUN packet connection type"))
+			}
+			d.stunConn = stunConn
+			d.workerGroup.Add(1)
+			go func() {
+				defer d.workerGroup.Done()
+				d.loopSTUNPacket(stunConn)
+			}()
 		}
 	case adapter.StartStatePostStart:
+		if d.server == nil || d.runContext == nil {
+			return d.failStartLocked(E.New("DERP service is not started"))
+		}
 		if len(d.verifyClientEndpoint) > 0 {
 			var endpoints []*local.Client
 			endpointManager := service.FromContext[adapter.EndpointManager](d.ctx)
 			for _, endpointTag := range d.verifyClientEndpoint {
 				endpoint, loaded := endpointManager.Get(endpointTag)
 				if !loaded {
-					return E.New("verify_client_endpoint: endpoint not found: ", endpointTag)
+					return d.failStartLocked(E.New("verify_client_endpoint: endpoint not found: ", endpointTag))
 				}
 				tsEndpoint, isTailscale := endpoint.(*boxScale.Endpoint)
 				if !isTailscale {
-					return E.New("verify_client_endpoint: endpoint is not Tailscale: ", endpointTag)
+					return d.failStartLocked(E.New("verify_client_endpoint: endpoint is not Tailscale: ", endpointTag))
 				}
 				localClient, err := tsEndpoint.Server().LocalClient()
 				if err != nil {
-					return err
+					return d.failStartLocked(err)
 				}
 				endpoints = append(endpoints, localClient)
 			}
@@ -251,12 +292,11 @@ func (d *Service) Start(stage adapter.StartStage) error {
 		}
 		if len(d.meshWith) > 0 {
 			if !d.server.HasMeshKey() {
-				return E.New("missing mesh psk")
+				return d.failStartLocked(E.New("missing mesh psk"))
 			}
 			for _, options := range d.meshWith {
-				err := d.startMeshWithHost(d.server, options)
-				if err != nil {
-					return err
+				if err := d.startMeshWithHost(d.server, options); err != nil {
+					return d.failStartLocked(err)
 				}
 			}
 		}
@@ -317,8 +357,10 @@ func (d *Service) startMeshWithHost(derpServer *derpserver.Server, server *optio
 	} else {
 		serverURL = "http://" + meshHost + "/derp"
 	}
-	meshClient, err := derphttp.NewClient(derpServer.PrivateKey(), serverURL, logf, netmon.NewStatic())
+	meshMonitor := netmon.NewStatic()
+	meshClient, err := derphttp.NewClient(derpServer.PrivateKey(), serverURL, logf, meshMonitor)
 	if err != nil {
+		_ = meshMonitor.Close()
 		return err
 	}
 	meshClient.TLSConfig = stdConfig
@@ -329,16 +371,108 @@ func (d *Service) startMeshWithHost(derpServer *derpserver.Server, server *optio
 	})
 	add := func(m derp.PeerPresentMessage) { derpServer.AddPacketForwarder(m.Key, meshClient) }
 	remove := func(m derp.PeerGoneMessage) { derpServer.RemovePacketForwarder(m.Peer, meshClient) }
-	notifyError := func(err error) { d.logger.Error(err) }
-	go meshClient.RunWatchConnectionLoop(context.Background(), derpServer.PublicKey(), logf, add, remove, notifyError)
+	notifyError := func(err error) {
+		if !E.IsClosedOrCanceled(err) && d.runContext.Err() == nil {
+			d.logger.Error(err)
+		}
+	}
+	d.meshClients = append(d.meshClients, meshClient)
+	d.meshMonitors = append(d.meshMonitors, meshMonitor)
+	d.workerGroup.Add(1)
+	go func() {
+		defer d.workerGroup.Done()
+		meshClient.RunWatchConnectionLoop(d.runContext, derpServer.PublicKey(), logf, add, remove, notifyError)
+	}()
 	return nil
 }
 
+func (d *Service) failStartLocked(cause error) error {
+	cleanupErr := d.closeResourcesLocked()
+	d.closeErr = cleanupErr
+	d.closed = true
+	d.closing = false
+	select {
+	case <-d.closeDone:
+	default:
+		close(d.closeDone)
+	}
+	return E.Errors(cause, cleanupErr)
+}
+
+func appendDERPCloseError(result *error, closeErr error) {
+	if closeErr == nil || E.IsClosedOrCanceled(closeErr) || errors.Is(closeErr, http.ErrServerClosed) {
+		return
+	}
+	*result = E.Errors(*result, closeErr)
+}
+
+func (d *Service) closeResourcesLocked() error {
+	if d.runCancel != nil {
+		d.runCancel()
+		d.runCancel = nil
+	}
+	var result error
+	if d.httpServer != nil {
+		appendDERPCloseError(&result, d.httpServer.Close())
+		d.httpServer = nil
+	}
+	if d.stunConn != nil {
+		appendDERPCloseError(&result, d.stunConn.Close())
+		d.stunConn = nil
+	}
+	if d.stunListener != nil {
+		appendDERPCloseError(&result, d.stunListener.Close())
+	}
+	if d.listener != nil {
+		appendDERPCloseError(&result, d.listener.Close())
+	}
+	for _, meshClient := range d.meshClients {
+		appendDERPCloseError(&result, meshClient.Close())
+	}
+	d.meshClients = nil
+	d.workerGroup.Wait()
+	for _, meshMonitor := range d.meshMonitors {
+		appendDERPCloseError(&result, meshMonitor.Close())
+	}
+	d.meshMonitors = nil
+	for _, httpClient := range d.verifyHTTPClients {
+		httpClient.CloseIdleConnections()
+	}
+	d.verifyHTTPClients = nil
+	if d.server != nil {
+		appendDERPCloseError(&result, d.server.Close())
+		d.server = nil
+	}
+	if d.tlsConfig != nil {
+		appendDERPCloseError(&result, d.tlsConfig.Close())
+	}
+	d.runContext = nil
+	return result
+}
+
 func (d *Service) Close() error {
-	err := common.Close(
-		common.PtrOrNil(d.listener),
-		d.tlsConfig,
-	)
+	d.lifecycleAccess.Lock()
+	if d.closed {
+		err := d.closeErr
+		d.lifecycleAccess.Unlock()
+		return err
+	}
+	if d.closing {
+		done := d.closeDone
+		d.lifecycleAccess.Unlock()
+		<-done
+		d.lifecycleAccess.Lock()
+		err := d.closeErr
+		d.lifecycleAccess.Unlock()
+		return err
+	}
+	d.closing = true
+	err := d.closeResourcesLocked()
+	d.closeErr = err
+	d.closed = true
+	d.closing = false
+	close(d.closeDone)
+	d.lifecycleAccess.Unlock()
 	return err
 }
 
@@ -498,7 +632,11 @@ func (d *Service) loopSTUNPacket(packetConn *net.UDPConn) {
 			if E.IsClosedOrCanceled(err) {
 				return
 			}
-			time.Sleep(time.Second)
+			select {
+			case <-d.runContext.Done():
+				return
+			case <-time.After(time.Second):
+			}
 			continue
 		}
 		if !stun.Is(buffer[:n]) {

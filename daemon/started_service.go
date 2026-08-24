@@ -337,9 +337,19 @@ func (s *StartedService) SubscribeLog(empty *emptypb.Empty, server grpc.ServerSt
 					Message: message.Message,
 				})
 			}
+			drainLimit := cap(subscription)
+			if drainLimit < 1 {
+				drainLimit = 1
+			}
 		fetch:
-			for {
+			for drained := 1; drained < drainLimit; drained++ {
 				select {
+				case <-s.ctx.Done():
+					return s.ctx.Err()
+				case <-server.Context().Done():
+					return server.Context().Err()
+				case <-done:
+					return nil
 				case message = <-subscription:
 					if message == nil {
 						rawMessage.Messages = nil
@@ -754,9 +764,19 @@ func (s *StartedService) SubscribeConnections(request *SubscribeConnectionsReque
 			if protoEvent := s.applyConnectionEvent(event, connectionSnapshots); protoEvent != nil {
 				pendingEvents = append(pendingEvents, protoEvent)
 			}
+			drainLimit := cap(subscription)
+			if drainLimit < 1 {
+				drainLimit = 1
+			}
 		drain:
-			for {
+			for drained := 1; drained < drainLimit; drained++ {
 				select {
+				case <-s.ctx.Done():
+					return s.ctx.Err()
+				case <-server.Context().Done():
+					return server.Context().Err()
+				case <-done:
+					return nil
 				case event = <-subscription:
 					if protoEvent := s.applyConnectionEvent(event, connectionSnapshots); protoEvent != nil {
 						pendingEvents = append(pendingEvents, protoEvent)
