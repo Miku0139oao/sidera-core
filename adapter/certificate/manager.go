@@ -29,7 +29,6 @@ type Manager struct {
 	mutations      int
 	mutationOwners map[uint64]int
 	closeErr       error
-	closeOwner     uint64
 	stage          adapter.StartStage
 	providers      []adapter.CertificateProviderService
 	providerByTag  map[string]adapter.CertificateProviderService
@@ -51,18 +50,19 @@ func (m *Manager) Start(stage adapter.StartStage) error {
 		return err
 	}
 	defer m.finishMutation()
+
 	m.access.Lock()
-	if m.closed {
+	if m.closing || m.closed {
 		m.access.Unlock()
 		return os.ErrClosed
 	}
 	if m.started && m.stage >= stage {
+		m.access.Unlock()
 		panic("already started")
 	}
-	m.started = true
-	m.stage = stage
-	providers := m.providers
+	providers := append([]adapter.CertificateProviderService(nil), m.providers...)
 	m.access.Unlock()
+
 	for _, provider := range providers {
 		name := "certificate-provider/" + provider.Type() + "[" + provider.Tag() + "]"
 		m.logger.Trace(stage, " ", name)
@@ -73,6 +73,14 @@ func (m *Manager) Start(stage adapter.StartStage) error {
 		}
 		m.logger.Trace(stage, " ", name, " completed (", F.Seconds(time.Since(startTime).Seconds()), "s)")
 	}
+
+	m.access.Lock()
+	defer m.access.Unlock()
+	if m.closing || m.closed {
+		return os.ErrClosed
+	}
+	m.started = true
+	m.stage = stage
 	return nil
 }
 
@@ -80,29 +88,27 @@ func (m *Manager) Close() (err error) {
 	owner := G.Current()
 	m.access.Lock()
 	condition := m.conditionLocked()
-	if m.closing && owner != 0 && owner == m.closeOwner {
-		m.access.Unlock()
-		return os.ErrClosed
-	}
-	if m.mutationOwners[G.Current()] > 0 {
-		m.access.Unlock()
-		return E.New("cannot close certificate manager from an active lifecycle callback")
-	}
-	for m.closing && !m.closed {
-		condition.Wait()
-	}
 	if m.closed {
 		closeErr := m.closeErr
 		m.access.Unlock()
 		return closeErr
 	}
+	// Never wait for an in-progress Close. A child Close callback may invoke
+	// its parent asynchronously and wait for that invocation to return.
+	if m.closing {
+		m.access.Unlock()
+		return os.ErrClosed
+	}
+	if m.mutationOwners[owner] > 0 {
+		m.access.Unlock()
+		return E.New("cannot close certificate manager from an active lifecycle callback")
+	}
 	m.closing = true
-	m.closeOwner = owner
 	for m.mutations > 0 {
 		condition.Wait()
 	}
 	m.started = false
-	providers := m.providers
+	providers := append([]adapter.CertificateProviderService(nil), m.providers...)
 	m.providers = nil
 	m.providerByTag = make(map[string]adapter.CertificateProviderService)
 	m.access.Unlock()
@@ -112,7 +118,6 @@ func (m *Manager) Close() (err error) {
 		m.closeErr = err
 		m.closing = false
 		m.closed = true
-		m.closeOwner = 0
 		condition.Broadcast()
 		m.access.Unlock()
 		if panicValue != nil {
@@ -153,8 +158,9 @@ func (m *Manager) Remove(tag string) error {
 		return err
 	}
 	defer m.finishMutation()
+
 	m.access.Lock()
-	if m.closed {
+	if m.closing || m.closed {
 		m.access.Unlock()
 		return os.ErrClosed
 	}
@@ -163,16 +169,29 @@ func (m *Manager) Remove(tag string) error {
 		m.access.Unlock()
 		return os.ErrInvalid
 	}
-	delete(m.providerByTag, tag)
 	index := common.Index(m.providers, func(it adapter.CertificateProviderService) bool {
 		return it == provider
 	})
 	if index == -1 {
+		m.access.Unlock()
 		panic("invalid certificate provider index")
 	}
-	m.providers = append(m.providers[:index], m.providers[index+1:]...)
 	m.access.Unlock()
-	return provider.Close()
+
+	// Keep the provider published and owned until cleanup succeeds. This lets a
+	// later manager Close retry a failed cleanup.
+	if err := m.closeProvider(provider); err != nil {
+		return err
+	}
+
+	m.access.Lock()
+	defer m.access.Unlock()
+	if current, loaded := m.providerByTag[tag]; !loaded || current != provider {
+		return E.New("certificate provider manager changed during removal: ", tag)
+	}
+	delete(m.providerByTag, tag)
+	m.providers = append(m.providers[:index], m.providers[index+1:]...)
+	return nil
 }
 
 func (m *Manager) Create(ctx context.Context, logger log.ContextLogger, tag string, providerType string, options any) error {
@@ -180,43 +199,88 @@ func (m *Manager) Create(ctx context.Context, logger log.ContextLogger, tag stri
 		return err
 	}
 	defer m.finishMutation()
+
+	m.access.Lock()
+	if m.closing || m.closed {
+		m.access.Unlock()
+		return os.ErrClosed
+	}
+	started := m.started
+	managerStage := m.stage
+	m.access.Unlock()
+
 	provider, err := m.registry.Create(ctx, logger, tag, providerType, options)
 	if err != nil {
 		return err
 	}
+	name := "certificate-provider/" + provider.Type() + "[" + provider.Tag() + "]"
+
 	m.access.Lock()
-	defer m.access.Unlock()
-	if m.closed {
-		return E.Errors(os.ErrClosed, provider.Close())
+	closing := m.closing || m.closed
+	m.access.Unlock()
+	if closing {
+		return E.Errors(os.ErrClosed, m.closeProvider(provider))
 	}
-	if m.started {
-		name := "certificate-provider/" + provider.Type() + "[" + provider.Tag() + "]"
+	if started {
 		for _, stage := range adapter.ListStartStages {
+			if stage > managerStage {
+				break
+			}
 			m.logger.Trace(stage, " ", name)
 			startTime := time.Now()
 			err = adapter.LegacyStart(provider, stage)
 			if err != nil {
-				return E.Errors(E.Cause(err, stage, " ", name), provider.Close())
+				return E.Errors(E.Cause(err, stage, " ", name), m.closeProvider(provider))
 			}
 			m.logger.Trace(stage, " ", name, " completed (", F.Seconds(time.Since(startTime).Seconds()), "s)")
 		}
 	}
-	if existsProvider, loaded := m.providerByTag[tag]; loaded {
-		err = existsProvider.Close()
-		if err != nil {
-			return E.Errors(E.Cause(err, "close certificate-provider/", existsProvider.Type(), "[", existsProvider.Tag(), "]"), provider.Close())
+
+	m.access.Lock()
+	if m.closing || m.closed {
+		m.access.Unlock()
+		return E.Errors(os.ErrClosed, m.closeProvider(provider))
+	}
+	existingProvider, replacing := m.providerByTag[tag]
+	m.access.Unlock()
+
+	if replacing {
+		if err = m.closeProvider(existingProvider); err != nil {
+			return E.Errors(
+				E.Cause(err, "close certificate-provider/", existingProvider.Type(), "[", existingProvider.Tag(), "]"),
+				m.closeProvider(provider),
+			)
 		}
-		existsIndex := common.Index(m.providers, func(it adapter.CertificateProviderService) bool {
-			return it == existsProvider
+	}
+
+	m.access.Lock()
+	if m.closing || m.closed {
+		m.access.Unlock()
+		return E.Errors(os.ErrClosed, m.closeProvider(provider))
+	}
+	currentProvider, stillExists := m.providerByTag[tag]
+	if stillExists != replacing || stillExists && currentProvider != existingProvider || m.started != started || started && m.stage != managerStage {
+		m.access.Unlock()
+		return E.Errors(E.New("certificate provider manager changed during create: ", tag), m.closeProvider(provider))
+	}
+	if replacing {
+		existingIndex := common.Index(m.providers, func(it adapter.CertificateProviderService) bool {
+			return it == existingProvider
 		})
-		if existsIndex == -1 {
-			panic("invalid certificate provider index")
+		if existingIndex == -1 {
+			m.access.Unlock()
+			return E.Errors(E.New("invalid certificate provider index: ", tag), m.closeProvider(provider))
 		}
-		m.providers = append(m.providers[:existsIndex], m.providers[existsIndex+1:]...)
+		m.providers = append(m.providers[:existingIndex], m.providers[existingIndex+1:]...)
 	}
 	m.providers = append(m.providers, provider)
 	m.providerByTag[tag] = provider
+	m.access.Unlock()
 	return nil
+}
+
+func (m *Manager) closeProvider(provider adapter.CertificateProviderService) error {
+	return provider.Close()
 }
 
 func (m *Manager) conditionLocked() *sync.Cond {
@@ -229,11 +293,25 @@ func (m *Manager) conditionLocked() *sync.Cond {
 func (m *Manager) beginMutation() error {
 	owner := G.Current()
 	m.access.Lock()
-	if m.closing || m.closed {
-		m.access.Unlock()
-		return os.ErrClosed
+	condition := m.conditionLocked()
+	for {
+		if m.closing || m.closed {
+			m.access.Unlock()
+			return os.ErrClosed
+		}
+		if m.mutations == 0 {
+			break
+		}
+		if m.mutationOwners[owner] > 0 {
+			m.access.Unlock()
+			return E.New("cannot reenter certificate manager lifecycle")
+		}
+		condition.Wait()
 	}
-	m.mutations++
+	if m.mutationOwners == nil {
+		m.mutationOwners = make(map[uint64]int)
+	}
+	m.mutations = 1
 	m.mutationOwners[owner]++
 	m.access.Unlock()
 	return nil
@@ -242,14 +320,12 @@ func (m *Manager) beginMutation() error {
 func (m *Manager) finishMutation() {
 	owner := G.Current()
 	m.access.Lock()
-	m.mutations--
-	if m.mutationOwners[owner] == 1 {
+	m.mutations = 0
+	if m.mutationOwners[owner] <= 1 {
 		delete(m.mutationOwners, owner)
 	} else {
 		m.mutationOwners[owner]--
 	}
-	if m.mutations == 0 {
-		m.conditionLocked().Broadcast()
-	}
+	m.conditionLocked().Broadcast()
 	m.access.Unlock()
 }
