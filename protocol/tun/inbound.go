@@ -9,6 +9,8 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Miku0139oao/sidera-core/adapter"
@@ -20,6 +22,7 @@ import (
 	"github.com/sagernet/sing-tun"
 	"github.com/sagernet/sing-tun/gtcpip/header"
 	"github.com/sagernet/sing/common"
+	"github.com/sagernet/sing/common/control"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/json/badoption"
 	M "github.com/sagernet/sing/common/metadata"
@@ -33,6 +36,10 @@ import (
 
 func RegisterInbound(registry *inbound.Registry) {
 	inbound.Register[option.TunInboundOptions](registry, C.TypeTun, NewInbound)
+}
+
+func openTUN(options tun.Options) (tun.Tun, error) {
+	return tun.New(options)
 }
 
 type Inbound struct {
@@ -59,6 +66,16 @@ type Inbound struct {
 	routeExcludeRuleSetCallback []*list.Element[adapter.RuleSetUpdateCallback]
 	routeAddressSet             []*netipx.IPSet
 	routeExcludeAddressSet      []*netipx.IPSet
+	lifecycleAccess             sync.Mutex
+	routeSetAccess              sync.Mutex
+	resourceAccess              sync.RWMutex
+	routeSetsAcquired           bool
+	routeSetsActive             bool
+	closeOnce                   sync.Once
+	closeErr                    error
+	closed                      atomic.Bool
+	openTUN                     func(tun.Options) (tun.Tun, error)
+	createTUNStack              func(string, tun.StackOptions) (tun.Stack, error)
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.TunInboundOptions) (adapter.Inbound, error) {
@@ -280,7 +297,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 			if options.NetNs == "" {
 				err = networkManager.RegisterAutoRedirectOutputMark(inbound.tunOptions.AutoRedirectOutputMark)
 				if err != nil {
-					return nil, err
+					return nil, E.Errors(err, inbound.autoRedirect.Close())
 				}
 			}
 		}
@@ -329,6 +346,11 @@ func (t *Inbound) Tag() string {
 }
 
 func (t *Inbound) Start(stage adapter.StartStage) error {
+	t.lifecycleAccess.Lock()
+	defer t.lifecycleAccess.Unlock()
+	if t.closed.Load() {
+		return net.ErrClosed
+	}
 	switch stage {
 	case adapter.StartStateInitialize:
 		if t.tunOptions.DNSModeOrDefault() != tun.DNSModeDisabled && len(t.tunOptions.DNSAddress) == 0 {
@@ -341,24 +363,28 @@ func (t *Inbound) Start(stage adapter.StartStage) error {
 			((C.IsLinux && !t.tunOptions.GSO) || (C.IsDarwin && !t.tunOptions.EXP_MultiPendingPackets)) {
 			outboundManager := service.FromContext[adapter.OutboundManager](t.ctx)
 			endpointManager := service.FromContext[adapter.EndpointManager](t.ctx)
-			for _, outbound := range outboundManager.Outbounds() {
-				if _, isFlowOutbound := outbound.(adapter.FlowOutbound); isFlowOutbound && common.Contains(outbound.Network(), N.NetworkTCP) {
-					if C.IsLinux {
-						t.tunOptions.GSO = true
-					} else {
-						t.tunOptions.EXP_MultiPendingPackets = true
+			if outboundManager != nil {
+				for _, outbound := range outboundManager.Outbounds() {
+					if _, isFlowOutbound := outbound.(adapter.FlowOutbound); isFlowOutbound && common.Contains(outbound.Network(), N.NetworkTCP) {
+						if C.IsLinux {
+							t.tunOptions.GSO = true
+						} else {
+							t.tunOptions.EXP_MultiPendingPackets = true
+						}
+						break
 					}
-					break
 				}
 			}
-			for _, endpoint := range endpointManager.Endpoints() {
-				if _, isFlowOutbound := endpoint.(adapter.FlowOutbound); isFlowOutbound && common.Contains(endpoint.Network(), N.NetworkTCP) {
-					if C.IsLinux {
-						t.tunOptions.GSO = true
-					} else {
-						t.tunOptions.EXP_MultiPendingPackets = true
+			if endpointManager != nil {
+				for _, endpoint := range endpointManager.Endpoints() {
+					if _, isFlowOutbound := endpoint.(adapter.FlowOutbound); isFlowOutbound && common.Contains(endpoint.Network(), N.NetworkTCP) {
+						if C.IsLinux {
+							t.tunOptions.GSO = true
+						} else {
+							t.tunOptions.EXP_MultiPendingPackets = true
+						}
+						break
 					}
-					break
 				}
 			}
 		}
@@ -375,30 +401,7 @@ func (t *Inbound) Start(stage adapter.StartStage) error {
 			}
 		}
 		if t.platformInterface == nil || C.IsWindows {
-			t.routeAddressSet = common.FlatMap(t.routeRuleSet, adapter.RuleSet.ExtractIPSet)
-			for _, routeRuleSet := range t.routeRuleSet {
-				ipSets := routeRuleSet.ExtractIPSet()
-				if len(ipSets) == 0 {
-					t.logger.Warn("route_address_set: no destination IP CIDR rules found in rule-set: ", routeRuleSet.Name())
-				}
-				routeRuleSet.IncRef()
-				t.routeAddressSet = append(t.routeAddressSet, ipSets...)
-				if t.autoRedirect != nil {
-					t.routeRuleSetCallback = append(t.routeRuleSetCallback, routeRuleSet.RegisterCallback(t.updateRouteAddressSet))
-				}
-			}
-			t.routeExcludeAddressSet = common.FlatMap(t.routeExcludeRuleSet, adapter.RuleSet.ExtractIPSet)
-			for _, routeExcludeRuleSet := range t.routeExcludeRuleSet {
-				ipSets := routeExcludeRuleSet.ExtractIPSet()
-				if len(ipSets) == 0 {
-					t.logger.Warn("route_address_set: no destination IP CIDR rules found in rule-set: ", routeExcludeRuleSet.Name())
-				}
-				routeExcludeRuleSet.IncRef()
-				t.routeExcludeAddressSet = append(t.routeExcludeAddressSet, ipSets...)
-				if t.autoRedirect != nil {
-					t.routeExcludeRuleSetCallback = append(t.routeExcludeRuleSetCallback, routeExcludeRuleSet.RegisterCallback(t.updateRouteAddressSet))
-				}
-			}
+			t.acquireRouteRuleSets()
 		}
 		var (
 			tunInterface tun.Tun
@@ -429,29 +432,35 @@ func (t *Inbound) Start(stage adapter.StartStage) error {
 		monitor.Start("open interface")
 		if t.platformInterface != nil && t.platformInterface.UsePlatformInterface() {
 			tunInterface, err = t.platformInterface.OpenInterface(&tunOptions, t.platformOptions)
+		} else if t.openTUN != nil {
+			tunInterface, err = t.openTUN(tunOptions)
 		} else {
-			tunInterface, err = tun.New(tunOptions)
+			tunInterface, err = openTUN(tunOptions)
 		}
 		monitor.Finish()
 		t.tunOptions.Name = tunOptions.Name
 		if err != nil {
-			return E.Cause(err, "configure tun interface")
+			return t.startError(E.Cause(err, "configure tun interface"))
 		}
 		t.logger.Trace("creating stack")
+		t.resourceAccess.Lock()
 		t.tunIf = tunInterface
+		t.resourceAccess.Unlock()
 		if t.platformInterface != nil {
 			err = t.platformInterface.ProcessPlatformOptions(t.platformOptions)
 			if err != nil {
-				closeError := t.tunIf.Close()
-				t.tunIf = nil
-				return E.Errors(E.Cause(err, "process platform options"), closeError)
+				return t.startError(E.Cause(err, "process platform options"))
 			}
 		}
 		var includeAllNetworks bool
 		if t.platformInterface != nil && t.platformInterface.UnderNetworkExtension() {
 			includeAllNetworks = t.platformInterface.NetworkExtensionIncludeAllNetworks()
 		}
-		tunStack, err := tun.NewStack(t.stack, tun.StackOptions{
+		var interfaceFinder control.InterfaceFinder
+		if t.networkManager != nil {
+			interfaceFinder = t.networkManager.InterfaceFinder()
+		}
+		stackOptions := tun.StackOptions{
 			Context:                t.ctx,
 			Tun:                    tunInterface,
 			TunOptions:             t.tunOptions,
@@ -463,43 +472,128 @@ func (t *Inbound) Start(stage adapter.StartStage) error {
 			Handler:                t,
 			Logger:                 t.logger,
 			ForwarderBindInterface: C.IsDarwin,
-			InterfaceFinder:        t.networkManager.InterfaceFinder(),
+			InterfaceFinder:        interfaceFinder,
 			IncludeAllNetworks:     includeAllNetworks,
-		})
-		if err != nil {
-			return err
 		}
+		var tunStack tun.Stack
+		if t.createTUNStack != nil {
+			tunStack, err = t.createTUNStack(t.stack, stackOptions)
+		} else {
+			tunStack, err = tun.NewStack(t.stack, stackOptions)
+		}
+		if err != nil {
+			return t.startError(E.Cause(err, "create tun stack"))
+		}
+		t.resourceAccess.Lock()
 		t.tunStack = tunStack
+		t.resourceAccess.Unlock()
 		t.logger.Info("started at ", t.tunOptions.Name)
 	case adapter.StartStatePostStart:
+		t.resourceAccess.RLock()
+		tunStack := t.tunStack
+		tunIf := t.tunIf
+		t.resourceAccess.RUnlock()
+		if tunStack == nil || tunIf == nil {
+			return t.startError(E.New("tun resources are not initialized"))
+		}
 		monitor := taskmonitor.New(t.logger, C.StartTimeout)
 		monitor.Start("starting tun stack")
-		err := t.tunStack.Start()
+		err := tunStack.Start()
 		monitor.Finish()
 		if err != nil {
-			return E.Cause(err, "starting tun stack")
+			return t.startError(E.Cause(err, "starting tun stack"))
 		}
 		monitor.Start("starting tun interface")
-		err = t.tunIf.Start()
+		err = tunIf.Start()
 		monitor.Finish()
 		if err != nil {
-			return E.Cause(err, "starting TUN interface")
+			return t.startError(E.Cause(err, "starting TUN interface"))
 		}
 		if t.autoRedirect != nil {
 			monitor.Start("initialize auto-redirect")
 			err := t.autoRedirect.Start()
 			monitor.Finish()
 			if err != nil {
-				return E.Cause(err, "auto-redirect")
+				return t.startError(E.Cause(err, "auto-redirect"))
 			}
 		}
+		t.routeSetAccess.Lock()
 		t.routeAddressSet = nil
 		t.routeExcludeAddressSet = nil
+		t.routeSetAccess.Unlock()
 	}
 	return nil
 }
 
+func (t *Inbound) acquireRouteRuleSets() {
+	t.routeSetAccess.Lock()
+	defer t.routeSetAccess.Unlock()
+	if t.routeSetsAcquired || t.closed.Load() {
+		return
+	}
+	for _, ruleSet := range t.routeRuleSet {
+		ruleSet.IncRef()
+		if t.autoRedirect != nil {
+			t.routeRuleSetCallback = append(t.routeRuleSetCallback, ruleSet.RegisterCallback(t.updateRouteAddressSet))
+		}
+	}
+	for _, ruleSet := range t.routeExcludeRuleSet {
+		ruleSet.IncRef()
+		if t.autoRedirect != nil {
+			t.routeExcludeRuleSetCallback = append(t.routeExcludeRuleSetCallback, ruleSet.RegisterCallback(t.updateRouteAddressSet))
+		}
+	}
+	t.routeAddressSet = common.FlatMap(t.routeRuleSet, adapter.RuleSet.ExtractIPSet)
+	t.routeExcludeAddressSet = common.FlatMap(t.routeExcludeRuleSet, adapter.RuleSet.ExtractIPSet)
+	for _, ruleSet := range t.routeRuleSet {
+		if len(ruleSet.ExtractIPSet()) == 0 {
+			t.logger.Warn("route_address_set: no destination IP CIDR rules found in rule-set: ", ruleSet.Name())
+		}
+	}
+	for _, ruleSet := range t.routeExcludeRuleSet {
+		if len(ruleSet.ExtractIPSet()) == 0 {
+			t.logger.Warn("route_exclude_address_set: no destination IP CIDR rules found in rule-set: ", ruleSet.Name())
+		}
+	}
+	t.routeSetsAcquired = true
+	t.routeSetsActive = true
+}
+
+func (t *Inbound) releaseRouteRuleSets() {
+	t.routeSetAccess.Lock()
+	if !t.routeSetsAcquired {
+		t.routeSetAccess.Unlock()
+		return
+	}
+	t.routeSetsActive = false
+	routeCallbacks := append([]*list.Element[adapter.RuleSetUpdateCallback](nil), t.routeRuleSetCallback...)
+	excludeCallbacks := append([]*list.Element[adapter.RuleSetUpdateCallback](nil), t.routeExcludeRuleSetCallback...)
+	t.routeRuleSetCallback = nil
+	t.routeExcludeRuleSetCallback = nil
+	t.routeAddressSet = nil
+	t.routeExcludeAddressSet = nil
+	t.routeSetsAcquired = false
+	t.routeSetAccess.Unlock()
+	for index, callback := range routeCallbacks {
+		t.routeRuleSet[index].UnregisterCallback(callback)
+	}
+	for index, callback := range excludeCallbacks {
+		t.routeExcludeRuleSet[index].UnregisterCallback(callback)
+	}
+	for _, ruleSet := range t.routeRuleSet {
+		ruleSet.DecRef()
+	}
+	for _, ruleSet := range t.routeExcludeRuleSet {
+		ruleSet.DecRef()
+	}
+}
+
 func (t *Inbound) updateRouteAddressSet(it adapter.RuleSet) {
+	t.routeSetAccess.Lock()
+	defer t.routeSetAccess.Unlock()
+	if !t.routeSetsActive || t.autoRedirect == nil {
+		return
+	}
 	t.routeAddressSet = common.FlatMap(t.routeRuleSet, adapter.RuleSet.ExtractIPSet)
 	t.routeExcludeAddressSet = common.FlatMap(t.routeExcludeRuleSet, adapter.RuleSet.ExtractIPSet)
 	t.autoRedirect.UpdateRouteAddressSet()
@@ -508,18 +602,37 @@ func (t *Inbound) updateRouteAddressSet(it adapter.RuleSet) {
 }
 
 func (t *Inbound) InterfaceUpdated() {
+	t.resourceAccess.RLock()
 	tunStack := t.tunStack
 	if tunStack != nil {
 		tunStack.ResetNetwork()
 	}
+	t.resourceAccess.RUnlock()
+}
+
+func (t *Inbound) startError(err error) error {
+	return E.Errors(err, t.closeLocked())
 }
 
 func (t *Inbound) Close() error {
-	return common.Close(
-		t.tunStack,
-		t.tunIf,
-		t.autoRedirect,
-	)
+	t.lifecycleAccess.Lock()
+	defer t.lifecycleAccess.Unlock()
+	return t.closeLocked()
+}
+
+func (t *Inbound) closeLocked() error {
+	t.closeOnce.Do(func() {
+		t.closed.Store(true)
+		t.releaseRouteRuleSets()
+		t.resourceAccess.Lock()
+		tunStack := t.tunStack
+		tunIf := t.tunIf
+		t.tunStack = nil
+		t.tunIf = nil
+		t.resourceAccess.Unlock()
+		t.closeErr = common.Close(tunStack, tunIf, t.autoRedirect)
+	})
+	return t.closeErr
 }
 
 func (t *Inbound) JudgeFlow(network uint8, source netip.AddrPort, destination netip.AddrPort, firstPacket []byte) tun.FlowVerdict {

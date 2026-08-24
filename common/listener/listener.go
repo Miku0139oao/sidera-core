@@ -6,6 +6,7 @@ import (
 	"net/netip"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 
 	"github.com/Miku0139oao/sidera-core/adapter"
@@ -43,6 +44,9 @@ type Listener struct {
 	packetOutbound       chan *N.PacketBuffer
 	packetOutboundClosed chan struct{}
 	shutdown             atomic.Bool
+	udpTruncated         atomic.Uint64
+	closeOnce            sync.Once
+	closeErr             error
 }
 
 type Options struct {
@@ -125,15 +129,22 @@ func (l *Listener) Start() error {
 }
 
 func (l *Listener) Close() error {
-	l.shutdown.Store(true)
-	var err error
-	if l.systemProxy != nil && l.systemProxy.IsEnabled() {
-		err = l.systemProxy.Disable()
-	}
-	return E.Errors(err, common.Close(
-		l.tcpListener,
-		common.PtrOrNil(l.udpConn),
-	))
+	l.closeOnce.Do(func() {
+		l.shutdown.Store(true)
+		var err error
+		if l.systemProxy != nil && l.systemProxy.IsEnabled() {
+			err = l.systemProxy.Disable()
+		}
+		err = E.Errors(err, common.Close(
+			l.tcpListener,
+			common.PtrOrNil(l.udpConn),
+		))
+		if l.packetOutboundClosed != nil {
+			<-l.packetOutboundClosed
+		}
+		l.closeErr = err
+	})
+	return l.closeErr
 }
 
 func (l *Listener) TCPListener() net.Listener {
@@ -142,6 +153,10 @@ func (l *Listener) TCPListener() net.Listener {
 
 func (l *Listener) UDPConn() *net.UDPConn {
 	return l.udpConn
+}
+
+func (l *Listener) UDPTruncatedPackets() uint64 {
+	return l.udpTruncated.Load()
 }
 
 func (l *Listener) ListenOptions() option.ListenOptions {
