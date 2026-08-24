@@ -32,16 +32,23 @@ var _ adapter.ConnectionManager = (*ConnectionManager)(nil)
 
 type ConnectionManager struct {
 	logger         logger.ContextLogger
+	ctx            context.Context
+	cancel         context.CancelCauseFunc
 	access         sync.Mutex
 	connections    list.List[io.Closer]
+	activeRelays   map[*relayLease]struct{}
 	operationGroup sync.WaitGroup
 	relayGroup     sync.WaitGroup
 	closed         bool
 }
 
 func NewConnectionManager(logger logger.ContextLogger) *ConnectionManager {
+	ctx, cancel := context.WithCancelCause(context.Background())
 	return &ConnectionManager{
-		logger: logger,
+		logger:       logger,
+		ctx:          ctx,
+		cancel:       cancel,
+		activeRelays: make(map[*relayLease]struct{}),
 	}
 }
 
@@ -77,12 +84,16 @@ func (m *ConnectionManager) Close() error {
 		return nil
 	}
 	m.closed = true
+	m.cancel(net.ErrClosed)
 	var closers []io.Closer
 	for element := m.connections.Front(); element != nil; {
 		nextElement := element.Next()
 		closers = append(closers, element.Value)
 		m.connections.Remove(element)
 		element = nextElement
+	}
+	for relay := range m.activeRelays {
+		closers = append(closers, relay.closers...)
 	}
 	m.access.Unlock()
 	for _, closer := range closers {
@@ -126,12 +137,13 @@ func (m *ConnectionManager) TrackPacketConn(conn net.PacketConn) net.PacketConn 
 }
 
 func (m *ConnectionManager) NewConnection(ctx context.Context, this N.Dialer, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
-	if !m.beginOperation() {
+	operationCtx, finishOperation, loaded := m.beginOperation(ctx)
+	if !loaded {
 		N.CloseOnHandshakeFailure(conn, onClose, net.ErrClosed)
 		return
 	}
-	defer m.operationGroup.Done()
-	ctx = adapter.WithContext(ctx, &metadata)
+	defer finishOperation()
+	ctx = adapter.WithContext(operationCtx, &metadata)
 	var (
 		remoteConn net.Conn
 		err        error
@@ -188,7 +200,8 @@ func (m *ConnectionManager) NewConnection(ctx context.Context, this N.Dialer, co
 		return
 	}
 	relayState := &connectionRelayState{onClose: onClose}
-	if !m.beginRelays(2) {
+	relay := m.beginRelays(2, conn, remoteConn)
+	if relay == nil {
 		common.Close(conn, remoteConn)
 		if onClose != nil {
 			onClose(net.ErrClosed)
@@ -196,22 +209,23 @@ func (m *ConnectionManager) NewConnection(ctx context.Context, this N.Dialer, co
 		return
 	}
 	go func() {
-		defer m.relayGroup.Done()
+		defer relay.Done()
 		m.connectionCopy(ctx, conn, remoteConn, false, relayState)
 	}()
 	go func() {
-		defer m.relayGroup.Done()
+		defer relay.Done()
 		m.connectionCopy(ctx, remoteConn, conn, true, relayState)
 	}()
 }
 
 func (m *ConnectionManager) NewPacketConnection(ctx context.Context, this N.Dialer, conn N.PacketConn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
-	if !m.beginOperation() {
+	operationCtx, finishOperation, loaded := m.beginOperation(ctx)
+	if !loaded {
 		N.CloseOnHandshakeFailure(conn, onClose, net.ErrClosed)
 		return
 	}
-	defer m.operationGroup.Done()
-	ctx = adapter.WithContext(ctx, &metadata)
+	defer finishOperation()
+	ctx = adapter.WithContext(operationCtx, &metadata)
 	var (
 		remotePacketConn   net.PacketConn
 		remoteConn         net.Conn
@@ -323,7 +337,8 @@ func (m *ConnectionManager) NewPacketConnection(ctx context.Context, this N.Dial
 	}
 	destination := bufio.NewPacketConn(remotePacketConn)
 	var done atomic.Bool
-	if !m.beginRelays(2) {
+	relay := m.beginRelays(2, conn, remotePacketConn)
+	if relay == nil {
 		common.Close(conn, remotePacketConn)
 		if onClose != nil {
 			onClose(net.ErrClosed)
@@ -331,33 +346,65 @@ func (m *ConnectionManager) NewPacketConnection(ctx context.Context, this N.Dial
 		return
 	}
 	go func() {
-		defer m.relayGroup.Done()
+		defer relay.Done()
 		m.packetConnectionCopy(ctx, conn, destination, false, &done, onClose)
 	}()
 	go func() {
-		defer m.relayGroup.Done()
+		defer relay.Done()
 		m.packetConnectionCopy(ctx, destination, conn, true, &done, onClose)
 	}()
 }
 
-func (m *ConnectionManager) beginOperation() bool {
+func (m *ConnectionManager) beginOperation(parent context.Context) (context.Context, func(), bool) {
 	m.access.Lock()
-	defer m.access.Unlock()
 	if m.closed {
-		return false
+		m.access.Unlock()
+		return nil, nil, false
 	}
 	m.operationGroup.Add(1)
-	return true
+	managerCtx := m.ctx
+	m.access.Unlock()
+
+	operationCtx, cancel := context.WithCancelCause(parent)
+	stopManager := context.AfterFunc(managerCtx, func() {
+		cancel(context.Cause(managerCtx))
+	})
+	if cause := context.Cause(managerCtx); cause != nil {
+		cancel(cause)
+	}
+	return operationCtx, func() {
+		stopManager()
+		cancel(nil)
+		m.operationGroup.Done()
+	}, true
 }
 
-func (m *ConnectionManager) beginRelays(count int) bool {
+type relayLease struct {
+	manager   *ConnectionManager
+	closers   []io.Closer
+	remaining atomic.Int32
+}
+
+func (m *ConnectionManager) beginRelays(count int, closers ...io.Closer) *relayLease {
 	m.access.Lock()
 	defer m.access.Unlock()
 	if m.closed {
-		return false
+		return nil
 	}
+	relay := &relayLease{manager: m, closers: closers}
+	relay.remaining.Store(int32(count))
+	m.activeRelays[relay] = struct{}{}
 	m.relayGroup.Add(count)
-	return true
+	return relay
+}
+
+func (r *relayLease) Done() {
+	if r.remaining.Add(-1) == 0 {
+		r.manager.access.Lock()
+		delete(r.manager.activeRelays, r)
+		r.manager.access.Unlock()
+	}
+	r.manager.relayGroup.Done()
 }
 
 type connectionRelayState struct {

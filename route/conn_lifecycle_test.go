@@ -5,13 +5,16 @@ import (
 	"errors"
 	"io"
 	"net"
+	"net/netip"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/Miku0139oao/sidera-core/adapter"
 	"github.com/Miku0139oao/sidera-core/log"
 	"github.com/sagernet/sing/common/buf"
 	M "github.com/sagernet/sing/common/metadata"
+	N "github.com/sagernet/sing/common/network"
 
 	"github.com/stretchr/testify/require"
 )
@@ -91,9 +94,97 @@ func TestCopyPacketExactPreservesDestinationHeadroom(t *testing.T) {
 	require.Equal(t, payload, writer.payload)
 }
 
+type blockingSetupDialer struct {
+	entered chan struct{}
+	once    sync.Once
+}
+
+func (d *blockingSetupDialer) DialContext(ctx context.Context, _ string, _ M.Socksaddr) (net.Conn, error) {
+	d.once.Do(func() { close(d.entered) })
+	<-ctx.Done()
+	return nil, context.Cause(ctx)
+}
+
+func (d *blockingSetupDialer) ListenPacket(context.Context, M.Socksaddr) (net.PacketConn, error) {
+	return nil, errors.New("unexpected ListenPacket")
+}
+
+func TestConnectionManagerCloseCancelsBlockedSetup(t *testing.T) {
+	manager := NewConnectionManager(log.NewNOPFactory().NewLogger("connection-test"))
+	dialer := &blockingSetupDialer{entered: make(chan struct{})}
+	incoming, peer := net.Pipe()
+	defer peer.Close()
+	operationDone := make(chan struct{})
+	go func() {
+		manager.NewConnection(t.Context(), dialer, incoming, adapter.InboundContext{Destination: M.Socksaddr{Addr: netip.MustParseAddr("1.1.1.1"), Port: 443}}, nil)
+		close(operationDone)
+	}()
+	select {
+	case <-dialer.entered:
+	case <-time.After(time.Second):
+		t.Fatal("dial setup did not block")
+	}
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- manager.Close() }()
+	select {
+	case err := <-closeDone:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("Close did not cancel blocked setup")
+	}
+	select {
+	case <-operationDone:
+	case <-time.After(time.Second):
+		t.Fatal("setup operation did not finish after cancellation")
+	}
+}
+
+type staticConnDialer struct{ conn net.Conn }
+
+func (d *staticConnDialer) DialContext(context.Context, string, M.Socksaddr) (net.Conn, error) {
+	return d.conn, nil
+}
+
+func (d *staticConnDialer) ListenPacket(context.Context, M.Socksaddr) (net.PacketConn, error) {
+	return nil, errors.New("unexpected ListenPacket")
+}
+
+func TestConnectionManagerCloseOwnsUntrackedRelayEndpoints(t *testing.T) {
+	manager := NewConnectionManager(log.NewNOPFactory().NewLogger("connection-test"))
+	client, incoming := net.Pipe()
+	remote, backend := net.Pipe()
+	defer client.Close()
+	defer backend.Close()
+	closed := make(chan error, 1)
+	manager.NewConnection(t.Context(), &staticConnDialer{conn: remote}, incoming, adapter.InboundContext{Destination: M.Socksaddr{Addr: netip.MustParseAddr("1.1.1.1"), Port: 443}}, func(err error) {
+		closed <- err
+	})
+	if err := manager.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("relay close callback was not invoked")
+	}
+	_ = client.SetReadDeadline(time.Now().Add(time.Second))
+	_ = backend.SetReadDeadline(time.Now().Add(time.Second))
+	var one [1]byte
+	_, clientErr := client.Read(one[:])
+	_, backendErr := backend.Read(one[:])
+	require.Error(t, clientErr)
+	require.Error(t, backendErr)
+}
+
+var (
+	_ N.Dialer = (*blockingSetupDialer)(nil)
+	_ N.Dialer = (*staticConnDialer)(nil)
+)
+
 func TestConnectionManagerCloseJoinsSetupOperations(t *testing.T) {
 	manager := NewConnectionManager(log.NewNOPFactory().NewLogger("connection-test"))
-	require.True(t, manager.beginOperation())
+	_, finishOperation, loaded := manager.beginOperation(t.Context())
+	require.True(t, loaded)
 	closeDone := make(chan error, 1)
 	go func() { closeDone <- manager.Close() }()
 	select {
@@ -101,19 +192,21 @@ func TestConnectionManagerCloseJoinsSetupOperations(t *testing.T) {
 		t.Fatalf("Close returned before setup completion: %v", err)
 	case <-time.After(20 * time.Millisecond):
 	}
-	manager.operationGroup.Done()
+	finishOperation()
 	select {
 	case err := <-closeDone:
 		require.NoError(t, err)
 	case <-time.After(time.Second):
 		t.Fatal("Close did not join setup completion")
 	}
-	require.False(t, manager.beginOperation())
+	_, _, loaded = manager.beginOperation(t.Context())
+	require.False(t, loaded)
 }
 
 func TestConnectionManagerCloseJoinsActiveRelays(t *testing.T) {
 	manager := NewConnectionManager(log.NewNOPFactory().NewLogger("connection-test"))
-	require.True(t, manager.beginRelays(1))
+	relay := manager.beginRelays(1)
+	require.NotNil(t, relay)
 	closeDone := make(chan error, 1)
 	go func() { closeDone <- manager.Close() }()
 	select {
@@ -121,14 +214,14 @@ func TestConnectionManagerCloseJoinsActiveRelays(t *testing.T) {
 		t.Fatalf("Close returned before active relay completion: %v", err)
 	case <-time.After(20 * time.Millisecond):
 	}
-	manager.relayGroup.Done()
+	relay.Done()
 	select {
 	case err := <-closeDone:
 		require.NoError(t, err)
 	case <-time.After(time.Second):
 		t.Fatal("Close did not join active relay completion")
 	}
-	require.False(t, manager.beginRelays(1))
+	require.Nil(t, manager.beginRelays(1))
 }
 
 func TestConnectionManagerRejectsLateRegistrationsAfterClose(t *testing.T) {
