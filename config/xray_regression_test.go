@@ -436,6 +436,23 @@ func TestDecodeXrayVLESSInboundDefaultsToRawTCP(t *testing.T) {
 	require.Equal(t, "vless", options.Inbounds[0].Type)
 }
 
+func TestDecodeXrayCanonicalizesAcceptedUUIDSpellings(t *testing.T) {
+	const canonical = "27848739-7e62-4138-9fd3-098a63964b6b"
+	const xrayAccepted = "-278487397e6241389fd3098a63964b6b"
+	outboundDocument := strings.Replace(xrayVLESSDocument(`{"network":"raw"}`), canonical, xrayAccepted, 1)
+	outboundOptions := decodeXrayTestConfig(t, outboundDocument).Outbounds[0].Options.(*option.VLESSOutboundOptions)
+	require.Equal(t, canonical, outboundOptions.UUID)
+
+	inboundOptions := decodeXrayTestConfig(t, `{
+		"inbounds": [{
+			"protocol": "vless",
+			"port": 443,
+			"settings": {"clients": [{"id": "`+xrayAccepted+`"}], "decryption": "none"}
+		}]
+	}`).Inbounds[0].Options.(*option.VLESSInboundOptions)
+	require.Equal(t, canonical, inboundOptions.Users[0].UUID)
+}
+
 func TestDecodeXrayVLESSEncryptionSecuresPublicOutbound(t *testing.T) {
 	encryption := "mlkem768x25519plus.native.0rtt." + strings.Repeat("A", 43)
 	options := decodeXrayTestConfig(t, `{

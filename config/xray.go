@@ -664,7 +664,8 @@ func translateXrayVLESSInbound(source xrayVLESSInboundSettings) (map[string]any,
 		if user.ID == "" {
 			return nil, E.New("VLESS user ", index, " id is required")
 		}
-		if err := validateXrayUUIDOrAlias(user.ID); err != nil {
+		normalizedID, err := normalizeXrayUUIDOrAlias(user.ID)
+		if err != nil {
 			return nil, E.Cause(err, "invalid VLESS user ", index, " id")
 		}
 		if user.Level != 0 {
@@ -688,7 +689,7 @@ func translateXrayVLESSInbound(source xrayVLESSInboundSettings) (map[string]any,
 		}
 		convertedUser := map[string]any{
 			"name": user.Email,
-			"uuid": user.ID,
+			"uuid": normalizedID,
 		}
 		if flow != "" {
 			convertedUser["flow"] = flow
@@ -701,28 +702,35 @@ func translateXrayVLESSInbound(source xrayVLESSInboundSettings) (map[string]any,
 	}, nil
 }
 
-func validateXrayUUIDOrAlias(value string) error {
+func normalizeXrayUUIDOrAlias(value string) (string, error) {
 	text := []byte(value)
 	if length := len(text); length < 32 || length > 36 {
 		if length == 0 || length > 30 {
-			return E.New("invalid Xray UUID or alias: ", value)
+			return "", E.New("invalid Xray UUID or alias: ", value)
 		}
-		return nil
+		return value, nil
 	}
+	var decoded [16]byte
+	byteOffset := 0
 	for _, groupLength := range [...]int{8, 4, 4, 4, 12} {
 		if len(text) > 0 && text[0] == '-' {
 			text = text[1:]
 		}
 		if len(text) < groupLength {
-			return E.New("invalid Xray UUID: ", value)
+			return "", E.New("invalid Xray UUID: ", value)
 		}
-		decoded := make([]byte, groupLength/2)
-		if _, err := hex.Decode(decoded, text[:groupLength]); err != nil {
-			return E.Cause(err, "invalid Xray UUID: ", value)
+		groupBytes := groupLength / 2
+		if _, err := hex.Decode(decoded[byteOffset:byteOffset+groupBytes], text[:groupLength]); err != nil {
+			return "", E.Cause(err, "invalid Xray UUID: ", value)
 		}
+		byteOffset += groupBytes
 		text = text[groupLength:]
 	}
-	return nil
+	return hex.EncodeToString(decoded[0:4]) + "-" +
+		hex.EncodeToString(decoded[4:6]) + "-" +
+		hex.EncodeToString(decoded[6:8]) + "-" +
+		hex.EncodeToString(decoded[8:10]) + "-" +
+		hex.EncodeToString(decoded[10:16]), nil
 }
 
 func isDefaultXrayVisionSeed(seed []uint32) bool {
@@ -929,9 +937,11 @@ func translateXrayVLESS(source xrayVLESSSettings) (map[string]any, error) {
 	if address == "" || port == 0 || user.ID == "" {
 		return nil, E.New("VLESS server address, port, and user id are required")
 	}
-	if err := validateXrayUUIDOrAlias(user.ID); err != nil {
+	normalizedID, err := normalizeXrayUUIDOrAlias(user.ID)
+	if err != nil {
 		return nil, E.Cause(err, "invalid VLESS user id")
 	}
+	user.ID = normalizedID
 	if user.Level != 0 || user.Email != "" {
 		return nil, E.New("VLESS user level/email metadata has no current Sidera equivalent")
 	}

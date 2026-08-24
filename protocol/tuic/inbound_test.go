@@ -39,8 +39,8 @@ func TestManagedUserIdentityPublishedBeforeServiceStart(t *testing.T) {
 			map[string]option.TUICUser{
 				newUserID: {Name: "new", UUID: newUserID, Password: "new-password"},
 			},
-			func(*quicTUIC.Service[string]) (*listener.Listener, error) {
-				started <- authenticatedUserName(auth.ContextWithUser(context.Background(), "new"))
+			func(*quicTUIC.Service[authenticatedTUICUser]) (*listener.Listener, error) {
+				started <- authenticatedUserName(auth.ContextWithUser(context.Background(), authenticatedTUICUser{UUID: newUserID, Name: "new"}))
 				<-release
 				return listener.New(listener.Options{}), nil
 			},
@@ -73,9 +73,19 @@ func TestManagedUserIdentityPublishedBeforeServiceStart(t *testing.T) {
 }
 
 func TestAuthenticatedIdentitySurvivesNewGenerationPublication(t *testing.T) {
-	oldContext := auth.ContextWithUser(context.Background(), "old")
+	oldContext := auth.ContextWithUser(context.Background(), authenticatedTUICUser{UUID: oldUserID, Name: "old"})
 	if got := authenticatedUserName(oldContext); got != "old" {
 		t.Fatalf("old authenticated identity changed after publication: %q", got)
+	}
+}
+
+func TestSameOrEmptyNamesRemainDistinctAuthenticationKeys(t *testing.T) {
+	for _, name := range []string{"", "same"} {
+		first := authenticatedTUICUser{UUID: oldUserID, Name: name}
+		second := authenticatedTUICUser{UUID: newUserID, Name: name}
+		if first == second {
+			t.Fatalf("TUIC authentication identities collapsed for name %q", name)
+		}
 	}
 }
 

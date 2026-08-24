@@ -721,10 +721,9 @@ func (s *Box) closeResources() (firstPanic any, err error) {
 		}
 	}
 	retryManagerClose := func(closeFunc func() error) error {
-		deadline := time.Now().Add(C.StopTimeout)
 		for {
 			err := closeFunc()
-			if !errors.Is(err, os.ErrClosed) || !time.Now().Before(deadline) {
+			if !errors.Is(err, adapter.ErrLifecycleBusy) {
 				return err
 			}
 			time.Sleep(time.Millisecond)
@@ -740,6 +739,10 @@ func (s *Box) closeResources() (firstPanic any, err error) {
 	if s.inbound != nil {
 		closeResource("inbound", func() error { return retryManagerClose(s.inbound.Close) })
 	}
+	if s.connection != nil {
+		closeResource("connection", s.connection.Close)
+		s.connection = nil
+	}
 	if s.service != nil {
 		closeResource("service", func() error { return retryManagerClose(s.service.CloseAfterProducerQuiescence) })
 	}
@@ -754,9 +757,6 @@ func (s *Box) closeResources() (firstPanic any, err error) {
 	}
 	if s.router != nil {
 		closeResource("router", s.router.Close)
-	}
-	if s.connection != nil {
-		closeResource("connection", s.connection.Close)
 	}
 	if s.dnsRouter != nil {
 		closeResource("dns-router", s.dnsRouter.Close)
