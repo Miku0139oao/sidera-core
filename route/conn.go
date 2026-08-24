@@ -144,15 +144,16 @@ func (m *ConnectionManager) NewConnection(ctx context.Context, this N.Dialer, co
 		remoteConn = spoofConn
 	}
 	serverFirst := sniff.Skip(&metadata)
-	var done atomic.Bool
-	if m.kickWriteHandshake(ctx, conn, remoteConn, serverFirst, false, &done, onClose) {
+	var handshakeDone atomic.Bool
+	if m.kickWriteHandshake(ctx, conn, remoteConn, serverFirst, false, &handshakeDone, onClose) {
 		return
 	}
-	if m.kickWriteHandshake(ctx, remoteConn, conn, serverFirst, true, &done, onClose) {
+	if m.kickWriteHandshake(ctx, remoteConn, conn, serverFirst, true, &handshakeDone, onClose) {
 		return
 	}
-	go m.connectionCopy(ctx, conn, remoteConn, false, &done, onClose)
-	go m.connectionCopy(ctx, remoteConn, conn, true, &done, onClose)
+	relayState := &connectionRelayState{onClose: onClose}
+	go m.connectionCopy(ctx, conn, remoteConn, false, relayState)
+	go m.connectionCopy(ctx, remoteConn, conn, true, relayState)
 }
 
 func (m *ConnectionManager) NewPacketConnection(ctx context.Context, this N.Dialer, conn N.PacketConn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
@@ -272,24 +273,63 @@ func (m *ConnectionManager) NewPacketConnection(ctx context.Context, this N.Dial
 	go m.packetConnectionCopy(ctx, destination, conn, true, &done, onClose)
 }
 
-func (m *ConnectionManager) connectionCopy(ctx context.Context, source net.Conn, destination net.Conn, direction bool, done *atomic.Bool, onClose N.CloseHandlerFunc) {
+type connectionRelayState struct {
+	access          sync.Mutex
+	completed       int
+	firstErr        error
+	firstMeaningful error
+	onClose         N.CloseHandlerFunc
+}
+
+func (s *connectionRelayState) record(err error) {
+	if err == nil {
+		return
+	}
+	s.access.Lock()
+	if s.firstErr == nil {
+		s.firstErr = err
+	}
+	if s.firstMeaningful == nil && !E.IsClosedOrCanceled(err) {
+		s.firstMeaningful = err
+	}
+	s.access.Unlock()
+}
+
+func (s *connectionRelayState) finish(source net.Conn, destination net.Conn) {
+	s.access.Lock()
+	s.completed++
+	if s.completed != 2 {
+		s.access.Unlock()
+		return
+	}
+	err := s.firstMeaningful
+	if err == nil {
+		err = s.firstErr
+	}
+	onClose := s.onClose
+	s.access.Unlock()
+	if onClose != nil {
+		onClose(err)
+	}
+	common.Close(source, destination)
+}
+
+func (m *ConnectionManager) connectionCopy(ctx context.Context, source net.Conn, destination net.Conn, direction bool, state *connectionRelayState) {
 	_, err := bufio.CopyWithIncreateBuffer(destination, source, bufio.DefaultIncreaseBufferAfter, bufio.DefaultBatchSize)
 	if err != nil {
+		state.record(err)
 		common.Close(source, destination)
-	} else if duplexDst, isDuplex := destination.(N.WriteCloser); isDuplex {
+	} else if duplexDst, isDuplex := N.UnwrapWriter(destination).(N.WriteCloser); isDuplex {
 		err = duplexDst.CloseWrite()
+		state.record(err)
 		if err != nil {
 			common.Close(source, destination)
 		}
 	} else {
-		destination.Close()
+		err = destination.Close()
+		state.record(err)
 	}
-	if done.Swap(true) {
-		if onClose != nil {
-			onClose(err)
-		}
-		common.Close(source, destination)
-	}
+	state.finish(source, destination)
 	if !direction {
 		if err == nil {
 			m.logger.DebugContext(ctx, "connection upload finished")

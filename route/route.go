@@ -39,6 +39,56 @@ var defaultPacketSniffers = []sniff.PacketSniffer{
 	sniff.NTP,
 }
 
+const (
+	maxPacketSniffPackets  = 64
+	maxPacketSniffBytes    = 256 * 1024
+	maxPacketSniffDuration = 2 * time.Second
+)
+
+var fragmentedQUICSniffer sniff.PacketSniffer = sniff.QUICClientHello
+
+type packetSniffBudget struct {
+	started            bool
+	deadline           time.Time
+	packets            int
+	bytes              int
+	processedBySniffer map[string]int
+}
+
+func (b *packetSniffBudget) begin(now time.Time, timeout time.Duration) {
+	if b.started {
+		return
+	}
+	if timeout <= 0 {
+		timeout = C.ReadPayloadTimeout
+	}
+	if timeout > maxPacketSniffDuration {
+		timeout = maxPacketSniffDuration
+	}
+	b.started = true
+	b.deadline = now.Add(timeout)
+}
+
+func (b *packetSniffBudget) exhausted(now time.Time) bool {
+	return b.packets >= maxPacketSniffPackets || b.bytes >= maxPacketSniffBytes || (b.started && !now.Before(b.deadline))
+}
+
+func (b *packetSniffBudget) account(packetLen int) {
+	b.packets++
+	b.bytes += packetLen
+}
+
+func (b *packetSniffBudget) processed(snifferNames []string) int {
+	return b.processedBySniffer[strings.Join(snifferNames, "\x00")]
+}
+
+func (b *packetSniffBudget) markProcessed(snifferNames []string) {
+	if b.processedBySniffer == nil {
+		b.processedBySniffer = make(map[string]int)
+	}
+	b.processedBySniffer[strings.Join(snifferNames, "\x00")]++
+}
+
 // Deprecated: use RouteConnectionEx instead.
 func (r *Router) RouteConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext) error {
 	done := make(chan any)
@@ -107,6 +157,7 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
 	}
 	selectedRule, _, buffers, _, err := r.matchRule(ctx, &metadata, conn, nil)
 	if err != nil {
+		buf.ReleaseMulti(buffers)
 		return err
 	}
 	var selectedOutbound adapter.Outbound
@@ -144,8 +195,8 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
 			}
 			return action.Error(ctx)
 		case *R.RuleActionHijackDNS:
-			for _, buffer := range buffers {
-				conn = bufio.NewCachedConn(conn, buffer)
+			for index := len(buffers) - 1; index >= 0; index-- {
+				conn = bufio.NewCachedConn(conn, buffers[index])
 			}
 			N.CloseOnHandshakeFailure(conn, onClose, r.hijackDNSStream(ctx, conn, metadata))
 			return nil
@@ -160,8 +211,8 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
 		selectedOutbound = defaultOutbound
 	}
 
-	for _, buffer := range buffers {
-		conn = bufio.NewCachedConn(conn, buffer)
+	for index := len(buffers) - 1; index >= 0; index-- {
+		conn = bufio.NewCachedConn(conn, buffers[index])
 	}
 	for _, tracker := range r.trackers {
 		conn = tracker.RoutedConnection(ctx, conn, metadata, selectedRule, selectedOutbound)
@@ -238,6 +289,7 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
 	}
 	selectedRule, _, _, packetBuffers, err := r.matchRule(ctx, &metadata, nil, conn)
 	if err != nil {
+		N.ReleaseMultiPacketBuffer(packetBuffers)
 		return err
 	}
 	var selectedOutbound adapter.Outbound
@@ -287,9 +339,10 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
 		}
 		selectedOutbound = defaultOutbound
 	}
-	for _, buffer := range packetBuffers {
-		conn = bufio.NewCachedPacketConn(conn, buffer.Buffer, buffer.Destination)
-		N.PutPacketBuffer(buffer)
+	for index := len(packetBuffers) - 1; index >= 0; index-- {
+		packetBuffer := packetBuffers[index]
+		conn = bufio.NewCachedPacketConn(conn, packetBuffer.Buffer, packetBuffer.Destination)
+		N.PutPacketBuffer(packetBuffer)
 	}
 	for _, tracker := range r.trackers {
 		conn = tracker.RoutedPacketConnection(ctx, conn, metadata, selectedRule, selectedOutbound)
@@ -582,6 +635,7 @@ func (r *Router) matchRule(
 	if fatalErr != nil {
 		return
 	}
+	var sniffBudget packetSniffBudget
 
 match:
 	for currentRuleIndex, currentRule := range r.rules {
@@ -650,7 +704,7 @@ match:
 		}
 		switch action := currentRule.Action().(type) {
 		case *R.RuleActionSniff:
-			newBuffer, newPacketBuffers, newErr := r.actionSniff(ctx, metadata, action, inputConn, inputPacketConn, buffers, packetBuffers)
+			newBuffer, newPacketBuffers, newErr := r.actionSniff(ctx, metadata, action, inputConn, inputPacketConn, buffers, packetBuffers, &sniffBudget)
 			if newBuffer != nil {
 				buffers = append(buffers, newBuffer)
 			} else if len(newPacketBuffers) > 0 {
@@ -690,6 +744,7 @@ match:
 func (r *Router) actionSniff(
 	ctx context.Context, metadata *adapter.InboundContext, action *R.RuleActionSniff,
 	inputConn net.Conn, inputPacketConn N.PacketConn, inputBuffers []*buf.Buffer, inputPacketBuffers []*N.PacketBuffer,
+	sniffBudget *packetSniffBudget,
 ) (buffer *buf.Buffer, packetBuffers []*N.PacketBuffer, fatalErr error) {
 	if sniff.Skip(metadata) {
 		r.logger.DebugContext(ctx, "sniff skipped due to port considered as server-first")
@@ -768,7 +823,18 @@ func (r *Router) actionSniff(
 			packetSniffers = defaultPacketSniffers
 		}
 		var err error
-		for _, packetBuffer := range inputPacketBuffers {
+		sniffBudget.begin(time.Now(), action.Timeout)
+		processed := sniffBudget.processed(action.SnifferNames)
+		if processed > len(inputPacketBuffers) {
+			processed = len(inputPacketBuffers)
+		}
+		for _, packetBuffer := range inputPacketBuffers[processed:] {
+			if sniffBudget.exhausted(time.Now()) {
+				err = E.New("packet sniff budget exceeded")
+				metadata.SnifferNames = action.SnifferNames
+				metadata.SniffError = err
+				goto finally
+			}
 			if quicMoreData() {
 				err = sniff.PeekPacket(
 					ctx,
@@ -783,6 +849,7 @@ func (r *Router) actionSniff(
 					packetSniffers...,
 				)
 			}
+			sniffBudget.markProcessed(action.SnifferNames)
 			metadata.SnifferNames = action.SnifferNames
 			metadata.SniffError = err
 			if errors.Is(err, sniff.ErrNeedMoreData) {
@@ -792,43 +859,49 @@ func (r *Router) actionSniff(
 			}
 			goto finally
 		}
-		packetBuffers = inputPacketBuffers
 		for {
+			if sniffBudget.exhausted(time.Now()) {
+				err = E.New("packet sniff budget exceeded")
+				metadata.SnifferNames = action.SnifferNames
+				metadata.SniffError = err
+				goto finally
+			}
 			var (
 				sniffBuffer = buf.NewPacket()
 				destination M.Socksaddr
 				done        = make(chan struct{})
 			)
 			go func() {
-				sniffTimeout := C.ReadPayloadTimeout
-				if action.Timeout > 0 {
-					sniffTimeout = action.Timeout
-				}
-				inputPacketConn.SetReadDeadline(time.Now().Add(sniffTimeout))
+				_ = inputPacketConn.SetReadDeadline(sniffBudget.deadline)
 				destination, err = inputPacketConn.ReadPacket(sniffBuffer)
-				inputPacketConn.SetReadDeadline(time.Time{})
+				_ = inputPacketConn.SetReadDeadline(time.Time{})
 				close(done)
 			}()
 			select {
 			case <-done:
 			case <-ctx.Done():
-				inputPacketConn.Close()
+				_ = inputPacketConn.Close()
+				<-done
+				sniffBuffer.Release()
 				fatalErr = ctx.Err()
 				return
 			}
 			if err != nil {
 				sniffBuffer.Release()
+				metadata.SnifferNames = action.SnifferNames
+				metadata.SniffError = err
 				if !E.IsTimeout(err) {
 					fatalErr = err
 					return
 				}
 			} else {
+				sniffBudget.account(sniffBuffer.Len())
 				if quicMoreData() {
 					err = sniff.PeekPacket(
 						ctx,
 						metadata,
 						sniffBuffer.Bytes(),
-						sniff.QUICClientHello,
+						fragmentedQUICSniffer,
 					)
 				} else {
 					err = sniff.PeekPacket(
@@ -843,6 +916,7 @@ func (r *Router) actionSniff(
 					Destination: destination,
 				}
 				packetBuffers = append(packetBuffers, packetBuffer)
+				sniffBudget.markProcessed(action.SnifferNames)
 				metadata.SnifferNames = action.SnifferNames
 				metadata.SniffError = err
 				if errors.Is(err, sniff.ErrNeedMoreData) {

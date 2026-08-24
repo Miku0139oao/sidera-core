@@ -3,6 +3,7 @@ package rule
 import (
 	"context"
 	"runtime"
+	"sync"
 	"time"
 
 	"github.com/Miku0139oao/sidera-core/adapter"
@@ -13,6 +14,10 @@ type RuleSetUpdater struct {
 	ctx      context.Context
 	cancel   context.CancelFunc
 	ruleSets []*RemoteRuleSet
+	access   sync.Mutex
+	started  bool
+	closed   bool
+	workers  sync.WaitGroup
 }
 
 func NewRuleSetUpdater(ctx context.Context, ruleSets []adapter.RuleSet) *RuleSetUpdater {
@@ -35,18 +40,35 @@ func NewRuleSetUpdater(ctx context.Context, ruleSets []adapter.RuleSet) *RuleSet
 }
 
 func (u *RuleSetUpdater) Start() {
-	go u.loopUpdate()
+	u.access.Lock()
+	if u.started || u.closed {
+		u.access.Unlock()
+		return
+	}
+	u.started = true
+	u.workers.Add(1)
+	u.access.Unlock()
+	go func() {
+		defer u.workers.Done()
+		u.loopUpdate()
+	}()
 }
 
 func (u *RuleSetUpdater) Close() error {
-	u.cancel()
+	u.access.Lock()
+	if !u.closed {
+		u.closed = true
+		u.cancel()
+	}
+	u.access.Unlock()
+	u.workers.Wait()
 	return nil
 }
 
 func (u *RuleSetUpdater) loopUpdate() {
 	nextUpdates := make([]time.Time, len(u.ruleSets))
 	for i, ruleSet := range u.ruleSets {
-		nextUpdates[i] = ruleSet.lastUpdated.Add(ruleSet.updateInterval)
+		nextUpdates[i] = ruleSet.lastUpdateTime().Add(ruleSet.updateInterval)
 	}
 	timer := time.NewTimer(0)
 	defer timer.Stop()
@@ -62,9 +84,13 @@ func (u *RuleSetUpdater) loopUpdate() {
 			if now.Before(nextUpdates[i]) {
 				continue
 			}
-			ruleSet.updateOnce()
+			if u.ctx.Err() != nil {
+				return
+			}
+			if ruleSet.updateOnce(u.ctx) {
+				updated = true
+			}
 			nextUpdates[i] = now.Add(ruleSet.updateInterval)
-			updated = true
 		}
 		if updated && common.LowMemory {
 			runtime.GC()
