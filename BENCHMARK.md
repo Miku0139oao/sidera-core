@@ -84,25 +84,25 @@ CPU-cost measurement.
 
 ## Final integrated correctness smoke
 
-Diagnostic bundle `20260824-131932-627705600-1099` used clean Sidera
-`2dd1db15`, sing-box `f60f3728`, Xray `6e3322d2`, and locally committed harness
-`35709aab`. All 27 implementation/scenario cells completed without a recorded
+Diagnostic bundle `20260824-141906-721724700-928` used clean Sidera
+`2777ab72`, sing-box `f60f3728`, Xray `6e3322d2`, and locally committed harness
+`a563549a`. All 27 implementation/scenario cells completed without a recorded
 error across SOCKS direct, VLESS TCP/TLS/REALITY, UDP direct, VLESS/XUDP, DNS
 UDP/TCP and DNS truncation fallback. REALITY interop passed in both directions.
 
 This was deliberately one short Windows block, so it is a correctness smoke,
 not comparative performance evidence. Its content-addressed files include:
 
-- `report.json` SHA-256 `ef3922296d691dd23984105c1dfde5db82fd5b627c29ec5b8c6622e4a41e19d7`;
-- `artifact-manifest.json` SHA-256 `065926ea299da991e72173ed41e62b2c01f473b3be5fbd4404a4be3f8467816c`;
+- `report.json` SHA-256 `3600a5b8b4244565156aec861d91bce87100cf32a75065bd6235030688776053`;
+- `artifact-manifest.json` SHA-256 `c3f1f7f0b47598802cd917e9dbb9c53cd33d423c9a508270e3645a2797f391c8`;
 - bundle status `complete`, 156 records, zero failed cells; and
 - TUN status `scaffold_only_not_run` rather than a fabricated pass.
 
 ## Low-memory artifact observations (unattested)
 
 `release/LOW_MEMORY_BUILD_TAGS` defines an additive artifact for low-RAM
-systems. Final stripped Windows builds from `2dd1db15` were 36,685,824 bytes
-versus 80,516,608 bytes full (54.44% smaller). This is an artifact-size fact,
+systems. Final stripped Windows builds from `2777ab72` were 36,699,648 bytes
+versus 80,538,112 bytes full (54.43% smaller). This is an artifact-size fact,
 not an RSS or throughput claim. Earlier unmanifested local smoke runs suggested:
 
 - a stripped Linux binary of about 35 MiB versus 76 MiB full;
