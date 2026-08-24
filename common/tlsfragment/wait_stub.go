@@ -8,11 +8,10 @@ import (
 	"time"
 )
 
-func writeAndWaitAck(ctx context.Context, conn *net.TCPConn, payload []byte, fallbackDelay time.Duration) error {
-	_, err := conn.Write(payload)
+func writeAndWaitAck(ctx context.Context, conn *net.TCPConn, payload []byte, fallbackDelay time.Duration) (int, error) {
+	written, err := writeFull(conn.Write, payload)
 	if err != nil {
-		return err
+		return written, err
 	}
-	time.Sleep(fallbackDelay)
-	return nil
+	return written, waitForDelay(ctx, fallbackDelay)
 }

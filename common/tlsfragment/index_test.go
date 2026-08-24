@@ -18,3 +18,35 @@ func TestIndexTLSServerName(t *testing.T) {
 	require.Equal(t, serverName.ServerName, string(payload[serverName.Index:serverName.Index+serverName.Length]))
 	require.Equal(t, "github.com", serverName.ServerName)
 }
+
+func TestIndexTLSServerNameRejectsEmptyAndMalformedNames(t *testing.T) {
+	if serverName := tf.IndexTLSServerName(makeFragmentClientHello("")); serverName != nil {
+		t.Fatalf("empty SNI was indexed: %+v", serverName)
+	}
+
+	payload := makeFragmentClientHello("example.com")
+	serverName := tf.IndexTLSServerName(payload)
+	require.NotNil(t, serverName)
+	payload[serverName.Index-2]++ // make the declared host_name longer than its entry
+	if serverName = tf.IndexTLSServerName(payload); serverName != nil {
+		t.Fatalf("malformed SNI was indexed: %+v", serverName)
+	}
+}
+
+func FuzzIndexTLSServerName(f *testing.F) {
+	f.Add(makeFragmentClientHello("example.com"))
+	f.Add(makeFragmentClientHello(""))
+	f.Add([]byte(nil))
+	f.Fuzz(func(t *testing.T, payload []byte) {
+		serverName := tf.IndexTLSServerName(payload)
+		if serverName == nil {
+			return
+		}
+		if serverName.Length <= 0 || serverName.Index < 0 || serverName.Index+serverName.Length > len(payload) {
+			t.Fatalf("invalid server-name bounds: %+v for %d bytes", serverName, len(payload))
+		}
+		if got := string(payload[serverName.Index : serverName.Index+serverName.Length]); got != serverName.ServerName {
+			t.Fatalf("indexed server name = %q, want %q", got, serverName.ServerName)
+		}
+	})
+}

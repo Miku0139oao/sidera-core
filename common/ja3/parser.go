@@ -49,6 +49,11 @@ const (
 	commaByte = byte(44)
 )
 
+// IsGREASE reports whether value is one of the 16 values reserved by RFC 8701.
+func IsGREASE(value uint16) bool {
+	return value&GreaseBitmask == 0x0A0A && byte(value>>8) == byte(value)
+}
+
 // parseSegment to populate the corresponding ClientHello object or return an error
 func (j *ClientHello) parseSegment(segment []byte) error {
 	// Check if we can decode the next fields
@@ -122,12 +127,15 @@ func (j *ClientHello) parseHandshake(hs []byte) error {
 		return &ParseError{LengthErr, 6}
 	}
 
-	csLen := uint16(cs[0])<<8 | uint16(cs[1])
-	numCiphers := int(csLen / 2)
+	csLen := int(binary.BigEndian.Uint16(cs))
+	if csLen < 2 || csLen%2 != 0 {
+		return &ParseError{LengthErr, 7}
+	}
+	numCiphers := csLen / 2
 	cipherSuites := make([]uint16, 0, numCiphers)
 
 	// Check if we can decode the next fields
-	if len(cs) < cipherSuiteHeaderLen+int(csLen)+compressMethodHeaderLen {
+	if len(cs) < cipherSuiteHeaderLen+csLen+compressMethodHeaderLen {
 		return &ParseError{LengthErr, 7}
 	}
 
@@ -138,13 +146,13 @@ func (j *ClientHello) parseHandshake(hs []byte) error {
 	j.CipherSuites = cipherSuites
 
 	// Check if we can decode the next fields
-	compressMethodLen := uint16(cs[cipherSuiteHeaderLen+int(csLen)])
-	if len(cs) < cipherSuiteHeaderLen+int(csLen)+compressMethodHeaderLen+int(compressMethodLen) {
+	compressMethodLen := int(cs[cipherSuiteHeaderLen+csLen])
+	if compressMethodLen < 1 || len(cs) < cipherSuiteHeaderLen+csLen+compressMethodHeaderLen+compressMethodLen {
 		return &ParseError{LengthErr, 8}
 	}
 
 	// Extensions
-	exs := cs[cipherSuiteHeaderLen+int(csLen)+compressMethodHeaderLen+int(compressMethodLen):]
+	exs := cs[cipherSuiteHeaderLen+csLen+compressMethodHeaderLen+compressMethodLen:]
 
 	err := j.parseExtensions(exs)
 
@@ -166,8 +174,8 @@ func (j *ClientHello) parseExtensions(exs []byte) error {
 	exsLen := uint16(exs[0])<<8 | uint16(exs[1])
 	exs = exs[extensionsHeaderLen:]
 
-	// Check if we can decode the next fields
-	if len(exs) < int(exsLen) {
+	// The extensions vector consumes the rest of a structurally valid ClientHello.
+	if len(exs) != int(exsLen) {
 		return &ParseError{LengthErr, 10}
 	}
 
@@ -197,17 +205,19 @@ func (j *ClientHello) parseExtensions(exs []byte) error {
 		switch exType {
 		case sniExtensionType: // Extensions: server_name
 
-			// Check if we can decode the next fields
+			// Check the ServerNameList and its sole host_name entry.
 			if len(sex) < sniExtensionHeaderLen {
 				return &ParseError{LengthErr, 13}
 			}
+			if int(binary.BigEndian.Uint16(sex)) != len(sex)-2 {
+				return &ParseError{LengthErr, 13}
+			}
 
-			sniType := uint8(sex[2])
-			sniLen := uint16(sex[3])<<8 | uint16(sex[4])
+			sniType := sex[2]
+			sniLen := int(binary.BigEndian.Uint16(sex[3:5]))
 			sex = sex[sniExtensionHeaderLen:]
 
-			// Check if we can decode the next fields
-			if len(sex) != int(sniLen) {
+			if sniLen == 0 || len(sex) != sniLen {
 				return &ParseError{LengthErr, 14}
 			}
 
@@ -224,13 +234,16 @@ func (j *ClientHello) parseExtensions(exs []byte) error {
 				return &ParseError{LengthErr, 15}
 			}
 
-			ecsLen := uint16(sex[0])<<8 | uint16(sex[1])
-			numCurves := int(ecsLen / 2)
+			ecsLen := int(binary.BigEndian.Uint16(sex))
+			if ecsLen < 2 || ecsLen%2 != 0 {
+				return &ParseError{LengthErr, 16}
+			}
+			numCurves := ecsLen / 2
 			ellipticCurves = make([]uint16, 0, numCurves)
 			sex = sex[ecExtensionHeaderLen:]
 
 			// Check if we can decode the next fields
-			if len(sex) != int(ecsLen) {
+			if len(sex) != ecsLen {
 				return &ParseError{LengthErr, 16}
 			}
 
@@ -264,7 +277,7 @@ func (j *ClientHello) parseExtensions(exs []byte) error {
 				return &ParseError{LengthErr, 19}
 			}
 			versionsLen := int(sex[0])
-			if versionsLen%2 != 0 || versionsLen != len(sex)-1 {
+			if versionsLen < 2 || versionsLen%2 != 0 || versionsLen != len(sex)-1 {
 				return &ParseError{LengthErr, 19}
 			}
 			for i := 0; i < versionsLen; i += 2 {
@@ -275,14 +288,14 @@ func (j *ClientHello) parseExtensions(exs []byte) error {
 				return &ParseError{LengthErr, 20}
 			}
 			ssaLen := int(binary.BigEndian.Uint16(sex))
-			if ssaLen%2 != 0 || ssaLen != len(sex)-2 {
+			if ssaLen < 2 || ssaLen%2 != 0 || ssaLen != len(sex)-2 {
 				return &ParseError{LengthErr, 20}
 			}
 			for i := 0; i < ssaLen; i += 2 {
 				signatureAlgorithms = append(signatureAlgorithms, binary.BigEndian.Uint16(sex[2+i:2+i+2]))
 			}
 		}
-		exs = exs[4+exLen:]
+		exs = exs[extensionHeaderLen+int(exLen):]
 	}
 	j.ServerName = string(sni)
 	j.Extensions = extensions
@@ -307,7 +320,7 @@ func (j *ClientHello) marshalJA3() {
 	appendUint16List := func(values []uint16) {
 		start := len(byteString)
 		for _, value := range values {
-			if value&GreaseBitmask == 0x0A0A {
+			if IsGREASE(value) {
 				continue
 			}
 			byteString = strconv.AppendUint(byteString, uint64(value), 10)

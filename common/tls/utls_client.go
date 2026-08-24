@@ -83,8 +83,23 @@ func (c *UTLSClientConfig) STDConfig() (*STDConfig, error) {
 }
 
 func (c *UTLSClientConfig) Client(conn net.Conn) (Conn, error) {
+	return c.client(conn, c.ctx)
+}
+
+func (c *UTLSClientConfig) ClientHandshake(ctx context.Context, conn net.Conn) (Conn, error) {
+	tlsConn, err := c.client(conn, ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err = tlsConn.HandshakeContext(ctx); err != nil {
+		return nil, err
+	}
+	return tlsConn, nil
+}
+
+func (c *UTLSClientConfig) client(conn net.Conn, ctx context.Context) (Conn, error) {
 	if c.fragment || c.recordFragment {
-		conn = tf.NewConn(conn, c.ctx, c.fragment, c.recordFragment, c.fragmentFallbackDelay)
+		conn = tf.NewConn(conn, ctx, c.fragment, c.recordFragment, c.fragmentFallbackDelay)
 	}
 	conn, err := applyTLSSpoof(conn, c.spoof, c.spoofMethod)
 	if err != nil {

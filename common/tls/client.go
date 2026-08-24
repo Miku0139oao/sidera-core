@@ -165,8 +165,7 @@ func (d *defaultDialer) dialContext(ctx context.Context, destination M.Socksaddr
 		conn.Close()
 		var echErr *tls.ECHRejectionError
 		if echRetry && errors.As(err, &echErr) && len(echErr.RetryConfigList) > 0 {
-			if echConfig, isECH := d.config.(ECHCapableConfig); isECH {
-				echConfig.SetECHConfigList(echErr.RetryConfigList)
+			if setECHRetryConfig(d.config, echErr.RetryConfigList) {
 				return d.dialContext(ctx, destination, false)
 			}
 		}
@@ -178,6 +177,21 @@ func (d *defaultDialer) dialContext(ctx context.Context, destination M.Socksaddr
 		return nil, err
 	}
 	return wrappedConn, nil
+}
+
+func setECHRetryConfig(config Config, configList []byte) bool {
+	if retryConfig, isECH := config.(interface{ SetECHRetryConfigList([]byte) }); isECH {
+		retryConfig.SetECHRetryConfigList(configList)
+		return true
+	}
+	if echConfig, isECH := config.(ECHCapableConfig); isECH {
+		echConfig.SetECHConfigList(configList)
+		return true
+	}
+	if ktlsConfig, isKTLS := config.(*KTLSClientConfig); isKTLS {
+		return setECHRetryConfig(ktlsConfig.Config, configList)
+	}
+	return false
 }
 
 func (d *defaultDialer) Upstream() any {
