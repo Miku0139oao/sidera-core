@@ -172,13 +172,20 @@ func (t *UDPTransport) exchangeTCP(ctx context.Context, message *mDNS.Msg) (*mDN
 	}
 	defer conn.Close()
 	defer setConnDeadline(ctx, conn, deadline.NeedAdditionalReadDeadline(conn))()
-	err = WriteMessage(conn, message.Id, message)
+	queryID := mDNS.Id()
+	err = WriteMessage(conn, queryID, message)
 	if err != nil {
 		return nil, E.Cause(err, "write request")
 	}
-	response, err := ReadMessage(conn)
-	if err != nil {
-		return nil, E.Cause(err, "read response")
+	for {
+		response, readErr := ReadMessage(conn)
+		if readErr != nil {
+			return nil, E.Cause(readErr, "read response")
+		}
+		if response.Id != queryID || validateDNSResponse(message, response) != nil {
+			continue
+		}
+		response.Id = message.Id
+		return response, nil
 	}
-	return response, nil
 }

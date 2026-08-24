@@ -3,7 +3,6 @@ package quic
 import (
 	"bytes"
 	"context"
-	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -34,6 +33,11 @@ import (
 
 var _ adapter.DNSTransport = (*HTTP3Transport)(nil)
 
+type http3RoundTripper interface {
+	RoundTrip(request *http.Request) (*http.Response, error)
+	Close() error
+}
+
 func RegisterHTTP3Transport(registry *dns.TransportRegistry) {
 	dns.RegisterTransport[option.RemoteHTTPSDNSServerOptions](registry, C.DNSTypeHTTP3, NewHTTP3)
 }
@@ -47,7 +51,8 @@ type HTTP3Transport struct {
 	serverAddr      M.Socksaddr
 	tlsConfig       *tls.STDConfig
 	transportAccess sync.Mutex
-	transport       *http3.Transport
+	transport       http3RoundTripper
+	closed          bool
 }
 
 func NewHTTP3(ctx context.Context, logger log.ContextLogger, tag string, options option.RemoteHTTPSDNSServerOptions) (adapter.DNSTransport, error) {
@@ -147,14 +152,29 @@ func (t *HTTP3Transport) Start(stage adapter.StartStage) error {
 
 func (t *HTTP3Transport) Close() error {
 	t.transportAccess.Lock()
-	defer t.transportAccess.Unlock()
-	return t.transport.Close()
+	if t.closed {
+		t.transportAccess.Unlock()
+		return nil
+	}
+	t.closed = true
+	oldTransport := t.transport
+	t.transport = nil
+	t.transportAccess.Unlock()
+	if oldTransport == nil {
+		return nil
+	}
+	return oldTransport.Close()
 }
 
 func (t *HTTP3Transport) Reset() {
 	t.transportAccess.Lock()
 	defer t.transportAccess.Unlock()
-	t.transport.Close()
+	if t.closed {
+		return
+	}
+	if t.transport != nil {
+		t.transport.Close()
+	}
 	t.transport = t.newTransport()
 }
 
@@ -177,6 +197,11 @@ func (t *HTTP3Transport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS
 	request.Header.Set("Content-Type", transport.MimeType)
 	request.Header.Set("Accept", transport.MimeType)
 	t.transportAccess.Lock()
+	if t.closed || t.transport == nil {
+		t.transportAccess.Unlock()
+		requestBuffer.Release()
+		return nil, net.ErrClosed
+	}
 	currentTransport := t.transport
 	t.transportAccess.Unlock()
 	response, err := currentTransport.RoundTrip(request)
@@ -188,26 +213,7 @@ func (t *HTTP3Transport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS
 	if response.StatusCode != http.StatusOK {
 		return nil, E.New("unexpected status: ", response.Status)
 	}
-	var responseMessage mDNS.Msg
-	if response.ContentLength > 0 {
-		responseBuffer := buf.NewSize(int(response.ContentLength))
-		defer responseBuffer.Release()
-		_, err = responseBuffer.ReadFullFrom(response.Body, int(response.ContentLength))
-		if err != nil {
-			return nil, err
-		}
-		err = responseMessage.Unpack(responseBuffer.Bytes())
-	} else {
-		rawMessage, err = io.ReadAll(response.Body)
-		if err != nil {
-			return nil, err
-		}
-		err = responseMessage.Unpack(rawMessage)
-	}
-	if err != nil {
-		return nil, err
-	}
-	return &responseMessage, nil
+	return transport.ReadDNSResponseBody(response.Body, response.ContentLength)
 }
 
 func (t *HTTP3Transport) ExchangeAsync(ctx context.Context, message *mDNS.Msg, callback func(response *mDNS.Msg, err error)) {
