@@ -123,9 +123,11 @@ records; `report.json` SHA-256 is
 `artifact-manifest.json` SHA-256 is
 `680ceb1b834bf0c960574815cf92354a01efdaf9b2afae903ffadc073638d694`.
 
-A privileged WSL preflight separately confirmed CAP_NET_ADMIN, `/dev/net/tun`,
-`ip`, `tc netem`, cgroup v2 and namespace create/delete. The TUN execution
-cells remain explicitly `planned_not_run`; readiness is not a performance pass.
+A later privileged WSL run executed the 7-cell gVisor TUN matrix against Sidera
+`c75c79a2` and recorded `executed_all_selected_passed`. Cells covered direct UDP,
+VLESS/XUDP, DNS UDP/TCP/fallback, and VLESS TCP download/upload. Plan SHA-256
+`3dbf0353d6987710118157ee5d5e2806ab33481a17e03155b1ba15e5e6c72c23`. This is
+correctness evidence only: WSL, one DUT implementation, no publication telemetry.
 
 ## Low-memory artifact observations (unattested)
 
