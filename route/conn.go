@@ -137,12 +137,12 @@ func (m *ConnectionManager) TrackPacketConn(conn net.PacketConn) net.PacketConn 
 }
 
 func (m *ConnectionManager) NewConnection(ctx context.Context, this N.Dialer, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
-	operationCtx, finishOperation, loaded := m.beginOperation(ctx)
+	operationCtx, operation, loaded := m.beginOperation(ctx)
 	if !loaded {
 		N.CloseOnHandshakeFailure(conn, onClose, net.ErrClosed)
 		return
 	}
-	defer finishOperation()
+	defer operation.finish()
 	ctx = adapter.WithContext(operationCtx, &metadata)
 	var (
 		remoteConn net.Conn
@@ -208,6 +208,7 @@ func (m *ConnectionManager) NewConnection(ctx context.Context, this N.Dialer, co
 		}
 		return
 	}
+	operation.transferTo(relay)
 	go func() {
 		defer relay.Done()
 		m.connectionCopy(ctx, conn, remoteConn, false, relayState)
@@ -219,12 +220,12 @@ func (m *ConnectionManager) NewConnection(ctx context.Context, this N.Dialer, co
 }
 
 func (m *ConnectionManager) NewPacketConnection(ctx context.Context, this N.Dialer, conn N.PacketConn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
-	operationCtx, finishOperation, loaded := m.beginOperation(ctx)
+	operationCtx, operation, loaded := m.beginOperation(ctx)
 	if !loaded {
 		N.CloseOnHandshakeFailure(conn, onClose, net.ErrClosed)
 		return
 	}
-	defer finishOperation()
+	defer operation.finish()
 	ctx = adapter.WithContext(operationCtx, &metadata)
 	var (
 		remotePacketConn   net.PacketConn
@@ -345,6 +346,7 @@ func (m *ConnectionManager) NewPacketConnection(ctx context.Context, this N.Dial
 		}
 		return
 	}
+	operation.transferTo(relay)
 	go func() {
 		defer relay.Done()
 		m.packetConnectionCopy(ctx, conn, destination, false, &done, onClose)
@@ -355,7 +357,28 @@ func (m *ConnectionManager) NewPacketConnection(ctx context.Context, this N.Dial
 	}()
 }
 
-func (m *ConnectionManager) beginOperation(parent context.Context) (context.Context, func(), bool) {
+// connectionOperation separates setup joining from the lifetime of the context
+// retained by dialers and wrappers. Only the setup goroutine calls transferTo
+// and finish; transferTo must precede starting the relay goroutines.
+type connectionOperation struct {
+	manager        *ConnectionManager
+	releaseContext func()
+	transferred    bool
+}
+
+func (o *connectionOperation) transferTo(relay *relayLease) {
+	relay.releaseContext = o.releaseContext
+	o.transferred = true
+}
+
+func (o *connectionOperation) finish() {
+	if !o.transferred {
+		o.releaseContext()
+	}
+	o.manager.operationGroup.Done()
+}
+
+func (m *ConnectionManager) beginOperation(parent context.Context) (context.Context, *connectionOperation, bool) {
 	m.access.Lock()
 	if m.closed {
 		m.access.Unlock()
@@ -372,17 +395,20 @@ func (m *ConnectionManager) beginOperation(parent context.Context) (context.Cont
 	if cause := context.Cause(managerCtx); cause != nil {
 		cancel(cause)
 	}
-	return operationCtx, func() {
-		stopManager()
-		cancel(nil)
-		m.operationGroup.Done()
+	return operationCtx, &connectionOperation{
+		manager: m,
+		releaseContext: func() {
+			stopManager()
+			cancel(nil)
+		},
 	}, true
 }
 
 type relayLease struct {
-	manager   *ConnectionManager
-	closers   []io.Closer
-	remaining atomic.Int32
+	manager        *ConnectionManager
+	closers        []io.Closer
+	remaining      atomic.Int32
+	releaseContext func()
 }
 
 func (m *ConnectionManager) beginRelays(count int, closers ...io.Closer) *relayLease {
@@ -400,6 +426,9 @@ func (m *ConnectionManager) beginRelays(count int, closers ...io.Closer) *relayL
 
 func (r *relayLease) Done() {
 	if r.remaining.Add(-1) == 0 {
+		if r.releaseContext != nil {
+			r.releaseContext()
+		}
 		r.manager.access.Lock()
 		delete(r.manager.activeRelays, r)
 		r.manager.access.Unlock()
