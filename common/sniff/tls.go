@@ -12,12 +12,17 @@ import (
 	E "github.com/sagernet/sing/common/exceptions"
 )
 
+// errTLSClientHelloCaptured aborts crypto/tls after ClientHello is parsed.
+// GetConfigForClient already has SNI; continuing the handshake (version
+// negotiation, PSK/ticket resumption, certificate selection) is unused work.
+var errTLSClientHelloCaptured = errors.New("tls client hello captured")
+
 func TLSClientHello(ctx context.Context, metadata *adapter.InboundContext, reader io.Reader) error {
 	var clientHello *tls.ClientHelloInfo
 	err := tls.Server(bufio.NewReadOnlyConn(reader), &tls.Config{
 		GetConfigForClient: func(argHello *tls.ClientHelloInfo) (*tls.Config, error) {
 			clientHello = argHello
-			return nil, nil
+			return nil, errTLSClientHelloCaptured
 		},
 	}).HandshakeContext(ctx)
 	if clientHello != nil {
