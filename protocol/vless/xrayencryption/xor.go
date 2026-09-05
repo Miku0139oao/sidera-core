@@ -13,6 +13,7 @@ import (
 	"net"
 	"sync"
 
+	"github.com/sagernet/sing/common/buf"
 	N "github.com/sagernet/sing/common/network"
 
 	"lukechampine.com/blake3"
@@ -71,7 +72,13 @@ func (c *XorConn) Write(b []byte) (int, error) {
 		return 0, errors.New("xray encryption: missing outbound XOR stream")
 	}
 
-	encoded := append([]byte(nil), b...)
+	scratch := buf.NewSize(len(b))
+	defer func() {
+		clear(scratch.Bytes())
+		scratch.Release()
+	}()
+	encoded := scratch.Extend(len(b))
+	copy(encoded, b)
 	for remaining := encoded; ; {
 		if len(remaining) <= c.OutSkip {
 			c.OutSkip -= len(remaining)
