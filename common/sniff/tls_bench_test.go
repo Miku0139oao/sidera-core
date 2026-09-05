@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"io"
 	"testing"
 
 	"github.com/Miku0139oao/sidera-core/adapter"
@@ -25,6 +26,20 @@ func BenchmarkTLSClientHelloComplete(b *testing.B) {
 }
 
 func BenchmarkTLSClientHelloFragmented(b *testing.B) {
+	hello := tlsClientHelloRecord("www.example.com", []uint16{tls.VersionTLS13, tls.VersionTLS12})
+	ctx := context.Background()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		var metadata adapter.InboundContext
+		reader := io.MultiReader(bytes.NewReader(hello[:8]), bytes.NewReader(hello[8:]))
+		if err := sniff.TLSClientHello(ctx, &metadata, reader); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkTLSClientHelloTruncated(b *testing.B) {
 	hello := tlsClientHelloRecord("www.example.com", []uint16{tls.VersionTLS13, tls.VersionTLS12})
 	truncated := hello[:len(hello)/2]
 	ctx := context.Background()
