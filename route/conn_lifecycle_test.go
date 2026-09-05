@@ -192,7 +192,7 @@ func TestConnectionManagerCloseJoinsSetupOperations(t *testing.T) {
 		t.Fatalf("Close returned before setup completion: %v", err)
 	case <-time.After(20 * time.Millisecond):
 	}
-	finishOperation()
+	finishOperation.finish()
 	select {
 	case err := <-closeDone:
 		require.NoError(t, err)
