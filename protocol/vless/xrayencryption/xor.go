@@ -72,13 +72,20 @@ func (c *XorConn) Write(b []byte) (int, error) {
 		return 0, errors.New("xray encryption: missing outbound XOR stream")
 	}
 
-	scratch := buf.NewSize(len(b))
-	defer func() {
-		clear(scratch.Bytes())
-		scratch.Release()
-	}()
-	encoded := scratch.Extend(len(b))
-	copy(encoded, b)
+	var encoded []byte
+	// A pooled Buffer itself has allocation/coordination overhead. Retain the
+	// original path for tiny writes and for sizes the backing pool cannot reuse.
+	if len(b) < 1024 || len(b) > buf.MaxPooledBufferSize {
+		encoded = append([]byte(nil), b...)
+	} else {
+		scratch := buf.NewSize(len(b))
+		defer func() {
+			clear(scratch.Bytes())
+			scratch.Release()
+		}()
+		encoded = scratch.Extend(len(b))
+		copy(encoded, b)
+	}
 	for remaining := encoded; ; {
 		if len(remaining) <= c.OutSkip {
 			c.OutSkip -= len(remaining)
