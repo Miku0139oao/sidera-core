@@ -9,6 +9,40 @@ publishable run must identify clean source trees, exact build
 commands and flags, configurations, binaries, raw samples, and the harness by
 commit and SHA-256.
 
+## 2026-09-05 verified optimization closure
+
+Tested production source: `17ad9f492a41e37ad311a56945c468fc1653497f`.
+Harness source: `d7981b1943242bd690d3947f241205f73251834e`.
+Independent Astra review **APPROVE** applies to these code revisions and the
+saved, scoped WSL controls—not publication or production performance claims.
+The sibling harness contains the durable index at `evidence/20260905/README.md`.
+
+- Successful complete/fragmented TLS sniffing saves **616 B/op and 8 allocations**.
+- XOR writes of 16/32 KiB drop from **16384/32768 to 64 B/op**; tiny and
+  oversized writes retain baseline allocation costs. The initial unconditional
+  pooling regression is preserved, not omitted from the record.
+- A separate 10,000-write XOR burst/explicit-GC probe records retained heap,
+  PSS and USS. It is not daemon RSS or memory-pressure evidence.
+- Final Windows default and low-memory release-profile race suites, Linux
+  default race suite, and full Linux amd64/arm64/386 plus Windows amd64 builds
+  passed. Harness final Windows/Linux race and Linux 386 non-race suites passed.
+- Clean pinned Sidera/sing-box/Xray diagnostics pass **27/27** cells; clean
+  Sidera↔Xray REALITY passes both directions. Six balanced before/after/A/A
+  transport rounds pass **36/36** cells. All analyzed timing effects are inside
+  the pre-existing A/A noise thresholds: **no end-to-end speedup or equivalence
+  claim** follows from this run.
+- Seven guarded gVisor TUN cells pass positive, link-down negative and restored
+  positive controls, with invocation-bound results, fresh same-interface RX/TX
+  deltas, artifact hashes and a zero-survivor cleanup snapshot. The fixture
+  confines ingress and explicitly restores saved routes; this does **not** prove
+  default routing fallback, automatic link-flap recovery, DNS hijacking, or
+  arbitrary-delay duplicate detection (UDP observation is bounded to 50 ms).
+
+Publication still needs appropriate native/two-host cross-core measurements,
+Windows Wintun and constrained-memory daemon runtime coverage. Release-profile
+build success is not runtime validation of every architecture. Historical runs
+below retain their original scope and are not upgraded by this closure.
+
 ## Corrected methodology
 
 The current harness uses each core as its own SOCKS client and, for VLESS
