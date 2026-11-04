@@ -255,7 +255,7 @@ func (m *queryMultiplexer) dispatch(ctx context.Context, message *mDNS.Msg, call
 		callback(nil, net.ErrClosed)
 		return
 	}
-	m.exchangeAsync(ctx, message, callback, retryReadError)
+	go m.exchangeAsync(ctx, message, callback, retryReadError)
 }
 
 func (m *queryMultiplexer) exchangeSingle(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {
