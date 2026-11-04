@@ -188,6 +188,7 @@ jobs:
         run: |
           set -xeuo pipefail
           sudo gem install --no-document fpm -v 1.16.0
+          echo '%_rpmformat 4' > "$HOME/.rpmmacros"
           sudo apt-get install -y debsigs
           cp .fpm_systemd .fpm
           fpm -t deb \
@@ -210,6 +211,7 @@ jobs:
         run: |-
           set -xeuo pipefail
           sudo gem install --no-document fpm -v 1.16.0
+          echo '%_rpmformat 4' > "$HOME/.rpmmacros"
           cp .fpm_systemd .fpm
           fpm -t rpm \
             --name "${NAME}" \
