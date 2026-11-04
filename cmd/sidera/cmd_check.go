@@ -7,6 +7,7 @@ import (
 	"github.com/Miku0139oao/sidera-core/log"
 	"github.com/Miku0139oao/sidera-core/option"
 
+	"github.com/sagernet/sing/service"
 	"github.com/spf13/cobra"
 )
 
@@ -45,7 +46,7 @@ func check() error {
 }
 
 func validateConfigOptions(options option.Options) error {
-	ctx, cancel := context.WithCancel(globalCtx)
+	ctx, cancel := context.WithCancel(service.ExtendContext(globalCtx))
 	defer cancel()
 	instance, err := box.New(box.Options{
 		Context:        ctx,

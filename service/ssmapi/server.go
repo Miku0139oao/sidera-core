@@ -101,10 +101,11 @@ func (s *Service) Start(stage adapter.StartStage) error {
 	}
 	err := s.loadCache()
 	if err != nil {
-		s.logger.Error(E.Cause(err, "load cache"))
+		s.logger.Error("load cache: ", err, ", saving disabled")
+	} else {
+		s.saveTicker = time.NewTicker(1 * time.Minute)
+		go s.loopSaveCache()
 	}
-	s.saveTicker = time.NewTicker(1 * time.Minute)
-	go s.loopSaveCache()
 	if s.tlsConfig != nil {
 		err = s.tlsConfig.Start()
 		if err != nil {
