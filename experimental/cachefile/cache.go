@@ -231,11 +231,9 @@ func (c *CacheFile) startCacheCleanup() {
 		interval = time.Hour
 	}
 	c.cleanupStarted = true
-	c.workerGroup.Add(1)
-	go func() {
-		defer c.workerGroup.Done()
+	c.workerGroup.Go(func() {
 		c.loopCacheCleanup(interval, cleanupFunc)
-	}()
+	})
 }
 
 func (c *CacheFile) start() error {
@@ -276,7 +274,7 @@ func (c *CacheFile) start() error {
 			if name[0] == 0 {
 				return b.ForEachBucket(func(k []byte) error {
 					bucketName := string(k)
-					if !(common.Contains(bucketNameList, bucketName)) {
+					if !common.Contains(bucketNameList, bucketName) {
 						_ = b.DeleteBucket(name)
 					}
 					return nil
