@@ -205,14 +205,12 @@ func (s *Service) ActivateRuntime() {
 	}
 	tcpListener := s.tcpListener
 	s.tcpListener = nil
-	s.serveWorkers.Add(1)
-	go func() {
-		defer s.serveWorkers.Done()
+	s.serveWorkers.Go(func() {
 		serveErr := s.httpServer.Serve(tcpListener)
 		if serveErr != nil && s.ctx.Err() == nil {
 			s.logger.Error("serve error: ", serveErr)
 		}
-	}()
+	})
 }
 
 func (s *Service) StopAdmission() error {

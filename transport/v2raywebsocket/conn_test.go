@@ -65,7 +65,9 @@ func (c *websocketMemoryConn) Close() error {
 	c.closed.Store(true)
 	return nil
 }
-func (c *websocketMemoryConn) LocalAddr() net.Addr              { return websocketTestAddr("local") }
+
+func (c *websocketMemoryConn) LocalAddr() net.Addr { return websocketTestAddr("local") }
+
 func (c *websocketMemoryConn) RemoteAddr() net.Addr             { return websocketTestAddr("remote") }
 func (c *websocketMemoryConn) SetDeadline(time.Time) error      { return nil }
 func (c *websocketMemoryConn) SetReadDeadline(time.Time) error  { return nil }

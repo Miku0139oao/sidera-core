@@ -132,11 +132,9 @@ func (b *webBridge) serveWebSocket(writer http.ResponseWriter, request *http.Req
 		activity: activity,
 		workers:  &sessionWorkers,
 	}
-	sessionWorkers.Add(1)
-	go func() {
-		defer sessionWorkers.Done()
+	sessionWorkers.Go(func() {
 		keepWebSocketAlive(ctx, cancel, conn)
-	}()
+	})
 	b.grpcServer.ServeHTTP(response, grpcRequest)
 	response.writeTrailerFrame()
 	_ = conn.Close(websocket.StatusNormalClosure, "")

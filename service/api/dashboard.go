@@ -123,11 +123,9 @@ func (d *dashboard) start() error {
 	}
 	d.httpClient = &http.Client{Transport: transport}
 	d.claimPublication()
-	d.workers.Add(1)
-	go func() {
-		defer d.workers.Done()
+	d.workers.Go(func() {
 		d.loopUpdate()
-	}()
+	})
 	return nil
 }
 
