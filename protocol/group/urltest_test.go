@@ -44,11 +44,9 @@ func TestURLTestConcurrentTouchAndCloseJoinsLoop(t *testing.T) {
 	group := newLifecycleTestURLGroup()
 	var callers sync.WaitGroup
 	for range 100 {
-		callers.Add(1)
-		go func() {
-			defer callers.Done()
+		callers.Go(func() {
 			group.Touch()
-		}()
+		})
 	}
 	if err := group.Close(); err != nil {
 		t.Fatal(err)
