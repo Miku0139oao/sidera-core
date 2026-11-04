@@ -215,16 +215,14 @@ func TestServerReplayStateGlobalBoundConcurrent(t *testing.T) {
 	var successes atomic.Int32
 	var wait sync.WaitGroup
 	for index := range 64 {
-		wait.Add(1)
-		go func() {
-			defer wait.Done()
+		wait.Go(func() {
 			key := [32]byte{byte(index + 1)}
 			if _, err := server.acceptResume(ticket, key); err == nil {
 				successes.Add(1)
 			} else if !errors.Is(err, errGlobalReplayLimit) {
 				t.Errorf("acceptResume(%d): %v", index, err)
 			}
-		}()
+		})
 	}
 	wait.Wait()
 	if successes.Load() != 8 || server.replayEntries != 8 || len(server.Sessions[ticket].NfsKeys) != 8 {

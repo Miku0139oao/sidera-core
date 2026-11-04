@@ -81,9 +81,7 @@ func TestRealmConcurrentAdmissionIsBounded(t *testing.T) {
 	var overloaded atomic.Int32
 	var waitGroup sync.WaitGroup
 	for index := range 32 {
-		waitGroup.Add(1)
-		go func() {
-			defer waitGroup.Done()
+		waitGroup.Go(func() {
 			response := registerRealmForTest(t, server, user, fmt.Sprintf("concurrent-%d", index))
 			switch response.Code {
 			case http.StatusOK:
@@ -93,7 +91,7 @@ func TestRealmConcurrentAdmissionIsBounded(t *testing.T) {
 			default:
 				t.Errorf("unexpected concurrent registration status %d: %s", response.Code, response.Body.String())
 			}
-		}()
+		})
 	}
 	waitGroup.Wait()
 	if admitted.Load() != 4 || overloaded.Load() != 28 {

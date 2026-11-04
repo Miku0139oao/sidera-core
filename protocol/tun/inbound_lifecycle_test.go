@@ -38,6 +38,7 @@ func (s *tunLifecycleRuleSet) Name() string { return s.name }
 func (s *tunLifecycleRuleSet) StartContext(context.Context, *adapter.HTTPStartContext) error {
 	return nil
 }
+
 func (s *tunLifecycleRuleSet) Metadata() adapter.RuleSetMetadata { return adapter.RuleSetMetadata{} }
 func (s *tunLifecycleRuleSet) ExtractIPSet() []*netipx.IPSet     { return s.ipSets }
 func (s *tunLifecycleRuleSet) IncRef()                           { s.refs.Add(1) }
@@ -119,11 +120,9 @@ func TestTUNCloseBalancesRuleSetRefsAndCallbacks(t *testing.T) {
 	require.Len(t, inbound.routeExcludeAddressSet, 1)
 
 	var callbacks sync.WaitGroup
-	callbacks.Add(1)
-	go func() {
-		defer callbacks.Done()
+	callbacks.Go(func() {
 		routeSet.fire()
-	}()
+	})
 	require.NoError(t, inbound.Close())
 	callbacks.Wait()
 	require.NoError(t, inbound.Close())
