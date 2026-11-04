@@ -72,7 +72,9 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
         with:
-          version: v2.12.2
+          # golangci-lint exports and imports Go type information; a release
+          # older than the toolchain aborts on its export-data version.
+          version: latest
           args: --timeout=30m
           install-mode: binary
           verify: false
