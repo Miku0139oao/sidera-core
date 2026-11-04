@@ -719,11 +719,9 @@ func (a *adminAPI) startReloadWorker() {
 		if a.reloadDelay <= 0 {
 			a.reloadDelay = adminReloadDelay
 		}
-		a.workers.Add(1)
-		go func() {
-			defer a.workers.Done()
+		a.workers.Go(func() {
 			a.reloadLoop()
-		}()
+		})
 	})
 }
 

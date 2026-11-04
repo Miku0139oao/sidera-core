@@ -69,9 +69,7 @@ func TestRuleSetConcurrentMatchReloadCleanupClose(t *testing.T) {
 		var workers sync.WaitGroup
 		stop := make(chan struct{})
 		for range 8 {
-			workers.Add(1)
-			go func() {
-				defer workers.Done()
+			workers.Go(func() {
 				metadata := &adapter.InboundContext{Domain: "example.com"}
 				for {
 					select {
@@ -81,7 +79,7 @@ func TestRuleSetConcurrentMatchReloadCleanupClose(t *testing.T) {
 						ruleSet.Match(metadata)
 					}
 				}
-			}()
+			})
 		}
 		for range 100 {
 			require.NoError(t, testCase.reload())

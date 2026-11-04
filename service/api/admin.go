@@ -792,11 +792,9 @@ func (a *adminAPI) start() error {
 			a.recordTrafficOpen(metadata)
 		}
 	}
-	a.workers.Add(1)
-	go func() {
-		defer a.workers.Done()
+	a.workers.Go(func() {
 		a.maintenanceLoop()
-	}()
+	})
 	a.startReloadWorker()
 	return nil
 }
