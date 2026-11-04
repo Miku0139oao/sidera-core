@@ -1,6 +1,6 @@
 module github.com/Miku0139oao/sidera-core
 
-go 1.24.7
+go 1.25.0
 
 require (
 	filippo.io/age v1.3.1
@@ -56,9 +56,9 @@ require (
 	github.com/sagernet/sing-snell v0.0.0-20260719094200-c43fbee0e839
 	github.com/sagernet/sing-tun v0.8.12-0.20260724023008-68aa7bdc2819
 	github.com/sagernet/sing-usbip v0.0.0-20260616101517-efb91521eddb
-	github.com/sagernet/sing-vmess v0.2.8-0.20250909125414-3aed155119a1
+	github.com/sagernet/sing-vmess v0.2.9-0.20261019223527-a0c58542bd9d
 	github.com/sagernet/smux v1.5.50-sing-box-mod.1
-	github.com/sagernet/tailscale v1.92.4-sing-box-1.13-mod.7.0.20260717155615-b353b93d194a
+	github.com/sagernet/tailscale v1.92.4-sing-box-1.13-mod.10
 	github.com/sagernet/wireguard-go v0.0.5-0.20260717024847-6f5e8b1947ae
 	github.com/sagernet/ws v0.0.0-20231204124109-acfe8907c854
 	github.com/spf13/cobra v1.10.2
@@ -107,7 +107,6 @@ require (
 	github.com/fxamacker/cbor/v2 v2.7.0 // indirect
 	github.com/gaissmai/bart v0.18.0 // indirect
 	github.com/go-jose/go-jose/v4 v4.1.3 // indirect
-	github.com/go-json-experiment/json v0.0.0-20250813024750-ebf49471dced // indirect
 	github.com/go-ole/go-ole v1.3.0 // indirect
 	github.com/gobwas/httphead v0.1.0 // indirect
 	github.com/gobwas/pool v0.2.1 // indirect
