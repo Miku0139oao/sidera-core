@@ -75,10 +75,7 @@ func TestXorConnWriteFragmentedHeader(t *testing.T) {
 			conn := NewXorConn(sink, NewCTR(key, iv), nil, 0, 0)
 			offset := 0
 			for _, part := range split {
-				end := offset + part
-				if end > len(input) {
-					end = len(input)
-				}
+				end := min(offset+part, len(input))
 				n, err := conn.Write(input[offset:end])
 				if err != nil || n != end-offset {
 					t.Fatalf("Write(%d:%d) = %d, %v", offset, end, n, err)
@@ -130,7 +127,7 @@ func TestXorConnWriteRepeatedRecords(t *testing.T) {
 	t.Run("sequential writes", func(t *testing.T) {
 		sink := &shortWriteConn{maxWrite: 1 << 20}
 		conn := NewXorConn(sink, NewCTR(key, iv), nil, 0, 0)
-		for i := 0; i < 8; i++ {
+		for i := range 8 {
 			piece := input[i*len(record) : (i+1)*len(record)]
 			n, err := conn.Write(piece)
 			if err != nil || n != len(piece) {

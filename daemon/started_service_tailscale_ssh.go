@@ -211,9 +211,7 @@ func (s *StartedService) StartTailscaleSSHSession(
 		Message: &TailscaleSSHServerMessage_Ready{Ready: &TailscaleSSHReady{}},
 	})
 
-	workersWg.Add(1)
-	go func() {
-		defer workersWg.Done()
+	workersWg.Go(func() {
 		for {
 			msg, recvErr := server.Recv()
 			if recvErr == io.EOF {
@@ -243,7 +241,7 @@ func (s *StartedService) StartTailscaleSSHSession(
 				}))
 			}
 		}
-	}()
+	})
 
 	pumpReader := func(reader io.Reader) {
 		defer workersWg.Done()

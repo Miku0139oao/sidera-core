@@ -83,7 +83,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		return nil, err
 	}
 	serviceUsers := common.Map(options.Users, func(it option.ShadowTLSUser) shadowtls.User {
-		return (shadowtls.User)(it)
+		return shadowtls.User(it)
 	})
 	var managedUsers []adapter.ManagedUser
 	if options.Version == 3 {

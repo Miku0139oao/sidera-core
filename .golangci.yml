@@ -37,6 +37,24 @@ linters:
     presets:
       - comments
       - common-false-positives
+    rules:
+      # TransportCredentials.Info must report a protocol info struct; these
+      # fields are what gRPC reads off it, and there is no replacement that
+      # keeps custom per-connection credentials working.
+      - path: transport/v2raygrpc/tls_credentials.go
+        linters:
+          - staticcheck
+        text: SA1019
+      - path: experimental/boxdd/peer_linux.go
+        linters:
+          - staticcheck
+        text: SA1019
+      # copyPacketExact records a non-nil error before returning, so these
+      # nil comparisons are unreachable by construction, not by accident.
+      - path: route/conn.go
+        linters:
+          - staticcheck
+        text: SA4023
     paths:
       - transport/simple-obfs
       - \.pb\.go$
