@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"os"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -65,6 +66,11 @@ func NewURLTest(ctx context.Context, router adapter.Router, logger log.ContextLo
 	}
 	if len(outbound.tags) == 0 {
 		return nil, E.New("missing tags")
+	}
+	for i, tag := range outbound.tags {
+		if slices.Contains(outbound.tags[:i], tag) {
+			return nil, E.New("duplicate tag: ", tag)
+		}
 	}
 	return outbound, nil
 }
@@ -437,6 +443,11 @@ func (g *URLTestGroup) URLTest(ctx context.Context) (map[string]uint16, error) {
 	return g.runURLTest(mergedContext, false)
 }
 
+type urlTestResult struct {
+	delay uint16
+	err   error
+}
+
 func (g *URLTestGroup) runURLTest(ctx context.Context, force bool) (map[string]uint16, error) {
 	result := make(map[string]uint16)
 	if g.checking.Swap(true) {
@@ -464,7 +475,20 @@ func (g *URLTestGroup) runURLTest(ctx context.Context, force bool) (map[string]u
 		b.Go(realTag, func() (any, error) {
 			testCtx, cancel := context.WithTimeout(ctx, C.TCPTimeout)
 			defer cancel()
-			t, err := urltest.URLTest(testCtx, g.link, p)
+			// The probe runs in its own goroutine: a dialer that ignores the
+			// context must not stall the whole group check past the deadline.
+			testChan := make(chan urlTestResult, 1)
+			go func() {
+				delay, testErr := urltest.URLTest(testCtx, g.link, p)
+				testChan <- urlTestResult{delay: delay, err: testErr}
+			}()
+			var testResult urlTestResult
+			select {
+			case testResult = <-testChan:
+			case <-testCtx.Done():
+				testResult.err = testCtx.Err()
+			}
+			t, err := testResult.delay, testResult.err
 			if err != nil {
 				g.logger.Debug("outbound ", tag, " unavailable: ", err)
 				g.history.DeleteURLTestHistory(realTag)
