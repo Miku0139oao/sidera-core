@@ -78,9 +78,10 @@ func Read(reader io.Reader, recover bool) (ruleSetCompat option.PlainRuleSetComp
 		return
 	}
 	ruleSetCompat.Version = version
-	ruleSetCompat.Options.Rules = make([]option.HeadlessRule, length)
 	for i := range length {
-		ruleSetCompat.Options.Rules[i], err = readRule(bReader, recover)
+		var rule option.HeadlessRule
+		rule, err = readRule(bReader, recover)
+		ruleSetCompat.Options.Rules = append(ruleSetCompat.Options.Rules, rule)
 		if err != nil {
 			err = E.Cause(err, "read rule[", i, "]")
 			return
@@ -522,18 +523,21 @@ func readRuleItemString(reader varbin.Reader) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	result := make([]string, length)
-	for i := range result {
+	var result []string
+	for range length {
 		strLen, err := binary.ReadUvarint(reader)
 		if err != nil {
 			return nil, err
 		}
-		buf := make([]byte, strLen)
-		_, err = io.ReadFull(reader, buf)
+		if maxInt := uint64(^uint(0) >> 1); strLen > maxInt {
+			return nil, E.New("string length out of range: ", strLen)
+		}
+		value := make([]byte, strLen)
+		_, err = io.ReadFull(reader, value)
 		if err != nil {
 			return nil, err
 		}
-		result[i] = string(buf)
+		result = append(result, string(value))
 	}
 	return result, nil
 }
@@ -655,13 +659,14 @@ func readLogicalRule(reader varbin.Reader, recovery bool) (logicalRule option.Lo
 	if err != nil {
 		return
 	}
-	logicalRule.Rules = make([]option.HeadlessRule, length)
 	for i := range length {
-		logicalRule.Rules[i], err = readRule(reader, recovery)
+		var rule option.HeadlessRule
+		rule, err = readRule(reader, recovery)
 		if err != nil {
 			err = E.Cause(err, "read logical rule [", i, "]")
 			return
 		}
+		logicalRule.Rules = append(logicalRule.Rules, rule)
 	}
 	err = binary.Read(reader, binary.BigEndian, &logicalRule.Invert)
 	if err != nil {
