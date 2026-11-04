@@ -22,7 +22,7 @@ go mod verify
 go mod tidy -diff
 ```
 
-CI uses official Go 1.26.5 with `GOTOOLCHAIN=local` and
+CI uses official Go 1.27.3 with `GOTOOLCHAIN=local` and
 `GOFLAGS=-mod=readonly`. Release jobs must not silently download another
 compiler, accept a dirty checkout, force an existing tag to another commit, or
 turn an unavailable Git identity into `dirty=false`. A manual publishing

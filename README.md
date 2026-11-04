@@ -31,12 +31,12 @@ matrix.
 
 ## Build
 
-The supported release toolchain is Go 1.26.5. The repository includes a
-`.go-version` file, and Make targets set `GOTOOLCHAIN=go1.26.5` so local,
+The supported release toolchain is Go 1.27.3. The repository includes a
+`.go-version` file, and Make targets set `GOTOOLCHAIN=go1.27.3` so local,
 container, and release builds use the same tested patch release. Compatibility
 with the private runtime symbols enabled by the `badlinkname` build tag is
-covered by the Go 1.26 CI build and race-test jobs. Go 1.24.7 remains the
-module compatibility floor, with Go 1.24 and 1.25 retained in the test matrix.
+covered by the Go 1.27 CI build and race-test jobs. Go 1.25.0 is the module
+compatibility floor, with Go 1.25, 1.26 and 1.27 retained in the test matrix.
 
 ```sh
 go build ./cmd/sidera
@@ -64,7 +64,7 @@ path; omitting it causes the linker to reject that path.
 
 ```sh
 mkdir -p dist
-GOTOOLCHAIN=go1.26.5 CGO_ENABLED=0 go build -trimpath \
+GOTOOLCHAIN=go1.27.3 CGO_ENABLED=0 go build -trimpath \
   -tags "$(cat release/LOW_MEMORY_BUILD_TAGS)" \
   -ldflags "$(cat release/LDFLAGS)" \
   -o dist/sidera-low-memory ./cmd/sidera

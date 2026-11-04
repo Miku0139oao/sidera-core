@@ -145,7 +145,7 @@ literal_low_memory_build() {
   [[ ! -e dist/sidera-low-memory ]] || existed=1
   [[ $existed -eq 0 ]] || fail "dist/sidera-low-memory already exists"
   mkdir -p dist
-  GOTOOLCHAIN=go1.26.5 CGO_ENABLED=0 go build -trimpath \
+  GOTOOLCHAIN=go1.27.3 CGO_ENABLED=0 go build -trimpath \
     -tags "$(cat release/LOW_MEMORY_BUILD_TAGS)" \
     -ldflags "$(cat release/LDFLAGS)" \
     -o dist/sidera-low-memory ./cmd/sidera

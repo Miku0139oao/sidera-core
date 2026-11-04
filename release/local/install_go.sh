@@ -7,8 +7,8 @@ go_version=$(tr -d '\r\n' < "$root/.go-version")
 
 # Updating .go-version must update this reviewed checksum in the same commit.
 case "$go_version" in
-  1.26.5)
-    archive_sha256=5c2c3b16caefa1d968a94c1daca04a7ca301a496d9b086e17ad77bb81393f053
+  1.27.3)
+    archive_sha256=65efbc80fdc1fa2cd2631cad5b481777a68e8725f34e89f50fc6ac714e379b40
     ;;
   *)
     echo "no reviewed linux-amd64 Go checksum for $go_version" >&2

@@ -30,7 +30,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
-          go-version: 1.26.5
+          go-version: 1.27.3
           cache-dependency-path: go.sum
       - name: Validate pinned inputs and modules
         run: bash script/ci-release-gate.sh inputs
@@ -70,7 +70,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
-          go-version: 1.26.5
+          go-version: 1.27.3
           cache-dependency-path: go.sum
       - name: Compile all packages and release command
         shell: bash
@@ -100,7 +100,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
-          go-version: 1.26.5
+          go-version: 1.27.3
           cache-dependency-path: go.sum
       - name: Compile command
         run: >-
@@ -118,7 +118,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
-          go-version: 1.26.5
+          go-version: 1.27.3
           cache-dependency-path: go.sum
       - name: Run race-sensitive packages serially
         run: bash script/ci-release-gate.sh race
@@ -135,7 +135,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
-          go-version: 1.26.5
+          go-version: 1.27.3
           cache: false
       - name: Build each profile twice with separate caches
         run: bash script/ci-release-gate.sh reproducible
