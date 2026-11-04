@@ -18,6 +18,7 @@ import (
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/auth"
 	E "github.com/sagernet/sing/common/exceptions"
+	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/protocol/http"
 	"github.com/sagernet/sing/protocol/socks"
@@ -194,6 +195,7 @@ func (h *Inbound) newConnection(ctx context.Context, conn net.Conn, metadata ada
 func (h *Inbound) newUserConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
 	metadata.Inbound = h.Tag()
 	metadata.InboundType = h.Type()
+	metadata.OriginDestination = M.SocksaddrFromNet(conn.LocalAddr()).Unwrap()
 	user, loaded := auth.UserFromContext[string](ctx)
 	if !loaded {
 		h.logger.InfoContext(ctx, "inbound connection to ", metadata.Destination)
