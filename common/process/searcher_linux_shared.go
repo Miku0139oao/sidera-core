@@ -28,6 +28,11 @@ const (
 	socketDiagResponseMinSize   = 72
 	socketDiagByFamily          = 20
 	pathProc                    = "/proc"
+
+	// A socket keeps the uid it was created with, while /proc reflects the
+	// current uid of the process, so a socket created before a privilege drop
+	// only appears under a scan of all users.
+	processPathsAllUsers = ^uint32(0)
 )
 
 type socketDiagConn struct {
@@ -91,21 +96,22 @@ func newUIDProcessPathCache(ttl time.Duration) *uidProcessPathCache {
 }
 
 func (c *uidProcessPathCache) findProcessPath(targetInode, uid uint32) (string, error) {
-	if cached, ok := c.cache.Get(uid); ok {
-		if processPath, found := cached.entries[targetInode]; found {
+	for _, scanUID := range []uint32{uid, processPathsAllUsers} {
+		if cached, ok := c.cache.Get(scanUID); ok {
+			if processPath, found := cached.entries[targetInode]; found {
+				return processPath, nil
+			}
+		}
+		processPaths, err := buildProcessPathByUIDCache(scanUID)
+		if err != nil {
+			return "", err
+		}
+		c.cache.Add(scanUID, &uidProcessPaths{entries: processPaths})
+		if processPath, found := processPaths[targetInode]; found {
 			return processPath, nil
 		}
 	}
-	processPaths, err := buildProcessPathByUIDCache(uid)
-	if err != nil {
-		return "", err
-	}
-	c.cache.Add(uid, &uidProcessPaths{entries: processPaths})
-	processPath, found := processPaths[targetInode]
-	if !found {
-		return "", E.New("process of uid(", uid, "), inode(", targetInode, ") not found")
-	}
-	return processPath, nil
+	return "", E.New("process of uid(", uid, "), inode(", targetInode, ") not found")
 }
 
 func (c *socketDiagConn) Close() error {
@@ -322,7 +328,7 @@ func buildProcessPathByUIDCache(uid uint32) (map[uint32]string, error) {
 			}
 			return nil, err
 		}
-		if info.Sys().(*syscall.Stat_t).Uid != uid {
+		if uid != processPathsAllUsers && info.Sys().(*syscall.Stat_t).Uid != uid {
 			continue
 		}
 		processPath := filepath.Join(pathProc, file.Name())

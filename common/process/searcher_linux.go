@@ -68,6 +68,10 @@ func (s *linuxSearcher) FindProcessInfo(ctx context.Context, network string, sou
 }
 
 func (s *linuxSearcher) resolveSocketByNetlink(network string, source netip.AddrPort, destination netip.AddrPort) (inode, uid uint32, err error) {
+	// A 4-in-6 mapped address would otherwise select the IPv6 socket-diag
+	// family and never match the IPv4 socket.
+	source = netip.AddrPortFrom(source.Addr().Unmap(), source.Port())
+	destination = netip.AddrPortFrom(destination.Addr().Unmap(), destination.Port())
 	family, protocol, err := socketDiagSettings(network, source)
 	if err != nil {
 		return 0, 0, err
