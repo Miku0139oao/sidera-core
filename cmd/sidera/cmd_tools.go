@@ -7,8 +7,8 @@ import (
 	"github.com/Miku0139oao/sidera-core"
 	E "github.com/sagernet/sing/common/exceptions"
 	N "github.com/sagernet/sing/common/network"
-
 	"github.com/sagernet/sing/service"
+
 	"github.com/spf13/cobra"
 )
 

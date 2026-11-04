@@ -6,8 +6,8 @@ import (
 	"github.com/Miku0139oao/sidera-core"
 	"github.com/Miku0139oao/sidera-core/log"
 	"github.com/Miku0139oao/sidera-core/option"
-
 	"github.com/sagernet/sing/service"
+
 	"github.com/spf13/cobra"
 )
 
