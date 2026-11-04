@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/Miku0139oao/sidera-core/adapter"
-	"github.com/Miku0139oao/sidera-core/common/dialer"
 	"github.com/Miku0139oao/sidera-core/common/sniff"
 	"github.com/Miku0139oao/sidera-core/common/tlsspoof"
 	C "github.com/Miku0139oao/sidera-core/constant"
@@ -19,7 +18,6 @@ import (
 	F "github.com/sagernet/sing/common/format"
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
-	N "github.com/sagernet/sing/common/network"
 
 	"github.com/miekg/dns"
 )
@@ -72,28 +70,6 @@ func NewRuleAction(ctx context.Context, logger logger.ContextLogger, action opti
 		return &RuleActionBypass{
 			Outbound:               action.BypassOptions.Outbound,
 			RuleActionRouteOptions: routeOptions,
-		}, nil
-	case C.RuleActionTypeDirect:
-		directDialer, err := dialer.New(ctx, option.DialerOptions{
-			AbstractDialerOptions: action.DirectOptions.AbstractDialerOptions,
-		}, false)
-		if err != nil {
-			return nil, err
-		}
-		var description string
-		descriptions := action.DirectOptions.Descriptions()
-		switch len(descriptions) {
-		case 0:
-		case 1:
-			description = F.ToString("(", descriptions[0], ")")
-		case 2:
-			description = F.ToString("(", descriptions[0], ",", descriptions[1], ")")
-		default:
-			description = F.ToString("(", descriptions[0], ",", descriptions[1], ",...)")
-		}
-		return &RuleActionDirect{
-			Dialer:      directDialer,
-			description: description,
 		}, nil
 	case C.RuleActionTypeReject:
 		return &RuleActionReject{
@@ -383,19 +359,6 @@ func (r *RuleActionDNSRouteOptions) String() string {
 		descriptions = append(descriptions, F.ToString("client-subnet=", r.ClientSubnet))
 	}
 	return F.ToString("route-options(", strings.Join(descriptions, ","), ")")
-}
-
-type RuleActionDirect struct {
-	Dialer      N.Dialer
-	description string
-}
-
-func (r *RuleActionDirect) Type() string {
-	return C.RuleActionTypeDirect
-}
-
-func (r *RuleActionDirect) String() string {
-	return "direct" + r.description
 }
 
 var (
