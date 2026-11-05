@@ -806,6 +806,9 @@ func (s *Service) Close() error {
 		session.Close()
 	}
 	s.webSocketGroup.Wait()
+	// Cancel the in-flight refresh before tearing down the client and the
+	// listener: closing them first turns the cancellation into a transport
+	// error, so waiters would observe net.ErrClosed instead of context.Canceled.
 	s.refreshWG.Wait()
 
 	s.httpClient.CloseIdleConnections()

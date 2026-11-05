@@ -2,6 +2,7 @@ package common
 
 import (
 	"net/netip"
+	"slices"
 
 	"github.com/sagernet/sing/common/control"
 	E "github.com/sagernet/sing/common/exceptions"
@@ -29,12 +30,7 @@ func NewExcludingInterfaceFinder(finder control.InterfaceFinder, exclude []strin
 }
 
 func (f *ExcludingInterfaceFinder) isExcluded(name string) bool {
-	for _, excluded := range f.exclude {
-		if excluded == name {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(f.exclude, name)
 }
 
 func (f *ExcludingInterfaceFinder) filtered(interfaces []control.Interface) []control.Interface {

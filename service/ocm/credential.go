@@ -136,6 +136,11 @@ func refreshToken(ctx context.Context, httpClient *http.Client, credentials *oau
 
 	response, err := httpClient.Do(request)
 	if err != nil {
+		// The client may be closing: report the cancellation, not the transport
+		// error it surfaces as once the connection is torn down.
+		if ctxErr := context.Cause(ctx); ctxErr != nil {
+			return nil, ctxErr
+		}
 		return nil, err
 	}
 	defer response.Body.Close()
