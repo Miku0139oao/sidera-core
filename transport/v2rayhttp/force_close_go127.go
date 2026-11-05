@@ -18,8 +18,9 @@ var _ *http.Transport
 
 // net/http/internal/http2.Transport
 type internalTransport struct {
-	t1       [2]uintptr // TransportConfig
-	connPool *clientConnPool //nolint:unused // field layout must match net/http/internal/http2.Transport
+	t1       [2]uintptr      // TransportConfig
+	connPool *clientConnPool //nolint:unused // layout must match net/http/internal/http2.Transport
+}
 
 // net/http/internal/http2.clientConnPool
 type clientConnPool struct {
