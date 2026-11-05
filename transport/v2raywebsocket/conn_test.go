@@ -157,9 +157,7 @@ func TestCoalescedHandshakePayloadAndConcurrentHeaders(t *testing.T) {
 	start := make(chan struct{})
 	var group sync.WaitGroup
 	for range connectionCount {
-		group.Add(1)
-		go func() {
-			defer group.Done()
+		group.Go(func() {
 			<-start
 			conn, err := client.DialContext(context.Background())
 			if err != nil {
@@ -175,7 +173,7 @@ func TestCoalescedHandshakePayloadAndConcurrentHeaders(t *testing.T) {
 			if err = conn.Close(); err != nil {
 				t.Errorf("Close: %v", err)
 			}
-		}()
+		})
 	}
 	close(start)
 	group.Wait()

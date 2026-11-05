@@ -147,14 +147,12 @@ func TestHTTP1ConcurrentFirstWriteEmitsOneRequest(t *testing.T) {
 	start := make(chan struct{})
 	var group sync.WaitGroup
 	for _, payload := range [][]byte{[]byte("first"), []byte("second")} {
-		group.Add(1)
-		go func() {
-			defer group.Done()
+		group.Go(func() {
 			<-start
 			if n, err := conn.Write(payload); err != nil || n != len(payload) {
 				t.Errorf("Write(%q) = %d, %v", payload, n, err)
 			}
-		}()
+		})
 	}
 	close(start)
 	group.Wait()
