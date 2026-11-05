@@ -260,11 +260,9 @@ func (d *Service) Start(stage adapter.StartStage) error {
 				return d.failStartLocked(E.New("unexpected STUN packet connection type"))
 			}
 			d.stunConn = stunConn
-			d.workerGroup.Add(1)
-			go func() {
-				defer d.workerGroup.Done()
+			d.workerGroup.Go(func() {
 				d.loopSTUNPacket(stunConn)
-			}()
+			})
 		}
 	case adapter.StartStatePostStart:
 		if d.server == nil || d.runContext == nil {
@@ -378,11 +376,9 @@ func (d *Service) startMeshWithHost(derpServer *derpserver.Server, server *optio
 	}
 	d.meshClients = append(d.meshClients, meshClient)
 	d.meshMonitors = append(d.meshMonitors, meshMonitor)
-	d.workerGroup.Add(1)
-	go func() {
-		defer d.workerGroup.Done()
+	d.workerGroup.Go(func() {
 		meshClient.RunWatchConnectionLoop(d.runContext, derpServer.PublicKey(), logf, add, remove, notifyError)
-	}()
+	})
 	return nil
 }
 

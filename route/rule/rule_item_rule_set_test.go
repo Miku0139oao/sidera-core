@@ -10,8 +10,8 @@ import (
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/common/x/list"
 
-	"github.com/stretchr/testify/require"
 	"go4.org/netipx"
+	"github.com/stretchr/testify/require"
 )
 
 type ruleSetItemTestRouter struct {

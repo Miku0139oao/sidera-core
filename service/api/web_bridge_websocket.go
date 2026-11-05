@@ -345,11 +345,7 @@ func (r *webSocketBodyReader) Read(buffer []byte) (int, error) {
 		}
 		if payload[0] == 1 {
 			if r.workers != nil {
-				r.workers.Add(1)
-				go func() {
-					defer r.workers.Done()
-					r.waitForClose()
-				}()
+				r.workers.Go(r.waitForClose)
 			} else {
 				go r.waitForClose()
 			}
