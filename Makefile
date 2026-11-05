@@ -1,7 +1,12 @@
 NAME = sidera
 COMMIT = $(shell git rev-parse --short HEAD)
 TAGS ?= $(shell cat release/DEFAULT_BUILD_TAGS_OTHERS)
-GOTOOLCHAIN ?= go1.26.5
+LOW_MEMORY_TAGS ?= $(shell cat release/LOW_MEMORY_BUILD_TAGS)
+GOTOOLCHAIN ?= go1.27.3
+GOLANGCI_LINT_VERSION ?= v2.12.2
+PROTOC_GEN_GO_VERSION ?= v1.36.11
+PROTOC_GEN_GO_GRPC_VERSION ?= v1.5.1
+GHR_REVISION ?= 610bfc9f5712eac7fe65a31fb1a214b64fb2b86c
 export GOTOOLCHAIN
 
 GOHOSTOS = $(shell go env GOHOSTOS)
@@ -16,10 +21,16 @@ PREFIX ?= $(shell go env GOPATH)
 SING_FFI ?= sing-ffi
 LIBBOX_FFI_CONFIG ?= ./experimental/libbox/ffi.json
 
-.PHONY: test release docs build schema
+.PHONY: build build_low_memory race ci_build ci_release_gate generate_completions schema \
+	install fmt fmt_docs lint lint_install proto proto_install release release_repo \
+	release_install test test_stdio docs docs_install clean
 
 build:
 	go build $(MAIN_PARAMS) $(MAIN)
+
+build_low_memory:
+	@mkdir -p dist
+	CGO_ENABLED=0 go build -o dist/$(NAME)-low-memory $(PARAMS) -tags "$(LOW_MEMORY_TAGS)" $(MAIN)
 
 race:
 	go build -race $(MAIN_PARAMS) $(MAIN)
@@ -27,6 +38,9 @@ race:
 ci_build:
 	go build $(PARAMS) $(MAIN) && \
 	go build $(MAIN_PARAMS) $(MAIN)
+
+ci_release_gate:
+	bash script/ci-release-gate.sh all
 
 generate_completions:
 	go run -v --tags "$(TAGS),generate,generate_completions" $(MAIN)
@@ -51,7 +65,7 @@ lint:
 #	GOOS=freebsd golangci-lint run ./...
 
 lint_install:
-	go install -v github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest
+	go install -v github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
 
 proto:
 	@go run ./cmd/internal/protogen
@@ -59,30 +73,27 @@ proto:
 	@gofumpt -l -w .
 
 proto_install:
-	go install -v google.golang.org/protobuf/cmd/protoc-gen-go@latest
-	go install -v google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
+	go install -v google.golang.org/protobuf/cmd/protoc-gen-go@$(PROTOC_GEN_GO_VERSION)
+	go install -v google.golang.org/grpc/cmd/protoc-gen-go-grpc@$(PROTOC_GEN_GO_GRPC_VERSION)
 
 update_certificates:
 	go run ./cmd/internal/update_certificates
 
 release:
-	go run ./cmd/internal/build goreleaser release --clean --skip publish
-	mkdir dist/release
-	mv dist/*.tar.gz \
-		dist/*.zip \
-		dist/*.deb \
-		dist/*.rpm \
-		dist/*_amd64.pkg.tar.zst \
-		dist/*_arm64.pkg.tar.zst \
-		dist/release
-	ghr --replace --draft --prerelease -p 5 "v${VERSION}" dist/release
-	rm -r dist/release
+	@echo "release publication is CI-only; dispatch .github/workflows/build.yml from the release commit" >&2
+	@false
 
-release_repo:
-	go run ./cmd/internal/build goreleaser release -f .goreleaser.fury.yaml --clean
+release_repo: release
 
 release_install:
-	go install -v github.com/tcnksm/ghr@latest
+	@tmp=$$(mktemp -d); \
+	trap 'rm -rf "$$tmp"' EXIT; \
+	git init -q "$$tmp/ghr"; \
+	git -C "$$tmp/ghr" remote add origin https://github.com/nekohasekai/ghr.git; \
+	git -C "$$tmp/ghr" fetch -q --depth=1 origin $(GHR_REVISION); \
+	test "$$(git -C "$$tmp/ghr" rev-parse FETCH_HEAD)" = "$(GHR_REVISION)"; \
+	git -C "$$tmp/ghr" checkout -q --detach FETCH_HEAD; \
+	go -C "$$tmp/ghr" install -v .
 
 update_android_version:
 	go run ./cmd/internal/update_android_version
@@ -278,10 +289,10 @@ publish_docs:
 
 docs_install:
 	python3 -m venv venv
-	source ./venv/bin/activate && pip install --force-reinstall mkdocs-material=="9.7.2" mkdocs-static-i18n=="1.2.*"
+	source ./venv/bin/activate && pip install --force-reinstall mkdocs-material=="9.7.2" mkdocs-static-i18n=="1.2.3"
 
 clean:
-	rm -rf bin dist sidera
+	rm -rf bin dist sidera sidera-low-memory
 	rm -f $(shell go env GOPATH)/bin/sidera
 
 update:

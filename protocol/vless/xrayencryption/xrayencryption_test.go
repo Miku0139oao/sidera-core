@@ -6,9 +6,12 @@ import (
 	"crypto/mlkem"
 	"crypto/rand"
 	"encoding/base64"
+	"errors"
+	"fmt"
 	"io"
 	"net"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -114,6 +117,27 @@ func TestZeroRTTReconnect(t *testing.T) {
 	exchange(t, resumedServer.conn, resumedClient, []byte("resumed response"))
 }
 
+func TestClosedServerRejectsHandshake(t *testing.T) {
+	privateKey, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverKey := base64.RawURLEncoding.EncodeToString(privateKey.Bytes())
+	server, err := NewServer(methodName + ".native.0s." + serverKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := server.Close(); err != nil {
+		t.Fatal(err)
+	}
+	serverConn, clientConn := net.Pipe()
+	defer serverConn.Close()
+	defer clientConn.Close()
+	if _, err := server.Handshake(serverConn, nil); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("Handshake after Close = %v, want net.ErrClosed", err)
+	}
+}
+
 func TestDefaultPaddingRoundTrip(t *testing.T) {
 	privateKey, err := mlkem.GenerateKey768()
 	if err != nil {
@@ -169,6 +193,8 @@ func TestParseConfigs(t *testing.T) {
 		{"mode", true, methodName + ".unknown.0s." + serverKey},
 		{"seconds", true, methodName + ".native.bad." + serverKey},
 		{"negative seconds", true, methodName + ".native.-1s." + serverKey},
+		{"oversized seconds", true, methodName + ".native.65536s." + serverKey},
+		{"descending seconds", true, methodName + ".native.300-120s." + serverKey},
 		{"handshake", false, methodName + ".native.2rtt." + serverKey},
 		{"missing key", true, methodName + ".native.0s." + testPadding},
 		{"bad key", false, methodName + ".native.1rtt." + strings.Repeat("x", 24)},
@@ -310,11 +336,22 @@ func TestPaddingAndHeaderParsing(t *testing.T) {
 	if len(lengths) != 2 || len(gaps) != 1 || lengths[0] != [3]int{100, 35, 40} || gaps[0] != [3]int{75, 0, 10} {
 		t.Fatalf("unexpected padding parse: lengths=%v gaps=%v", lengths, gaps)
 	}
-	for _, invalid := range []string{"99-35-35", "100-34-35", "100-35", "100--35"} {
+	maxInt := int(^uint(0) >> 1)
+	for _, invalid := range []string{
+		"99-35-35",
+		"100-34-35",
+		"100-35",
+		"100--35",
+		"100-35-35.100-0-0.100-35-9223372036854775807",
+		"100-35-35.100-0-9223372036854775807",
+	} {
 		lengths, gaps = nil, nil
 		if err := ParsePadding(invalid, &lengths, &gaps); err == nil {
 			t.Fatalf("accepted invalid padding %q", invalid)
 		}
+	}
+	if _, _, _, err := CreatePadding([][3]int{{100, 35, maxInt}}, nil); err == nil {
+		t.Fatal("CreatePadding accepted an overflowing length")
 	}
 	lengths, gaps = nil, nil
 	if err := ParsePadding("101-35-35", &lengths, &gaps); err != nil {
@@ -365,9 +402,19 @@ func handshakePair(t *testing.T, server *ServerInstance, client *ClientInstance)
 	return serverHandshake.conn, clientHandshake.conn
 }
 
+var testTCPPort atomic.Uint32
+
 func tcpPipe(t *testing.T) (net.Conn, net.Conn) {
 	t.Helper()
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	var listener net.Listener
+	var err error
+	for range 1000 {
+		port := 20000 + int(testTCPPort.Add(1)%20000)
+		listener, err = net.Listen("tcp4", fmt.Sprintf("127.0.0.1:%d", port))
+		if err == nil {
+			break
+		}
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -381,7 +428,7 @@ func tcpPipe(t *testing.T) (net.Conn, net.Conn) {
 		conn, acceptErr := listener.Accept()
 		accepted <- acceptResult{conn, acceptErr}
 	}()
-	client, err := net.Dial("tcp", listener.Addr().String())
+	client, err := net.Dial("tcp4", listener.Addr().String())
 	if err != nil {
 		t.Fatal(err)
 	}

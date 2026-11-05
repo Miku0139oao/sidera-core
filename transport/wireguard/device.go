@@ -34,11 +34,14 @@ type DeviceOptions struct {
 	UDPNATMax       uint32
 	NetworkMonitor  tun.NetworkUpdateMonitor
 	InterfaceFinder control.InterfaceFinder
-	CreateDialer    func(interfaceName string) N.Dialer
-	Name            string
-	MTU             uint32
-	Address         []netip.Prefix
-	AllowedAddress  []netip.Prefix
+	// ExcludeInterface lists interfaces the UDP NAT must not use for egress.
+	// It is applied through the interface finder, see newStackDevice.
+	ExcludeInterface []string
+	CreateDialer     func(interfaceName string) N.Dialer
+	Name             string
+	MTU              uint32
+	Address          []netip.Prefix
+	AllowedAddress   []netip.Prefix
 }
 
 func NewDevice(options DeviceOptions) (Device, error) {

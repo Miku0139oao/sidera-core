@@ -2,6 +2,7 @@ package rule
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -36,6 +37,9 @@ type LocalRuleSet struct {
 	watcher    *fswatch.Watcher
 	callbacks  list.List[adapter.RuleSetUpdateCallback]
 	refs       atomic.Int32
+	closed     bool
+	closeOnce  sync.Once
+	closeErr   error
 }
 
 func NewLocalRuleSet(ctx context.Context, logger logger.Logger, tag string, options option.RuleSet) (*LocalRuleSet, error) {
@@ -82,12 +86,21 @@ func (s *LocalRuleSet) Name() string {
 }
 
 func (s *LocalRuleSet) String() string {
+	s.access.RLock()
+	defer s.access.RUnlock()
 	return strings.Join(F.MapToString(s.rules), " ")
 }
 
 func (s *LocalRuleSet) StartContext(ctx context.Context, startContext *adapter.HTTPStartContext) error {
-	if s.watcher != nil {
-		err := s.watcher.Start()
+	s.access.RLock()
+	if s.closed {
+		s.access.RUnlock()
+		return os.ErrClosed
+	}
+	watcher := s.watcher
+	s.access.RUnlock()
+	if watcher != nil {
+		err := watcher.Start()
 		if err != nil {
 			s.logger.Error(E.Cause(err, "watch rule-set file"))
 		}
@@ -143,6 +156,10 @@ func (s *LocalRuleSet) reloadRules(headlessRules []option.HeadlessRule) error {
 		return err
 	}
 	s.access.Lock()
+	if s.closed {
+		s.access.Unlock()
+		return os.ErrClosed
+	}
 	s.rules = rules
 	s.metadata = metadata
 	callbacks := s.callbacks.Array()
@@ -166,19 +183,26 @@ func (s *LocalRuleSet) ExtractIPSet() []*netipx.IPSet {
 }
 
 func (s *LocalRuleSet) IncRef() {
+	s.access.Lock()
 	s.refs.Add(1)
+	s.access.Unlock()
 }
 
 func (s *LocalRuleSet) DecRef() {
+	s.access.Lock()
 	if s.refs.Add(-1) < 0 {
+		s.access.Unlock()
 		panic("rule-set: negative refs")
 	}
+	s.access.Unlock()
 }
 
 func (s *LocalRuleSet) Cleanup() {
+	s.access.Lock()
 	if s.refs.Load() == 0 {
 		s.rules = nil
 	}
+	s.access.Unlock()
 }
 
 func (s *LocalRuleSet) RegisterCallback(callback adapter.RuleSetUpdateCallback) *list.Element[adapter.RuleSetUpdateCallback] {
@@ -194,14 +218,26 @@ func (s *LocalRuleSet) UnregisterCallback(element *list.Element[adapter.RuleSetU
 }
 
 func (s *LocalRuleSet) Close() error {
-	s.rules = nil
-	return common.Close(common.PtrOrNil(s.watcher))
+	s.closeOnce.Do(func() {
+		s.access.Lock()
+		s.closed = true
+		s.rules = nil
+		watcher := s.watcher
+		s.watcher = nil
+		s.access.Unlock()
+		s.closeErr = common.Close(common.PtrOrNil(watcher))
+	})
+	return s.closeErr
 }
 
 func (s *LocalRuleSet) Match(metadata *adapter.InboundContext) bool {
+	s.access.RLock()
+	defer s.access.RUnlock()
 	return matchAnyHeadlessRule(s.rules, metadata)
 }
 
 func (s *LocalRuleSet) mergeableRule() *DefaultHeadlessRule {
+	s.access.RLock()
+	defer s.access.RUnlock()
 	return mergeableRuleIn(s.rules)
 }

@@ -1,8 +1,6 @@
 package tf
 
-import (
-	"encoding/binary"
-)
+import "encoding/binary"
 
 const (
 	recordLayerHeaderLen    int    = 5
@@ -33,16 +31,19 @@ func IndexTLSServerName(payload []byte) *MyServerName {
 	if len(payload) < recordLayerHeaderLen || payload[0] != contentType {
 		return nil
 	}
-	segmentLen := binary.BigEndian.Uint16(payload[3:5])
-	if len(payload) < recordLayerHeaderLen+int(segmentLen) {
+	segmentLen := int(binary.BigEndian.Uint16(payload[3:5]))
+	if len(payload) < recordLayerHeaderLen+segmentLen {
 		return nil
 	}
-	serverName := indexTLSServerNameFromHandshake(payload[recordLayerHeaderLen:])
+	serverName := indexTLSServerNameFromHandshake(payload[recordLayerHeaderLen : recordLayerHeaderLen+segmentLen])
 	if serverName == nil {
 		return nil
 	}
 	serverName.Index += recordLayerHeaderLen
 	serverName.ExtensionsListLengthIndex += recordLayerHeaderLen
+	if serverName.Length == 0 || serverName.Index < 0 || serverName.Index+serverName.Length > len(payload) {
+		return nil
+	}
 	return serverName
 }
 
@@ -53,32 +54,34 @@ func indexTLSServerNameFromHandshake(handshake []byte) *MyServerName {
 	if handshake[0] != handshakeType {
 		return nil
 	}
-	handshakeLen := uint32(handshake[1])<<16 | uint32(handshake[2])<<8 | uint32(handshake[3])
-	if len(handshake[4:]) != int(handshakeLen) {
+	handshakeLen := int(handshake[1])<<16 | int(handshake[2])<<8 | int(handshake[3])
+	if len(handshake[4:]) != handshakeLen {
 		return nil
 	}
-	tlsVersion := uint16(handshake[4])<<8 | uint16(handshake[5])
+	tlsVersion := binary.BigEndian.Uint16(handshake[4:6])
 	if tlsVersion&tlsVersionBitmask != 0x0300 && tlsVersion != tls13 {
 		return nil
 	}
-	sessionIDLen := handshake[38]
-	currentIndex := handshakeHeaderLen + randomDataLen + sessionIDHeaderLen + int(sessionIDLen)
-	if len(handshake) < currentIndex {
+	sessionIDLen := int(handshake[38])
+	currentIndex := handshakeHeaderLen + randomDataLen + sessionIDHeaderLen + sessionIDLen
+	if len(handshake) < currentIndex+cipherSuiteHeaderLen {
 		return nil
 	}
+
 	cipherSuites := handshake[currentIndex:]
-	if len(cipherSuites) < cipherSuiteHeaderLen {
+	csLen := int(binary.BigEndian.Uint16(cipherSuites))
+	if csLen < 2 || csLen%2 != 0 || len(cipherSuites) < cipherSuiteHeaderLen+csLen+compressMethodHeaderLen {
 		return nil
 	}
-	csLen := uint16(cipherSuites[0])<<8 | uint16(cipherSuites[1])
-	if len(cipherSuites) < cipherSuiteHeaderLen+int(csLen)+compressMethodHeaderLen {
+	compressMethodLen := int(cipherSuites[cipherSuiteHeaderLen+csLen])
+	if compressMethodLen < 1 {
 		return nil
 	}
-	compressMethodLen := uint16(cipherSuites[cipherSuiteHeaderLen+int(csLen)])
-	currentIndex += cipherSuiteHeaderLen + int(csLen) + compressMethodHeaderLen + int(compressMethodLen)
+	currentIndex += cipherSuiteHeaderLen + csLen + compressMethodHeaderLen + compressMethodLen
 	if len(handshake) < currentIndex {
 		return nil
 	}
+
 	serverName := indexTLSServerNameFromExtensions(handshake[currentIndex:])
 	if serverName == nil {
 		return nil
@@ -88,49 +91,64 @@ func indexTLSServerNameFromHandshake(handshake []byte) *MyServerName {
 	return serverName
 }
 
-func indexTLSServerNameFromExtensions(exs []byte) *MyServerName {
-	if len(exs) == 0 {
+func indexTLSServerNameFromExtensions(extensions []byte) *MyServerName {
+	if len(extensions) < extensionsHeaderLen {
 		return nil
 	}
-	if len(exs) < extensionsHeaderLen {
+	extensionsLen := int(binary.BigEndian.Uint16(extensions))
+	if len(extensions)-extensionsHeaderLen != extensionsLen {
 		return nil
 	}
-	exsLen := uint16(exs[0])<<8 | uint16(exs[1])
-	exs = exs[extensionsHeaderLen:]
-	if len(exs) < int(exsLen) {
-		return nil
-	}
-	for currentIndex := extensionsHeaderLen; len(exs) > 0; {
-		if len(exs) < extensionHeaderLen {
+	extensions = extensions[extensionsHeaderLen:]
+
+	var indexedServerName *MyServerName
+	for currentIndex := extensionsHeaderLen; len(extensions) > 0; {
+		if len(extensions) < extensionHeaderLen {
 			return nil
 		}
-		exType := uint16(exs[0])<<8 | uint16(exs[1])
-		exLen := uint16(exs[2])<<8 | uint16(exs[3])
-		if len(exs) < extensionHeaderLen+int(exLen) {
+		extensionType := binary.BigEndian.Uint16(extensions)
+		extensionLen := int(binary.BigEndian.Uint16(extensions[2:4]))
+		if len(extensions) < extensionHeaderLen+extensionLen {
 			return nil
 		}
-		sex := exs[extensionHeaderLen : extensionHeaderLen+int(exLen)]
+		extension := extensions[extensionHeaderLen : extensionHeaderLen+extensionLen]
 
-		switch exType {
-		case sniExtensionType:
-			if len(sex) < sniExtensionHeaderLen {
+		if extensionType == sniExtensionType {
+			if len(extension) < 2 {
 				return nil
 			}
-			sniType := sex[2]
-			if sniType != sniNameDNSHostnameType {
+			serverNameListLen := int(binary.BigEndian.Uint16(extension))
+			if serverNameListLen != len(extension)-2 {
 				return nil
 			}
-			sniLen := uint16(sex[3])<<8 | uint16(sex[4])
-			sex = sex[sniExtensionHeaderLen:]
-
-			return &MyServerName{
-				Index:      currentIndex + extensionHeaderLen + sniExtensionHeaderLen,
-				Length:     int(sniLen),
-				ServerName: string(sex),
+			serverNameList := extension[2:]
+			entryOffset := 0
+			for len(serverNameList) > 0 {
+				if len(serverNameList) < 3 {
+					return nil
+				}
+				nameType := serverNameList[0]
+				nameLen := int(binary.BigEndian.Uint16(serverNameList[1:3]))
+				if len(serverNameList) < 3+nameLen {
+					return nil
+				}
+				if nameType == sniNameDNSHostnameType {
+					if nameLen == 0 || indexedServerName != nil {
+						return nil
+					}
+					name := serverNameList[3 : 3+nameLen]
+					indexedServerName = &MyServerName{
+						Index:      currentIndex + extensionHeaderLen + 2 + entryOffset + 3,
+						Length:     nameLen,
+						ServerName: string(name),
+					}
+				}
+				serverNameList = serverNameList[3+nameLen:]
+				entryOffset += 3 + nameLen
 			}
 		}
-		exs = exs[4+exLen:]
-		currentIndex += 4 + int(exLen)
+		extensions = extensions[extensionHeaderLen+extensionLen:]
+		currentIndex += extensionHeaderLen + extensionLen
 	}
-	return nil
+	return indexedServerName
 }

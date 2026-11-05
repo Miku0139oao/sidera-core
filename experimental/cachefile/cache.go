@@ -41,28 +41,52 @@ var (
 var _ adapter.CacheFile = (*CacheFile)(nil)
 
 type CacheFile struct {
-	ctx                context.Context
-	logger             logger.Logger
-	path               string
-	cacheID            []byte
-	cacheIDText        string
-	storeFakeIP        bool
-	storeRDRC          bool
-	storeDNS           bool
-	disableExpire      bool
-	rdrcTimeout        time.Duration
-	optimisticTimeout  time.Duration
-	DB                 *bbolt.DB
-	resetAccess        sync.Mutex
-	saveMetadataTimer  *time.Timer
-	saveFakeIPAccess   sync.RWMutex
-	saveDomain         map[netip.Addr]string
-	saveAddress4       map[string]netip.Addr
-	saveAddress6       map[string]netip.Addr
-	saveRDRCAccess     sync.RWMutex
-	saveRDRC           map[saveCacheKey]bool
-	saveDNSCacheAccess sync.RWMutex
-	saveDNSCache       map[saveCacheKey]saveDNSCacheEntry
+	ctx               context.Context
+	logger            logger.Logger
+	path              string
+	cacheID           []byte
+	cacheIDText       string
+	storeFakeIP       bool
+	storeRDRC         bool
+	storeDNS          bool
+	disableExpire     bool
+	rdrcTimeout       time.Duration
+	optimisticTimeout time.Duration
+	DB                *bbolt.DB
+
+	dbAccess    sync.RWMutex
+	resetAccess sync.Mutex
+
+	lifecycleAccess sync.Mutex
+	closing         bool
+	closed          bool
+	closeDone       chan struct{}
+	closeErr        error
+	cleanupStop     chan struct{}
+	workerGroup     sync.WaitGroup
+	cleanupStarted  bool
+
+	persistenceAccess    sync.Mutex
+	persistenceOperation sync.Mutex
+	persistenceWake      chan struct{}
+	persistenceStarted   bool
+	persistenceClosing   bool
+	persistenceCursor    persistenceKind
+	pendingEntries       int
+	pendingBytes         int
+	persistenceErr       error
+	persistenceSaver     func(persistenceItem) error
+	overloadCount        uint64
+	overloadLoggedAt     time.Time
+	dnsGeneration        uint64
+	rdrcGeneration       uint64
+	fakeIPGeneration     uint64
+	metadataSave         saveMetadataEntry
+	saveFakeIP           map[netip.Addr]saveFakeIPEntry
+	saveAddress4         map[string]netip.Addr
+	saveAddress6         map[string]netip.Addr
+	saveRDRC             map[saveCacheKey]saveRDRCEntry
+	saveDNSCache         map[saveCacheKey]saveDNSCacheEntry
 }
 
 type saveCacheKey struct {
@@ -75,6 +99,28 @@ type saveDNSCacheEntry struct {
 	rawMessage []byte
 	expireAt   time.Time
 	sequence   uint64
+	generation uint64
+	saving     bool
+}
+
+type saveRDRCEntry struct {
+	expiresAt  time.Time
+	sequence   uint64
+	generation uint64
+	saving     bool
+}
+
+type saveFakeIPEntry struct {
+	domain     string
+	sequence   uint64
+	generation uint64
+	saving     bool
+}
+
+type saveMetadataEntry struct {
+	metadata   *adapter.FakeIPMetadata
+	sequence   uint64
+	generation uint64
 	saving     bool
 }
 
@@ -101,20 +147,23 @@ func New(ctx context.Context, logger logger.Logger, options option.CacheFileOpti
 		}
 	}
 	return &CacheFile{
-		ctx:          ctx,
-		logger:       logger,
-		path:         filemanager.BasePath(ctx, path),
-		cacheID:      cacheIDBytes,
-		cacheIDText:  options.CacheID,
-		storeFakeIP:  options.StoreFakeIP,
-		storeRDRC:    options.StoreRDRC,
-		storeDNS:     options.StoreDNS,
-		rdrcTimeout:  rdrcTimeout,
-		saveDomain:   make(map[netip.Addr]string),
-		saveAddress4: make(map[string]netip.Addr),
-		saveAddress6: make(map[string]netip.Addr),
-		saveRDRC:     make(map[saveCacheKey]bool),
-		saveDNSCache: make(map[saveCacheKey]saveDNSCacheEntry),
+		ctx:             ctx,
+		logger:          logger,
+		path:            filemanager.BasePath(ctx, path),
+		cacheID:         cacheIDBytes,
+		cacheIDText:     options.CacheID,
+		storeFakeIP:     options.StoreFakeIP,
+		storeRDRC:       options.StoreRDRC,
+		storeDNS:        options.StoreDNS,
+		rdrcTimeout:     rdrcTimeout,
+		closeDone:       make(chan struct{}),
+		cleanupStop:     make(chan struct{}),
+		persistenceWake: make(chan struct{}, 1),
+		saveFakeIP:      make(map[netip.Addr]saveFakeIPEntry),
+		saveAddress4:    make(map[string]netip.Addr),
+		saveAddress6:    make(map[string]netip.Addr),
+		saveRDRC:        make(map[saveCacheKey]saveRDRCEntry),
+		saveDNSCache:    make(map[saveCacheKey]saveDNSCacheEntry),
 	}
 }
 
@@ -139,9 +188,18 @@ func (c *CacheFile) SetDisableExpire(disableExpire bool) {
 }
 
 func (c *CacheFile) Start(stage adapter.StartStage) error {
+	c.lifecycleAccess.Lock()
+	defer c.lifecycleAccess.Unlock()
+	if c.closing || c.closed {
+		return os.ErrClosed
+	}
 	switch stage {
 	case adapter.StartStateInitialize:
-		return c.start()
+		err := c.start()
+		if err != nil {
+			return err
+		}
+		c.startPersistenceWorker()
 	case adapter.StartStateStart:
 		c.startCacheCleanup()
 	}
@@ -149,22 +207,33 @@ func (c *CacheFile) Start(stage adapter.StartStage) error {
 }
 
 func (c *CacheFile) startCacheCleanup() {
+	if c.cleanupStarted {
+		return
+	}
+	var (
+		interval    time.Duration
+		cleanupFunc func()
+	)
 	if c.storeDNS {
 		c.clearRDRC()
 		c.cleanupDNSCache()
-		interval := c.optimisticTimeout / 2
-		if interval <= 0 {
-			interval = time.Hour
-		}
-		go c.loopCacheCleanup(interval, c.cleanupDNSCache)
+		interval = c.optimisticTimeout / 2
+		cleanupFunc = c.cleanupDNSCache
 	} else if c.storeRDRC {
 		c.cleanupRDRC()
-		interval := c.rdrcTimeout / 2
-		if interval <= 0 {
-			interval = time.Hour
-		}
-		go c.loopCacheCleanup(interval, c.cleanupRDRC)
+		interval = c.rdrcTimeout / 2
+		cleanupFunc = c.cleanupRDRC
 	}
+	if cleanupFunc == nil {
+		return
+	}
+	if interval <= 0 {
+		interval = time.Hour
+	}
+	c.cleanupStarted = true
+	c.workerGroup.Go(func() {
+		c.loopCacheCleanup(interval, cleanupFunc)
+	})
 }
 
 func (c *CacheFile) start() error {
@@ -205,7 +274,7 @@ func (c *CacheFile) start() error {
 			if name[0] == 0 {
 				return b.ForEachBucket(func(k []byte) error {
 					bucketName := string(k)
-					if !(common.Contains(bucketNameList, bucketName)) {
+					if !common.Contains(bucketNameList, bucketName) {
 						_ = b.DeleteBucket(name)
 					}
 					return nil
@@ -223,52 +292,102 @@ func (c *CacheFile) start() error {
 		db.Close()
 		return err
 	}
+	c.dbAccess.Lock()
 	c.DB = db
+	c.dbAccess.Unlock()
 	return nil
 }
 
 func (c *CacheFile) Close() error {
-	if c.DB == nil {
-		return nil
+	c.lifecycleAccess.Lock()
+	if c.closing || c.closed {
+		done := c.closeDone
+		c.lifecycleAccess.Unlock()
+		<-done
+		c.lifecycleAccess.Lock()
+		err := c.closeErr
+		c.lifecycleAccess.Unlock()
+		return err
 	}
-	return c.DB.Close()
+	c.closing = true
+	close(c.cleanupStop)
+	c.persistenceAccess.Lock()
+	c.persistenceClosing = true
+	c.persistenceAccess.Unlock()
+	c.notifyPersistenceWorker()
+	c.lifecycleAccess.Unlock()
+
+	c.workerGroup.Wait()
+
+	c.dbAccess.Lock()
+	var dbErr error
+	if c.DB != nil {
+		dbErr = c.DB.Close()
+		c.DB = nil
+	}
+	c.dbAccess.Unlock()
+
+	c.persistenceAccess.Lock()
+	persistenceErr := c.persistenceErr
+	overloadCount := c.overloadCount
+	c.persistenceAccess.Unlock()
+	if overloadCount > 0 && c.logger != nil {
+		c.logger.Warn("cache persistence discarded ", overloadCount, " update(s) because the bounded queue was full")
+	}
+
+	c.lifecycleAccess.Lock()
+	c.closeErr = E.Errors(persistenceErr, dbErr)
+	c.closed = true
+	c.closing = false
+	close(c.closeDone)
+	err := c.closeErr
+	c.lifecycleAccess.Unlock()
+	return err
 }
 
 func (c *CacheFile) view(fn func(tx *bbolt.Tx) error) (err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			c.resetDB()
-			err = E.New("database corrupted: ", r)
-		}
-	}()
-	return c.DB.View(fn)
+	return c.withDB(func(db *bbolt.DB) error { return db.View(fn) })
 }
 
 func (c *CacheFile) batch(fn func(tx *bbolt.Tx) error) (err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			c.resetDB()
-			err = E.New("database corrupted: ", r)
-		}
-	}()
-	return c.DB.Batch(fn)
+	return c.withDB(func(db *bbolt.DB) error { return db.Batch(fn) })
 }
 
 func (c *CacheFile) update(fn func(tx *bbolt.Tx) error) (err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			c.resetDB()
-			err = E.New("database corrupted: ", r)
-		}
+	return c.withDB(func(db *bbolt.DB) error { return db.Update(fn) })
+}
+
+func (c *CacheFile) withDB(operation func(db *bbolt.DB) error) (err error) {
+	c.dbAccess.RLock()
+	db := c.DB
+	if db == nil {
+		c.dbAccess.RUnlock()
+		return os.ErrClosed
+	}
+	var panicValue any
+	func() {
+		defer func() { panicValue = recover() }()
+		err = operation(db)
 	}()
-	return c.DB.Update(fn)
+	c.dbAccess.RUnlock()
+	if panicValue != nil {
+		c.resetDB()
+		return E.New("database corrupted: ", panicValue)
+	}
+	return err
 }
 
 func (c *CacheFile) resetDB() {
 	c.resetAccess.Lock()
 	defer c.resetAccess.Unlock()
-	c.DB.Close()
-	filemanager.Remove(c.ctx, c.path)
+	c.dbAccess.Lock()
+	defer c.dbAccess.Unlock()
+	if c.DB == nil {
+		return
+	}
+	_ = c.DB.Close()
+	c.DB = nil
+	_ = filemanager.Remove(c.ctx, c.path)
 	db, err := bbolt.Open(c.path, 0o666, &bbolt.Options{Timeout: time.Second})
 	if err == nil {
 		_ = filemanager.Chown(c.ctx, c.path)

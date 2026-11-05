@@ -4,7 +4,6 @@ import (
 	"context"
 	"net"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/Miku0139oao/sidera-core/adapter"
@@ -19,7 +18,6 @@ import (
 	"golang.org/x/net/http2"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/keepalive"
-	gM "google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/peer"
 )
 
@@ -52,28 +50,32 @@ func NewServer(ctx context.Context, logger logger.ContextLogger, options option.
 }
 
 func (s *Server) Tun(server GunService_TunServer) error {
-	conn := NewGRPCConn(server, nil)
+	streamContext := server.Context()
+	routeContext, routeCancel := context.WithCancelCause(log.ContextWithNewID(streamContext))
+	conn := NewGRPCConn(server, routeCancel)
 	var source M.Socksaddr
 	if remotePeer, loaded := peer.FromContext(server.Context()); loaded {
 		source = M.SocksaddrFromNet(remotePeer.Addr)
 	}
-	if grpcMetadata, loaded := gM.FromIncomingContext(server.Context()); loaded {
-		forwardFrom := strings.Join(grpcMetadata.Get("X-Forwarded-For"), ",")
-		if forwardFrom != "" {
-			for from := range strings.SplitSeq(forwardFrom, ",") {
-				originAddr := M.ParseSocksaddr(from)
-				if originAddr.IsValid() {
-					source = originAddr.Unwrap()
-				}
-			}
-		}
-	}
+
 	done := make(chan struct{})
-	go s.handler.NewConnectionEx(log.ContextWithNewID(s.ctx), conn, source, M.Socksaddr{}, N.OnceClose(func(it error) {
+	go s.handler.NewConnectionEx(routeContext, conn, source, M.Socksaddr{}, N.OnceClose(func(it error) {
 		close(done)
 	}))
-	<-done
-	return nil
+	select {
+	case <-done:
+		routeCancel(nil)
+		conn.Close()
+		return nil
+	case <-conn.Done():
+		routeCancel(net.ErrClosed)
+		return nil
+	case <-streamContext.Done():
+		cause := context.Cause(streamContext)
+		routeCancel(cause)
+		conn.Close()
+		return cause
+	}
 }
 
 func (s *Server) mustEmbedUnimplementedGunServiceServer() {

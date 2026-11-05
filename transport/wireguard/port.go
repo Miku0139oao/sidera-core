@@ -4,6 +4,7 @@ import (
 	"net/netip"
 	"sync/atomic"
 
+	"github.com/Miku0139oao/sidera-core/common"
 	"github.com/sagernet/sing-tun"
 	"github.com/sagernet/sing-tun/gtcpip/header"
 	E "github.com/sagernet/sing/common/exceptions"
@@ -72,7 +73,7 @@ func (e *Endpoint) WritePackets(packets [][]byte) error {
 		} else {
 			source = e.tunDevice.Inet6Address()
 		}
-		reply, replyOk := tun.BuildUnreachable(packet, source, state.headroom)
+		reply, replyOk := common.BuildICMPUnreachable(packet, source, state.headroom)
 		if replyOk {
 			replies = append(replies, reply)
 		}

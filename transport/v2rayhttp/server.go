@@ -2,6 +2,7 @@ package v2rayhttp
 
 import (
 	"context"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -21,7 +22,6 @@ import (
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	aTLS "github.com/sagernet/sing/common/tls"
-	sHttp "github.com/sagernet/sing/protocol/http"
 
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
@@ -29,18 +29,21 @@ import (
 
 var _ adapter.V2RayServerTransport = (*Server)(nil)
 
+const maxHTTP1EarlyData = 1 << 20
+
 type Server struct {
-	ctx        context.Context
-	logger     logger.ContextLogger
-	tlsConfig  tls.ServerConfig
-	handler    adapter.V2RayServerTransportHandler
-	httpServer *http.Server
-	h2Server   *http2.Server
-	h2cHandler http.Handler
-	host       []string
-	path       string
-	method     string
-	headers    http.Header
+	ctx                   context.Context
+	logger                logger.ContextLogger
+	tlsConfig             tls.ServerConfig
+	handler               adapter.V2RayServerTransportHandler
+	httpServer            *http.Server
+	h2Server              *http2.Server
+	h2cHandler            http.Handler
+	host                  []string
+	path                  string
+	method                string
+	headers               http.Header
+	http1EarlyBodyTimeout time.Duration
 }
 
 func NewServer(ctx context.Context, logger logger.ContextLogger, options option.V2RayHTTPOptions, tlsConfig tls.ServerConfig, handler adapter.V2RayServerTransportHandler) (*Server, error) {
@@ -52,10 +55,11 @@ func NewServer(ctx context.Context, logger logger.ContextLogger, options option.
 		h2Server: &http2.Server{
 			IdleTimeout: time.Duration(options.IdleTimeout),
 		},
-		host:    options.Host,
-		path:    options.Path,
-		method:  options.Method,
-		headers: options.Headers.Build(),
+		host:                  options.Host,
+		path:                  options.Path,
+		method:                options.Method,
+		headers:               options.Headers.Build(),
+		http1EarlyBodyTimeout: C.TCPTimeout,
 	}
 	if !strings.HasPrefix(server.path, "/") {
 		server.path = "/" + server.path
@@ -102,15 +106,40 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		}
 	}
 
-	source := sHttp.SourceAddress(request)
+	source := M.ParseSocksaddr(request.RemoteAddr).Unwrap()
 	if h, ok := writer.(http.Hijacker); ok {
 		var requestBody *buf.Buffer
-		if contentLength := int(request.ContentLength); contentLength > 0 {
-			requestBody = buf.NewSize(contentLength)
-			_, err := requestBody.ReadFullFrom(request.Body, contentLength)
-			if err != nil {
-				s.invalidRequest(writer, request, 0, E.Cause(err, "read request"))
+		defer func() {
+			if requestBody != nil {
+				requestBody.Release()
+			}
+		}()
+		if request.ContentLength > maxHTTP1EarlyData {
+			s.invalidRequest(writer, request, http.StatusRequestEntityTooLarge, E.New("request body is too large"))
+			return
+		}
+		if request.Body != nil && request.Body != http.NoBody {
+			responseController := http.NewResponseController(writer)
+			if err := responseController.SetReadDeadline(time.Now().Add(s.http1EarlyBodyTimeout)); err != nil {
+				s.invalidRequest(writer, request, http.StatusRequestTimeout, E.Cause(err, "set request body deadline"))
 				return
+			}
+			requestBodyBytes, readErr := io.ReadAll(io.LimitReader(request.Body, maxHTTP1EarlyData+1))
+			clearErr := responseController.SetReadDeadline(time.Time{})
+			if readErr != nil {
+				s.invalidRequest(writer, request, http.StatusRequestTimeout, E.Cause(readErr, "read request"))
+				return
+			}
+			if clearErr != nil {
+				s.invalidRequest(writer, request, 0, E.Cause(clearErr, "clear request body deadline"))
+				return
+			}
+			if len(requestBodyBytes) > maxHTTP1EarlyData {
+				s.invalidRequest(writer, request, http.StatusRequestEntityTooLarge, E.New("request body is too large"))
+				return
+			}
+			if len(requestBodyBytes) > 0 {
+				requestBody = buf.As(requestBodyBytes)
 			}
 		}
 		writer.WriteHeader(http.StatusOK)
@@ -124,6 +153,7 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 			cache := buf.NewSize(cacheLen)
 			_, err = cache.ReadFullFrom(reader.Reader, cacheLen)
 			if err != nil {
+				cache.Release()
 				conn.Close()
 				s.invalidRequest(writer, request, 0, E.Cause(err, "read cache"))
 				return
@@ -132,6 +162,7 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		}
 		if requestBody != nil {
 			conn = bufio.NewCachedConn(conn, requestBody)
+			requestBody = nil
 		}
 		s.handler.NewConnectionEx(DupContext(request.Context()), conn, source, M.Socksaddr{}, nil)
 	} else {

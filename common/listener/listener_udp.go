@@ -2,9 +2,11 @@ package listener
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/netip"
 	"os"
+	"runtime"
 	"strings"
 	"syscall"
 
@@ -104,15 +106,10 @@ func (l *Listener) PacketWriter() N.PacketWriter {
 
 func (l *Listener) loopUDPIn() {
 	defer close(l.packetOutboundClosed)
-	if l.oobPacketHandler == nil {
-		if batchHandler, isBatchHandler := l.packetHandler.(adapter.PacketBatchHandler); isBatchHandler {
-			packetConn := sBufio.NewPacketConn(l.udpConn)
-			if readWaiter, created := sBufio.CreatePacketBatchReadWaiter(packetConn); created {
-				l.loopUDPInBatch(batchHandler, readWaiter)
-				return
-			}
-		}
-	}
+	// Packet batch readers in the pinned network module do not expose recvmsg
+	// flags, so they cannot distinguish a complete datagram from an MSG_TRUNC
+	// prefix. Use ReadMsgUDPAddrPort here until that ownership contract includes
+	// per-packet flags.
 	var buffer *buf.Buffer
 	if !l.threadUnsafePacketWriter {
 		buffer = buf.NewPacket()
@@ -128,7 +125,14 @@ func (l *Listener) loopUDPIn() {
 			} else {
 				buffer.Reset()
 			}
-			n, oobN, _, addr, err := l.udpConn.ReadMsgUDPAddrPort(buffer.FreeBytes(), oob)
+			n, oobN, flags, addr, err := l.udpConn.ReadMsgUDPAddrPort(buffer.FreeBytes(), oob)
+			if udpMessageTruncated(flags, err) {
+				l.udpTruncated.Add(1)
+				if l.threadUnsafePacketWriter {
+					buffer.Release()
+				}
+				continue
+			}
 			if err != nil {
 				if l.threadUnsafePacketWriter {
 					buffer.Release()
@@ -150,7 +154,14 @@ func (l *Listener) loopUDPIn() {
 			} else {
 				buffer.Reset()
 			}
-			n, addr, err := l.udpConn.ReadFromUDPAddrPort(buffer.FreeBytes())
+			n, _, flags, addr, err := l.udpConn.ReadMsgUDPAddrPort(buffer.FreeBytes(), nil)
+			if udpMessageTruncated(flags, err) {
+				l.udpTruncated.Add(1)
+				if l.threadUnsafePacketWriter {
+					buffer.Release()
+				}
+				continue
+			}
 			if err != nil {
 				if l.threadUnsafePacketWriter {
 					buffer.Release()
@@ -168,24 +179,21 @@ func (l *Listener) loopUDPIn() {
 	}
 }
 
-func (l *Listener) loopUDPInBatch(handler adapter.PacketBatchHandler, readWaiter N.PacketBatchReadWaiter) {
-	readWaitOptions := N.ReadWaitOptions{
-		BatchSize: sBufio.DefaultPacketReadBatchSize,
+func udpMessageTruncated(flags int, err error) bool {
+	var truncFlag int
+	switch runtime.GOOS {
+	case "linux", "android", "solaris", "illumos":
+		truncFlag = 0x20
+	case "windows":
+		truncFlag = 0x100
+	default:
+		truncFlag = 0x10
 	}
-	readWaiter.InitializeReadWaiter(readWaitOptions)
-	for {
-		buffers, sources, err := readWaiter.WaitReadPackets()
-		if err != nil {
-			buf.ReleaseMulti(buffers)
-			if l.shutdown.Load() && E.IsClosed(err) {
-				return
-			}
-			l.udpConn.Close()
-			l.logger.Error("udp listener closed: ", err)
-			return
-		}
-		handler.NewPacketBatch(buffers, sources)
+	if flags&truncFlag != 0 {
+		return true
 	}
+	// WSARecvMsg reports WSAEMSGSIZE for a truncated datagram on Windows.
+	return runtime.GOOS == "windows" && errors.Is(err, syscall.Errno(10040))
 }
 
 func (l *Listener) loopUDPOut() {

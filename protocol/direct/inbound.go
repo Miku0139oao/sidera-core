@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/Miku0139oao/sidera-core/adapter"
@@ -23,13 +24,24 @@ func RegisterInbound(registry *inbound.Registry) {
 	inbound.Register[option.DirectInboundOptions](registry, C.TypeDirect, NewInbound)
 }
 
+type udpNATService interface {
+	NewPacket(bufferSlices [][]byte, source M.Socksaddr, destination M.Socksaddr, userData any)
+	NewPacketBatch(buffers []*buf.Buffer, sources []M.Socksaddr, destination M.Socksaddr, userData any)
+	Purge()
+}
+
 type Inbound struct {
 	inbound.Adapter
 	ctx                 context.Context
 	router              adapter.ConnectionRouterEx
 	logger              log.ContextLogger
 	listener            *listener.Listener
-	udpNat              *udpnat.Service
+	udpNat              udpNATService
+	lifecycleAccess     sync.Mutex
+	udpAccess           sync.RWMutex
+	closed              bool
+	closeOnce           sync.Once
+	closeErr            error
 	overrideOption      int
 	overrideDestination M.Socksaddr
 }
@@ -71,6 +83,11 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 }
 
 func (i *Inbound) Start(stage adapter.StartStage) error {
+	i.lifecycleAccess.Lock()
+	defer i.lifecycleAccess.Unlock()
+	if i.closed {
+		return net.ErrClosed
+	}
 	if stage != adapter.StartStateStart {
 		return nil
 	}
@@ -78,18 +95,48 @@ func (i *Inbound) Start(stage adapter.StartStage) error {
 }
 
 func (i *Inbound) InterfaceUpdated() {
-	i.udpNat.Purge()
+	i.udpAccess.Lock()
+	defer i.udpAccess.Unlock()
+	if !i.closed && i.udpNat != nil {
+		i.udpNat.Purge()
+	}
 }
 
 func (i *Inbound) Close() error {
-	return i.listener.Close()
+	i.lifecycleAccess.Lock()
+	defer i.lifecycleAccess.Unlock()
+	i.closeOnce.Do(func() {
+		i.udpAccess.Lock()
+		i.closed = true
+		i.udpAccess.Unlock()
+		if i.listener != nil {
+			i.closeErr = i.listener.Close()
+		}
+		i.udpAccess.Lock()
+		if i.udpNat != nil {
+			i.udpNat.Purge()
+		}
+		i.udpAccess.Unlock()
+	})
+	return i.closeErr
 }
 
 func (i *Inbound) NewPacket(buffer *buf.Buffer, source M.Socksaddr) {
+	i.udpAccess.RLock()
+	defer i.udpAccess.RUnlock()
+	if i.closed || i.udpNat == nil {
+		return
+	}
 	i.udpNat.NewPacket([][]byte{buffer.Bytes()}, source, i.listener.UDPAddr(), nil)
 }
 
 func (i *Inbound) NewPacketBatch(buffers []*buf.Buffer, sources []M.Socksaddr) {
+	i.udpAccess.RLock()
+	defer i.udpAccess.RUnlock()
+	if i.closed || i.udpNat == nil {
+		buf.ReleaseMulti(buffers)
+		return
+	}
 	i.udpNat.NewPacketBatch(buffers, sources, i.listener.UDPAddr(), nil)
 }
 

@@ -31,12 +31,12 @@ matrix.
 
 ## Build
 
-The supported release toolchain is Go 1.26.5. The repository includes a
-`.go-version` file, and Make targets set `GOTOOLCHAIN=go1.26.5` so local,
+The supported release toolchain is Go 1.27.3. The repository includes a
+`.go-version` file, and Make targets set `GOTOOLCHAIN=go1.27.3` so local,
 container, and release builds use the same tested patch release. Compatibility
 with the private runtime symbols enabled by the `badlinkname` build tag is
-covered by the Go 1.26 CI build and race-test jobs. Go 1.24.7 remains the
-module compatibility floor, with Go 1.24 and 1.25 retained in the test matrix.
+covered by the Go 1.27 CI build and race-test jobs. The module compatibility floor is
+Go 1.27.3; the test matrix no longer carries older toolchains.
 
 ```sh
 go build ./cmd/sidera
@@ -49,13 +49,51 @@ Build it explicitly when migration support is required:
 go build -tags with_3xui_import ./cmd/sidera
 ```
 
-The release build profiles and optional feature tags are listed in `release/`.
+For low-RAM or slow 1–2 core devices, an additive lean profile keeps the core
+TCP proxy, system-stack TUN, built-in core management, and uTLS/REALITY paths
+while excluding optional QUIC, gVisor, VPN, cloud, and extended management
+integrations. The versioned, stripped local artifact is built in `dist/` with:
 
-## Provenance
+```sh
+make build_low_memory
+```
+
+CI also executes this literal direct-build command. `release/LDFLAGS` is
+required because the profile enables the audited private-link compatibility
+path; omitting it causes the linker to reject that path.
+
+```sh
+mkdir -p dist
+GOTOOLCHAIN=go1.27.3 CGO_ENABLED=0 go build -trimpath \
+  -tags "$(cat release/LOW_MEMORY_BUILD_TAGS)" \
+  -ldflags "$(cat release/LDFLAGS)" \
+  -o dist/sidera-low-memory ./cmd/sidera
+```
+
+This profile is intentionally separate from the full release artifact. Tagged
+features that are not compiled fail explicitly; TUN remains available but uses
+the system stack, so low-memory deployments should set `stack: system`
+explicitly rather than relying on the full profile's automatic stack choice.
+The release build profiles and optional feature tags are listed in `release/`.
+See [BENCHMARK.md](BENCHMARK.md) for the corrected sing-box/Xray methodology,
+current engineering baseline, and claim limits.
+
+## Release and provenance
+
+Core binary/package publication is CI-only; the legacy local `make release`
+entry point fails closed. The release gate is defined in
+`.github/workflows/release-gate.yml`;
+its exact commands are implemented by
+`script/ci-release-gate.sh`. It compiles the full and low-memory profiles for
+Linux and Windows amd64 and compile-gates arm64/386, validates the sample
+configuration, runs targeted race tests, detects schema/completion drift, and
+compares two independent deterministic builds. See `release/RELEASE.md` for
+the clean-tree, tag, provenance, attestation, and SHA-256 release contract.
 
 Sidera Core is an independent derivative and is not affiliated with SagerNet,
-sing-box, Project X, or Xray-core. See `UPSTREAM.md` and `NOTICE.md` for pinned
-source revisions and attribution.
+sing-box, Project X, or Xray-core. See `UPSTREAM.md`, `NOTICE.md`, and
+`release/licenses/` for pinned source revisions, attribution, and redistributed
+license texts.
 
 ## License
 

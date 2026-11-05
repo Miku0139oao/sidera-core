@@ -337,9 +337,16 @@ func (s *StartedService) SubscribeLog(empty *emptypb.Empty, server grpc.ServerSt
 					Message: message.Message,
 				})
 			}
+			drainLimit := max(cap(subscription), 1)
 		fetch:
-			for {
+			for drained := 1; drained < drainLimit; drained++ {
 				select {
+				case <-s.ctx.Done():
+					return s.ctx.Err()
+				case <-server.Context().Done():
+					return server.Context().Err()
+				case <-done:
+					return nil
 				case message = <-subscription:
 					if message == nil {
 						rawMessage.Messages = nil
@@ -513,7 +520,7 @@ func (s *StartedService) readGroups() *Groups {
 			}
 			g.Items = append(g.Items, &item)
 		}
-		if len(g.Items) < 2 {
+		if len(g.Items) == 0 {
 			continue
 		}
 		gs.Group = append(gs.Group, &g)
@@ -754,9 +761,16 @@ func (s *StartedService) SubscribeConnections(request *SubscribeConnectionsReque
 			if protoEvent := s.applyConnectionEvent(event, connectionSnapshots); protoEvent != nil {
 				pendingEvents = append(pendingEvents, protoEvent)
 			}
+			drainLimit := max(cap(subscription), 1)
 		drain:
-			for {
+			for drained := 1; drained < drainLimit; drained++ {
 				select {
+				case <-s.ctx.Done():
+					return s.ctx.Err()
+				case <-server.Context().Done():
+					return server.Context().Err()
+				case <-done:
+					return nil
 				case event = <-subscription:
 					if protoEvent := s.applyConnectionEvent(event, connectionSnapshots); protoEvent != nil {
 						pendingEvents = append(pendingEvents, protoEvent)

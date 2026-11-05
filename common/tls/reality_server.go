@@ -11,6 +11,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Miku0139oao/sidera-core/common/dialer"
@@ -229,11 +230,92 @@ func (c *RealityServerConfig) Server(conn net.Conn) (Conn, error) {
 }
 
 func (c *RealityServerConfig) ServerHandshake(ctx context.Context, conn net.Conn) (Conn, error) {
-	tlsConn, err := utls.RealityServer(ctx, conn, c.config)
+	config := c.config.Clone()
+	connections := newRealityHandshakeConnections(ctx)
+	connections.Track(conn)
+	baseDialContext := config.DialContext
+	config.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		target, err := baseDialContext(ctx, network, address)
+		if err == nil {
+			connections.Track(target)
+		}
+		return target, err
+	}
+
+	interruptDone := make(chan struct{})
+	stopInterrupt := context.AfterFunc(ctx, func() {
+		connections.Interrupt()
+		close(interruptDone)
+	})
+	tlsConn, err := utls.RealityServer(ctx, conn, config)
+	if !stopInterrupt() {
+		<-interruptDone
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		if tlsConn != nil {
+			_ = tlsConn.Close()
+		}
+		return nil, ctxErr
+	}
 	if err != nil {
 		return nil, err
 	}
+	connections.ClearDeadlines()
 	return &realityConnWrapper{Conn: tlsConn}, nil
+}
+
+type realityHandshakeConnections struct {
+	access      sync.Mutex
+	connections []net.Conn
+	deadline    time.Time
+	interrupted bool
+}
+
+func newRealityHandshakeConnections(ctx context.Context) *realityHandshakeConnections {
+	connections := new(realityHandshakeConnections)
+	connections.deadline, _ = ctx.Deadline()
+	return connections
+}
+
+func (c *realityHandshakeConnections) Track(conn net.Conn) {
+	c.access.Lock()
+	c.connections = append(c.connections, conn)
+	deadline := c.deadline
+	interrupted := c.interrupted
+	c.access.Unlock()
+
+	if interrupted {
+		_ = conn.SetDeadline(time.Now())
+		_ = conn.Close()
+	} else if !deadline.IsZero() {
+		_ = conn.SetDeadline(deadline)
+	}
+}
+
+func (c *realityHandshakeConnections) Interrupt() {
+	c.access.Lock()
+	c.interrupted = true
+	connections := append([]net.Conn(nil), c.connections...)
+	c.access.Unlock()
+
+	for _, conn := range connections {
+		_ = conn.SetDeadline(time.Now())
+		_ = conn.Close()
+	}
+}
+
+func (c *realityHandshakeConnections) ClearDeadlines() {
+	c.access.Lock()
+	if c.deadline.IsZero() {
+		c.access.Unlock()
+		return
+	}
+	connections := append([]net.Conn(nil), c.connections...)
+	c.access.Unlock()
+
+	for _, conn := range connections {
+		_ = conn.SetDeadline(time.Time{})
+	}
 }
 
 func (c *RealityServerConfig) Clone() Config {
@@ -272,10 +354,8 @@ func (c *realityConnWrapper) Upstream() any {
 	return c.Conn
 }
 
-// Due to low implementation quality, the reality server intercepted half close and caused memory leaks.
-// We fixed it by calling Close() directly.
 func (c *realityConnWrapper) CloseWrite() error {
-	return c.Close()
+	return c.Conn.CloseWrite()
 }
 
 func (c *realityConnWrapper) ReaderReplaceable() bool {

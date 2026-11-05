@@ -7,6 +7,8 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/Miku0139oao/sidera-core/log"
 	"github.com/Miku0139oao/sidera-core/option"
@@ -45,12 +47,15 @@ func newHTTPHandler(logger log.ContextLogger, grpcServer *grpc.Server, options o
 	corsHandler := cors.New(corsOptions)
 	webSocketOrigins, insecureWebSocketOrigin := webSocketOriginPolicy(allowedOrigins)
 	return corsHandler.Handler(&webBridge{
-		logger:                  logger,
-		grpcServer:              grpcServer,
-		dashboard:               dashboard,
-		admin:                   admin,
-		webSocketOrigins:        webSocketOrigins,
-		insecureWebSocketOrigin: insecureWebSocketOrigin,
+		logger:                     logger,
+		grpcServer:                 grpcServer,
+		dashboard:                  dashboard,
+		admin:                      admin,
+		webSocketOrigins:           webSocketOrigins,
+		insecureWebSocketOrigin:    insecureWebSocketOrigin,
+		webSocketSlots:             make(chan struct{}, webSocketMaxConnections),
+		webSocketFirstFrameTimeout: webSocketDefaultFirstFrameTimeout,
+		webSocketIdleTimeout:       webSocketDefaultIdleTimeout,
 	})
 }
 
@@ -69,12 +74,16 @@ func webSocketOriginPolicy(allowedOrigins []string) ([]string, bool) {
 }
 
 type webBridge struct {
-	logger                  log.ContextLogger
-	grpcServer              *grpc.Server
-	dashboard               *dashboard
-	admin                   *adminAPI
-	webSocketOrigins        []string
-	insecureWebSocketOrigin bool
+	logger                     log.ContextLogger
+	grpcServer                 *grpc.Server
+	dashboard                  *dashboard
+	admin                      *adminAPI
+	webSocketOrigins           []string
+	insecureWebSocketOrigin    bool
+	webSocketAdmissionAccess   sync.Mutex
+	webSocketSlots             chan struct{}
+	webSocketFirstFrameTimeout time.Duration
+	webSocketIdleTimeout       time.Duration
 }
 
 func (b *webBridge) ServeHTTP(writer http.ResponseWriter, request *http.Request) {

@@ -161,9 +161,7 @@ type UpdateProxyRequest struct {
 
 func updateProxy(w http.ResponseWriter, r *http.Request) {
 	req := UpdateProxyRequest{}
-	if err := render.DecodeJSON(r.Body, &req); err != nil {
-		render.Status(r, http.StatusBadRequest)
-		render.JSON(w, r, ErrBadRequest)
+	if !decodeJSONRequest(w, r, &req) {
 		return
 	}
 

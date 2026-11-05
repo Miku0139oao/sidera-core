@@ -6,6 +6,7 @@ import (
 	"net/netip"
 
 	"github.com/Miku0139oao/sidera-core/adapter"
+	"github.com/Miku0139oao/sidera-core/common"
 	C "github.com/Miku0139oao/sidera-core/constant"
 	"github.com/Miku0139oao/sidera-core/log"
 	"github.com/sagernet/sing-tun"
@@ -132,7 +133,7 @@ func (t *Endpoint) WritePackets(packets [][]byte) error {
 		if header.IPVersion(packet) == header.IPv6Version {
 			source = inet6Address
 		}
-		reply, replyOk := tun.BuildUnreachable(packet, source, headroom)
+		reply, replyOk := common.BuildICMPUnreachable(packet, source, headroom)
 		if replyOk {
 			replies = append(replies, reply)
 		}

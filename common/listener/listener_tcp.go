@@ -94,21 +94,29 @@ func (l *Listener) ListenTCP() (net.Listener, error) {
 
 func (l *Listener) loopTCPIn() {
 	tcpListener := l.tcpListener
+	var acceptDelay time.Duration
 	for {
 		conn, err := tcpListener.Accept()
 		if err != nil {
-			//nolint:staticcheck
-			if netError, isNetError := err.(net.Error); isNetError && netError.Temporary() {
-				l.logger.Error(err)
-				continue
-			}
 			if l.shutdown.Load() && E.IsClosed(err) {
 				return
 			}
+			//nolint:staticcheck
+			if netError, isNetError := err.(net.Error); isNetError && netError.Temporary() {
+				if acceptDelay == 0 {
+					acceptDelay = 5 * time.Millisecond
+				} else {
+					acceptDelay = min(2*acceptDelay, time.Second)
+				}
+				l.logger.Error(err, ", retrying in ", acceptDelay)
+				time.Sleep(acceptDelay)
+				continue
+			}
 			l.tcpListener.Close()
 			l.logger.Error("tcp listener closed: ", err)
-			continue
+			return
 		}
+		acceptDelay = 0
 		go l.newTCPConnection(conn)
 	}
 }

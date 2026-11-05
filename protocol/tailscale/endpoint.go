@@ -425,7 +425,7 @@ func (t *Endpoint) postStart() error {
 	if gErr != nil {
 		return gonet.TranslateNetstackError(gErr)
 	}
-	icmpForwarder := tun.NewICMPForwarder(ipStack, t, t.logger)
+	icmpForwarder := tun.NewICMPForwarder(ipStack, t, nil, t.logger)
 	ipStack.SetTransportProtocolHandler(icmp.ProtocolNumber4, icmpForwarder.HandlePacket)
 	ipStack.SetTransportProtocolHandler(icmp.ProtocolNumber6, icmpForwarder.HandlePacket)
 	t.stack = ipStack
@@ -1023,5 +1023,7 @@ func (t *peerDNSQueryHandler) HandlePeerDNSQuery(ctx context.Context, query []by
 		}
 		return nil, err
 	}
-	return response.Pack()
+	compressedResponse := *response
+	compressedResponse.Compress = true
+	return compressedResponse.Pack()
 }

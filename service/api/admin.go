@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
 	"maps"
 	"math"
 	"net"
@@ -50,6 +51,9 @@ const (
 	adminMaintenanceInterval        = 2 * time.Second
 	adminTrafficCheckpointInterval  = 30 * time.Second
 	adminOverviewCacheDuration      = time.Second
+	adminPendingTrafficLimit        = 4096
+	adminJSONBodyLimit              = 1 << 20
+	adminReloadDelay                = 300 * time.Millisecond
 )
 
 // ContextWithValidation disables runtime and persistent dashboard mutations
@@ -78,6 +82,7 @@ type adminAPI struct {
 	inbounds            []adminInboundRuntime
 	serverRevisions     map[string]int64
 	userAliases         map[string]adminManagedUserIdentity
+	userAliasUnused     map[string]bool
 	processSignalReload bool
 
 	storeAccess           sync.RWMutex
@@ -87,13 +92,23 @@ type adminAPI struct {
 	trafficAccess         sync.Mutex
 	trafficBaselines      map[uuid.UUID]adminTrafficBaseline
 	pendingTrafficAccess  sync.Mutex
-	pendingTraffic        []adminTrafficEvent
+	pendingTraffic        map[adminTrafficKey]adminTrafficEvent
 	runCtx                context.Context
 	cancel                context.CancelFunc
 	workers               sync.WaitGroup
 	handlerAccess         sync.Mutex
 	handlers              sync.WaitGroup
 	closing               bool
+	stopAdmissionOnce     sync.Once
+	finalizeOnce          sync.Once
+	finalizeErr           error
+	reloadWorkerOnce      sync.Once
+	reloadRequests        chan struct{}
+	reloadPending         atomic.Bool
+	reloadDelay           time.Duration
+	reloadSignal          func() error
+	stateSaveBarrier      func(string) error
+	checkpointBarrier     func()
 	overviewAccess        sync.Mutex
 	overviewContent       []byte
 	overviewExpires       time.Time
@@ -269,6 +284,13 @@ type adminTrafficEvent struct {
 	UpdatedAt  int64
 }
 
+type adminTrafficKey struct {
+	Inbound    string
+	Identity   string
+	Generation int64
+	ByID       bool
+}
+
 type adminManagedUserIdentity struct {
 	ID         string
 	Generation int64
@@ -277,7 +299,7 @@ type adminManagedUserIdentity struct {
 func newAdminAPI(ctx context.Context, logger log.ContextLogger, secret string, dataPath string, publicBaseURL string, serverRevisions map[string]int64, processSignalReload bool) (*adminAPI, error) {
 	runCtx, cancel := context.WithCancel(ctx)
 	a := &adminAPI{
-		ctx:                 ctx,
+		ctx:                 context.WithoutCancel(ctx),
 		runCtx:              runCtx,
 		cancel:              cancel,
 		logger:              logger,
@@ -289,8 +311,12 @@ func newAdminAPI(ctx context.Context, logger log.ContextLogger, secret string, d
 		runtimes:            make(map[string]*adminInboundRuntime),
 		serverRevisions:     make(map[string]int64, len(serverRevisions)),
 		userAliases:         make(map[string]adminManagedUserIdentity),
+		userAliasUnused:     make(map[string]bool),
 		processSignalReload: processSignalReload,
 		trafficBaselines:    make(map[uuid.UUID]adminTrafficBaseline),
+		pendingTraffic:      make(map[adminTrafficKey]adminTrafficEvent),
+		reloadRequests:      make(chan struct{}, 1),
+		reloadDelay:         adminReloadDelay,
 		store: adminStore{
 			Version:               adminStoreVersion,
 			Accounts:              make(map[string]*adminAccount),
@@ -412,26 +438,46 @@ func (a *adminAPI) addRuntime(tag string, inboundType string, kind string, candi
 }
 
 func (a *adminAPI) loadStore() error {
-	var result error
-	found := false
-	for _, candidatePath := range []string{a.dataPath, a.dataPath + ".bak"} {
-		content, err := filemanager.ReadFile(a.ctx, candidatePath)
+	type candidate struct {
+		path  string
+		store adminStore
+		found bool
+		valid bool
+		err   error
+	}
+	candidates := []candidate{{path: a.dataPath}, {path: a.dataPath + ".bak"}}
+	now := time.Now().UnixMilli()
+	for index := range candidates {
+		content, err := filemanager.ReadFile(a.ctx, candidates[index].path)
 		if errors.Is(err, os.ErrNotExist) {
 			continue
 		}
-		found = true
+		candidates[index].found = true
 		if err == nil {
-			var stored adminStore
-			stored, err = decodeAdminStore(content, time.Now().UnixMilli())
-			if err == nil {
-				a.store = stored
-				if candidatePath != a.dataPath {
-					a.logger.Warn("dashboard: recovered data from backup after primary store failed")
-				}
-				return nil
-			}
+			candidates[index].store, err = decodeAdminStore(content, now)
+			candidates[index].valid = err == nil
 		}
-		result = errors.Join(result, E.Cause(err, "load dashboard data at ", candidatePath))
+		candidates[index].err = err
+	}
+	if candidates[0].valid {
+		a.store = candidates[0].store
+		return nil
+	}
+	if candidates[1].valid {
+		a.store = candidates[1].store
+		if a.logger != nil {
+			a.logger.Warn("dashboard: recovered data from backup after primary store failed")
+		}
+		return nil
+	}
+	var result error
+	found := false
+	for _, candidate := range candidates {
+		if !candidate.found {
+			continue
+		}
+		found = true
+		result = errors.Join(result, E.Cause(candidate.err, "load dashboard data at ", candidate.path))
 	}
 	if !found {
 		return nil
@@ -740,17 +786,16 @@ func (a *adminAPI) start() error {
 	}
 	a.startedAt = time.Now()
 	if a.traffic != nil {
-		a.removeTrafficOpenHook = a.traffic.AddOpenHook(a.recordTrafficOpen)
-		a.removeTrafficHook = a.traffic.AddCloseHook(a.recordTraffic)
+		a.removeTrafficOpenHook = a.traffic.AddOpenHookQuiescent(a.recordTrafficOpen)
+		a.removeTrafficHook = a.traffic.AddCloseHookQuiescent(a.recordTraffic)
 		for _, metadata := range a.traffic.Connections() {
 			a.recordTrafficOpen(metadata)
 		}
 	}
-	a.workers.Add(1)
-	go func() {
-		defer a.workers.Done()
+	a.workers.Go(func() {
 		a.maintenanceLoop()
-	}()
+	})
+	a.startReloadWorker()
 	return nil
 }
 
@@ -786,13 +831,13 @@ func (a *adminAPI) markServerProfilesApplied() (func() error, error) {
 	}
 	if err := a.saveStore(); err != nil {
 		a.restoreAppliedServerProfiles(previousServers, previousInbounds)
-		return nil, err
+		return nil, errors.Join(err, a.saveStorePreservingBackup())
 	}
 	return func() error {
 		a.mutation.Lock()
 		defer a.unlockMutation()
 		a.restoreAppliedServerProfiles(previousServers, previousInbounds)
-		return a.saveStore()
+		return a.saveStorePreservingBackup()
 	}, nil
 }
 
@@ -803,28 +848,56 @@ func (a *adminAPI) restoreAppliedServerProfiles(servers map[string]*adminServerS
 	a.storeAccess.Unlock()
 }
 
-func (a *adminAPI) close() {
-	a.handlerAccess.Lock()
-	a.closing = true
-	a.handlerAccess.Unlock()
-	a.handlers.Wait()
-	if a.removeTrafficOpenHook != nil {
-		a.removeTrafficOpenHook()
-		a.removeTrafficOpenHook = nil
-	}
-	if a.removeTrafficHook != nil {
-		a.removeTrafficHook()
-		a.removeTrafficHook = nil
-	}
-	a.cancel()
-	a.workers.Wait()
-	if a.validationOnly {
-		return
-	}
-	a.snapshotActiveTraffic()
-	if err := a.saveStore(); err != nil {
-		a.logger.Error("dashboard: save data: ", err)
-	}
+// stopAdmission stops remote handlers and background mutation workers while
+// deliberately leaving traffic hooks installed. The owner must quiesce traffic
+// producers before finalizeTrafficAccounting removes those hooks.
+func (a *adminAPI) stopAdmission() {
+	a.stopAdmissionOnce.Do(func() {
+		a.handlerAccess.Lock()
+		a.closing = true
+		a.handlerAccess.Unlock()
+		a.handlers.Wait()
+		if a.cancel != nil {
+			a.cancel()
+		}
+		a.workers.Wait()
+	})
+}
+
+func (a *adminAPI) finalizeTrafficAccounting() error {
+	a.finalizeOnce.Do(func() {
+		a.stopAdmission()
+		if a.removeTrafficOpenHook != nil {
+			a.removeTrafficOpenHook()
+			a.removeTrafficOpenHook = nil
+		}
+		if a.removeTrafficHook != nil {
+			a.removeTrafficHook()
+			a.removeTrafficHook = nil
+		}
+		if a.validationOnly {
+			return
+		}
+		a.snapshotActiveTraffic()
+		a.mutation.Lock()
+		a.flushPendingTrafficLocked()
+		a.mutation.Unlock()
+		a.storeAccess.Lock()
+		clear(a.userAliases)
+		clear(a.userAliasUnused)
+		a.storeAccess.Unlock()
+		if err := a.saveStore(); err != nil {
+			a.finalizeErr = E.Cause(err, "save final dashboard data")
+			return
+		}
+		a.dirty.Store(false)
+	})
+	return a.finalizeErr
+}
+
+func (a *adminAPI) close() error {
+	a.stopAdmission()
+	return a.finalizeTrafficAccounting()
 }
 
 func (a *adminAPI) recordTrafficOpen(metadata *trafficcontrol.TrackerMetadata) {
@@ -864,15 +937,58 @@ func (a *adminAPI) recordTraffic(metadata *trafficcontrol.TrackerMetadata) {
 		Upload: upload, Download: download, UpdatedAt: time.Now().UnixMilli(),
 	}
 	if !a.mutation.TryLock() {
-		a.pendingTrafficAccess.Lock()
-		a.pendingTraffic = append(a.pendingTraffic, event)
-		a.pendingTrafficAccess.Unlock()
-		a.dirty.Store(true)
+		if a.queuePendingTraffic(event) {
+			a.dirty.Store(true)
+			return
+		}
+		// The fixed-size identity map is full. Backpressure this close until the
+		// current mutation commits or rolls back, then flush without dropping it.
+		a.mutation.Lock()
+		a.flushPendingTrafficLocked()
+		a.applyTrafficEventsLocked([]adminTrafficEvent{event})
+		a.mutation.Unlock()
 		return
 	}
 	a.flushPendingTrafficLocked()
 	a.applyTrafficEventsLocked([]adminTrafficEvent{event})
 	a.mutation.Unlock()
+}
+
+func adminTrafficEventKey(event adminTrafficEvent) adminTrafficKey {
+	identity := event.User
+	byID := event.UserID != ""
+	if byID {
+		identity = event.UserID
+	}
+	return adminTrafficKey{Inbound: event.Inbound, Identity: identity, Generation: event.Generation, ByID: byID}
+}
+
+func aggregateAdminTrafficEvent(current adminTrafficEvent, event adminTrafficEvent) adminTrafficEvent {
+	if current.Inbound == "" {
+		current.Inbound = event.Inbound
+		current.User = event.User
+		current.UserID = event.UserID
+		current.Generation = event.Generation
+	}
+	current.Upload = saturatingAdminTrafficAdd(current.Upload, event.Upload)
+	current.Download = saturatingAdminTrafficAdd(current.Download, event.Download)
+	current.UpdatedAt = max(current.UpdatedAt, event.UpdatedAt)
+	return current
+}
+
+func (a *adminAPI) queuePendingTraffic(event adminTrafficEvent) bool {
+	key := adminTrafficEventKey(event)
+	a.pendingTrafficAccess.Lock()
+	defer a.pendingTrafficAccess.Unlock()
+	if a.pendingTraffic == nil {
+		a.pendingTraffic = make(map[adminTrafficKey]adminTrafficEvent)
+	}
+	current, exists := a.pendingTraffic[key]
+	if !exists && len(a.pendingTraffic) >= adminPendingTrafficLimit {
+		return false
+	}
+	a.pendingTraffic[key] = aggregateAdminTrafficEvent(current, event)
+	return true
 }
 
 func (a *adminAPI) applyTrafficEventsLocked(events []adminTrafficEvent) {
@@ -892,6 +1008,12 @@ func (a *adminAPI) applyTrafficEventsLocked(events []adminTrafficEvent) {
 	}
 	aggregated := make(map[string]map[trafficEventKey]adminTrafficEvent)
 	for _, event := range events {
+		if event.UserID == "" {
+			if alias := a.userAliases[adminUserKey(event.Inbound, event.User)]; alias.ID != "" {
+				event.UserID = alias.ID
+				event.Generation = alias.Generation
+			}
+		}
 		identity := event.User
 		byID := event.UserID != ""
 		if byID {
@@ -903,15 +1025,7 @@ func (a *adminAPI) applyTrafficEventsLocked(events []adminTrafficEvent) {
 			aggregated[event.Inbound] = byIdentity
 		}
 		key := trafficEventKey{identity: identity, generation: event.Generation, byID: byID}
-		current := byIdentity[key]
-		current.Inbound = event.Inbound
-		current.User = event.User
-		current.UserID = event.UserID
-		current.Generation = event.Generation
-		current.Upload = saturatingAdminTrafficAdd(current.Upload, event.Upload)
-		current.Download = saturatingAdminTrafficAdd(current.Download, event.Download)
-		current.UpdatedAt = max(current.UpdatedAt, event.UpdatedAt)
-		byIdentity[key] = current
+		byIdentity[key] = aggregateAdminTrafficEvent(byIdentity[key], event)
 	}
 	for inbound, byIdentity := range aggregated {
 		record := a.store.Inbounds[inbound]
@@ -930,6 +1044,12 @@ func (a *adminAPI) applyTrafficEventsLocked(events []adminTrafficEvent) {
 }
 
 func (a *adminAPI) applyTrafficEventLocked(event adminTrafficEvent) {
+	if event.UserID == "" {
+		if alias := a.userAliases[adminUserKey(event.Inbound, event.User)]; alias.ID != "" {
+			event.UserID = alias.ID
+			event.Generation = alias.Generation
+		}
+	}
 	record := a.store.Inbounds[event.Inbound]
 	if record == nil {
 		return
@@ -970,18 +1090,61 @@ func (a *adminAPI) managedUserIdentity(tag string, name string) (string, int64) 
 	return alias.ID, alias.Generation
 }
 
-func (a *adminAPI) flushPendingTraffic() {
-	a.mutation.Lock()
-	a.flushPendingTrafficLocked()
-	a.mutation.Unlock()
-}
-
 func (a *adminAPI) flushPendingTrafficLocked() {
 	a.pendingTrafficAccess.Lock()
-	events := a.pendingTraffic
-	a.pendingTraffic = nil
+	pending := a.pendingTraffic
+	a.pendingTraffic = make(map[adminTrafficKey]adminTrafficEvent)
 	a.pendingTrafficAccess.Unlock()
+	if len(pending) == 0 {
+		a.reclaimUserAliases()
+		return
+	}
+	events := make([]adminTrafficEvent, 0, len(pending))
+	for _, event := range pending {
+		events = append(events, event)
+	}
 	a.applyTrafficEventsLocked(events)
+	a.reclaimUserAliases()
+}
+
+func (a *adminAPI) reclaimUserAliases() {
+	live := make(map[string]bool)
+	if a.traffic != nil {
+		for _, metadata := range a.traffic.Connections() {
+			if metadata.Metadata.User != "" {
+				live[adminUserKey(metadata.Metadata.Inbound, metadata.Metadata.User)] = true
+			}
+		}
+	}
+	a.pendingTrafficAccess.Lock()
+	for _, event := range a.pendingTraffic {
+		if event.UserID == "" && event.User != "" {
+			live[adminUserKey(event.Inbound, event.User)] = true
+		}
+	}
+	a.pendingTrafficAccess.Unlock()
+	a.storeAccess.Lock()
+	if a.userAliasUnused == nil {
+		a.userAliasUnused = make(map[string]bool)
+	}
+	for key := range a.userAliases {
+		if live[key] {
+			delete(a.userAliasUnused, key)
+			continue
+		}
+		if a.userAliasUnused[key] {
+			delete(a.userAliases, key)
+			delete(a.userAliasUnused, key)
+		} else {
+			a.userAliasUnused[key] = true
+		}
+	}
+	for key := range a.userAliasUnused {
+		if _, exists := a.userAliases[key]; !exists {
+			delete(a.userAliasUnused, key)
+		}
+	}
+	a.storeAccess.Unlock()
 }
 
 func (a *adminAPI) unlockMutation() {
@@ -1003,7 +1166,6 @@ func (a *adminAPI) maintenanceLoop() {
 			continue
 		case <-maintenanceTicker.C:
 		}
-		a.flushPendingTraffic()
 		if err := a.renewExpiredAccounts(time.Now().UnixMilli()); err != nil {
 			a.logger.Error("dashboard: renew accounts: ", err)
 		}
@@ -1014,19 +1176,26 @@ func (a *adminAPI) maintenanceLoop() {
 }
 
 func (a *adminAPI) checkpointTraffic() {
-	a.flushPendingTraffic()
+	a.mutation.Lock()
+	defer a.mutation.Unlock()
+	a.flushPendingTrafficLocked()
 	if !a.dirty.Swap(false) {
 		return
 	}
+	if a.checkpointBarrier != nil {
+		a.checkpointBarrier()
+	}
 	if err := a.saveTrafficStore(); err != nil {
-		a.logger.Error("dashboard: save data: ", err)
+		if a.logger != nil {
+			a.logger.Error("dashboard: save data: ", err)
+		}
 		a.dirty.Store(true)
 	}
 }
 
 func (a *adminAPI) renewExpiredAccounts(now int64) error {
 	a.mutation.Lock()
-	defer a.unlockMutation()
+	defer a.mutation.Unlock()
 	a.flushPendingTrafficLocked()
 
 	a.storeAccess.Lock()
@@ -1104,7 +1273,7 @@ func (a *adminAPI) renewExpiredAccounts(now int64) error {
 		for _, tag := range tags {
 			restoreErr = errors.Join(restoreErr, a.applyInbound(tag, true))
 		}
-		restoreErr = errors.Join(restoreErr, a.saveStore())
+		restoreErr = errors.Join(restoreErr, a.saveStorePreservingBackup())
 		return errors.Join(err, restoreErr)
 	}
 	return nil
@@ -2079,9 +2248,11 @@ func (a *adminAPI) updateUser(writer http.ResponseWriter, request *http.Request)
 		if a.userAliases == nil {
 			a.userAliases = make(map[string]adminManagedUserIdentity)
 		}
-		a.userAliases[adminUserKey(tag, current.Name)] = adminManagedUserIdentity{
+		aliasKey := adminUserKey(tag, current.Name)
+		a.userAliases[aliasKey] = adminManagedUserIdentity{
 			ID: current.ID, Generation: current.TrafficGeneration,
 		}
+		delete(a.userAliasUnused, aliasKey)
 		a.storeAccess.Unlock()
 		a.trafficAccess.Lock()
 		a.baselineUserTrafficLocked(tag, current.Name, true)
@@ -2205,7 +2376,7 @@ func (a *adminAPI) resetUserTraffic(writer http.ResponseWriter, request *http.Re
 		a.storeAccess.Lock()
 		a.store.Inbounds[tag] = previous
 		a.storeAccess.Unlock()
-		restoreErr := a.saveStore()
+		restoreErr := a.saveStorePreservingBackup()
 		writeAdminError(writer, http.StatusInternalServerError, errors.Join(E.Cause(err, "儲存流量資料失敗"), restoreErr).Error())
 		return
 	}
@@ -2299,7 +2470,7 @@ func (a *adminAPI) rollbackMutation(tag string, previous *adminInboundStore, acc
 	applyErr := a.applyInbound(tag, true)
 	var saveErr error
 	if persist {
-		saveErr = a.saveStore()
+		saveErr = a.saveStorePreservingBackup()
 	}
 	return errors.Join(applyErr, saveErr)
 }
@@ -2512,14 +2683,21 @@ func (a *adminAPI) closeAllConnections(writer http.ResponseWriter, request *http
 }
 
 func (a *adminAPI) saveStore() error {
-	return a.saveStoreNormalized(true)
+	return a.saveStoreNormalized(true, true)
+}
+
+// saveStorePreservingBackup is used after an in-memory rollback. It replaces
+// a possibly published tentative primary without rotating that rejected
+// generation into the validated backup.
+func (a *adminAPI) saveStorePreservingBackup() error {
+	return a.saveStoreNormalized(true, false)
 }
 
 func (a *adminAPI) saveTrafficStore() error {
-	return a.saveStoreNormalized(false)
+	return a.saveStoreNormalized(false, true)
 }
 
-func (a *adminAPI) saveStoreNormalized(normalize bool) error {
+func (a *adminAPI) saveStoreNormalized(normalize bool, rotateBackup bool) error {
 	if a.validationOnly {
 		return nil
 	}
@@ -2546,71 +2724,153 @@ func (a *adminAPI) saveStoreNormalized(normalize bool) error {
 	if err != nil {
 		return err
 	}
+	content = append(content, '\n')
 	parent := filepath.Dir(a.dataPath)
 	if parent != "." {
 		if err = filemanager.MkdirAll(a.ctx, parent, 0o700); err != nil {
 			return err
 		}
 	}
-	tempPath := a.dataPath + ".tmp"
-	backupPath := a.dataPath + ".bak"
-	if err = filemanager.Remove(a.ctx, tempPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	temporary, err := filemanager.OpenFile(a.ctx, tempPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+
+	newPath, err := a.writeAdminStateTemp(parent, "new", content)
 	if err != nil {
 		return err
 	}
-	defer filemanager.Remove(a.ctx, tempPath)
-	content = append(content, '\n')
-	if err = temporary.Chmod(0o600); err == nil {
-		_, err = temporary.Write(content)
-	}
-	if err == nil {
-		err = temporary.Sync()
-	}
-	closeErr := temporary.Close()
-	if err != nil || closeErr != nil {
-		return errors.Join(err, closeErr)
-	}
-	if err = secureAdminStateFile(a.ctx, tempPath); err != nil {
+	defer func() {
+		if newPath != "" {
+			_ = filemanager.Remove(a.ctx, newPath)
+		}
+	}()
+	if err = a.runStateSaveBarrier("new-generation-durable"); err != nil {
 		return err
 	}
 
-	_, statErr := filemanager.Stat(a.ctx, a.dataPath)
-	hasCurrent := statErr == nil
-	if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
-		return statErr
+	// Copy, rather than rename, a validated primary. Publish that copy as the
+	// backup while the primary is still intact; every crash point therefore
+	// retains a loadable primary and backup generation.
+	var backupStage string
+	if previous, valid := a.validAdminStateContent(a.dataPath); rotateBackup && valid {
+		backupStage, err = a.writeAdminStateTemp(parent, "backup", previous)
+		if err != nil {
+			return err
+		}
+		defer func() {
+			if backupStage != "" {
+				_ = filemanager.Remove(a.ctx, backupStage)
+			}
+		}()
+		if err = a.runStateSaveBarrier("backup-generation-durable"); err != nil {
+			return err
+		}
+		if err = replaceAdminStateFile(a.ctx, backupStage, a.dataPath+".bak"); err != nil {
+			return err
+		}
+		backupStage = ""
+		if err = syncAdminStateDirectory(a.ctx, parent); err != nil {
+			return E.Cause(err, "sync dashboard backup directory")
+		}
+		if err = a.runStateSaveBarrier("backup-published"); err != nil {
+			return err
+		}
 	}
-	if hasCurrent {
-		if err = secureAdminStateFile(a.ctx, a.dataPath); err != nil {
-			return err
-		}
-		if err = filemanager.Remove(a.ctx, backupPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return err
-		}
-		if err = filemanager.Rename(a.ctx, a.dataPath, backupPath); err != nil {
-			return err
-		}
+
+	if err = replaceAdminStateFile(a.ctx, newPath, a.dataPath); err != nil {
+		return err
 	}
-	if err = replaceAdminStateFile(a.ctx, tempPath, a.dataPath); err != nil {
-		if hasCurrent {
-			err = errors.Join(err, replaceAdminStateFile(a.ctx, backupPath, a.dataPath))
-		}
+	newPath = ""
+	if err = a.runStateSaveBarrier("primary-published"); err != nil {
 		return err
 	}
 	if err = syncAdminStateDirectory(a.ctx, parent); err != nil {
 		return E.Cause(err, "sync dashboard data directory")
 	}
+	if err = a.runStateSaveBarrier("primary-durable"); err != nil {
+		return err
+	}
 	return nil
 }
 
+func (a *adminAPI) validAdminStateContent(path string) ([]byte, bool) {
+	content, err := filemanager.ReadFile(a.ctx, path)
+	if err != nil {
+		return nil, false
+	}
+	if _, err = decodeAdminStore(content, time.Now().UnixMilli()); err != nil {
+		return nil, false
+	}
+	return content, true
+}
+
+func (a *adminAPI) writeAdminStateTemp(parent string, kind string, content []byte) (string, error) {
+	for range 16 {
+		var nonce [12]byte
+		if _, err := rand.Read(nonce[:]); err != nil {
+			return "", err
+		}
+		path := filepath.Join(parent, "."+filepath.Base(a.dataPath)+"."+kind+"-"+hex.EncodeToString(nonce[:]))
+		file, err := filemanager.OpenFile(a.ctx, path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		if errors.Is(err, os.ErrExist) {
+			continue
+		}
+		if err != nil {
+			return "", err
+		}
+		writeErr := file.Chmod(0o600)
+		if writeErr == nil {
+			_, writeErr = file.Write(content)
+		}
+		if writeErr == nil {
+			writeErr = file.Sync()
+		}
+		closeErr := file.Close()
+		if writeErr != nil || closeErr != nil {
+			_ = filemanager.Remove(a.ctx, path)
+			return "", errors.Join(writeErr, closeErr)
+		}
+		if err = secureAdminStateFile(a.ctx, path); err != nil {
+			_ = filemanager.Remove(a.ctx, path)
+			return "", err
+		}
+		return path, nil
+	}
+	return "", E.New("allocate unique dashboard state path")
+}
+
+func (a *adminAPI) runStateSaveBarrier(stage string) error {
+	if a.stateSaveBarrier == nil {
+		return nil
+	}
+	return a.stateSaveBarrier(stage)
+}
+
 func decodeAdminJSON(writer http.ResponseWriter, request *http.Request, value any) error {
-	request.Body = http.MaxBytesReader(writer, request.Body, 1<<20)
+	if request.ContentLength > adminJSONBodyLimit {
+		writeAdminError(writer, http.StatusRequestEntityTooLarge, "請求內容過大")
+		return &http.MaxBytesError{Limit: adminJSONBodyLimit}
+	}
+	request.Body = http.MaxBytesReader(writer, request.Body, adminJSONBodyLimit)
 	decoder := json.NewDecoder(request.Body)
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(value); err != nil {
-		writeAdminError(writer, http.StatusBadRequest, "請求內容格式不正確")
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			writeAdminError(writer, http.StatusRequestEntityTooLarge, "請求內容過大")
+		} else {
+			writeAdminError(writer, http.StatusBadRequest, "請求內容格式不正確")
+		}
+		return err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			err = E.New("unexpected trailing JSON value")
+		}
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			writeAdminError(writer, http.StatusRequestEntityTooLarge, "請求內容過大")
+		} else {
+			writeAdminError(writer, http.StatusBadRequest, "請求內容格式不正確")
+		}
 		return err
 	}
 	return nil

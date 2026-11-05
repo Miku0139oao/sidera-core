@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/textproto"
 	"strings"
+	"sync"
 	"time"
 
 	E "github.com/sagernet/sing/common/exceptions"
@@ -18,9 +19,12 @@ import (
 )
 
 const (
-	webSocketSubprotocol  = "grpc-websockets"
-	webSocketReadLimit    = 1 << 22
-	webSocketPingInterval = 30 * time.Second
+	webSocketSubprotocol              = "grpc-websockets"
+	webSocketReadLimit                = 1 << 22
+	webSocketPingInterval             = 30 * time.Second
+	webSocketDefaultFirstFrameTimeout = 10 * time.Second
+	webSocketDefaultIdleTimeout       = 2 * time.Minute
+	webSocketMaxConnections           = 128
 )
 
 func isWebSocketGRPCRequest(request *http.Request) bool {
@@ -28,24 +32,62 @@ func isWebSocketGRPCRequest(request *http.Request) bool {
 		httpguts.HeaderValuesContainsToken(request.Header.Values("Sec-Websocket-Protocol"), webSocketSubprotocol)
 }
 
+func (b *webBridge) acquireWebSocket() bool {
+	b.webSocketAdmissionAccess.Lock()
+	if b.webSocketSlots == nil {
+		b.webSocketSlots = make(chan struct{}, webSocketMaxConnections)
+	}
+	slots := b.webSocketSlots
+	b.webSocketAdmissionAccess.Unlock()
+	select {
+	case slots <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (b *webBridge) releaseWebSocket() {
+	b.webSocketAdmissionAccess.Lock()
+	slots := b.webSocketSlots
+	b.webSocketAdmissionAccess.Unlock()
+	if slots != nil {
+		<-slots
+	}
+}
+
 // serveWebSocket carries a single gRPC stream over a WebSocket connection:
 // the first client message contains the request metadata, each subsequent
 // binary message is prefixed with 0 for body data or is a single 1 byte for
 // the half-close signal, and the server sends gRPC-Web frames back.
 func (b *webBridge) serveWebSocket(writer http.ResponseWriter, request *http.Request) {
+	if !b.acquireWebSocket() {
+		writer.Header().Set("Retry-After", "1")
+		http.Error(writer, "too many websocket streams", http.StatusServiceUnavailable)
+		return
+	}
+	defer b.releaseWebSocket()
 	conn, err := websocket.Accept(writer, request, &websocket.AcceptOptions{
 		Subprotocols:       []string{webSocketSubprotocol},
 		OriginPatterns:     b.webSocketOrigins,
 		InsecureSkipVerify: b.insecureWebSocketOrigin,
 	})
 	if err != nil {
-		b.logger.Error("upgrade websocket request: ", err)
+		if b.logger != nil {
+			b.logger.Error("upgrade websocket request: ", err)
+		}
 		return
 	}
 	conn.SetReadLimit(webSocketReadLimit)
 	ctx, cancel := context.WithCancel(request.Context())
 	defer cancel()
-	messageType, firstMessage, err := conn.Read(ctx)
+	firstFrameTimeout := b.webSocketFirstFrameTimeout
+	if firstFrameTimeout <= 0 {
+		firstFrameTimeout = webSocketDefaultFirstFrameTimeout
+	}
+	firstFrameCtx, cancelFirstFrame := context.WithTimeout(ctx, firstFrameTimeout)
+	messageType, firstMessage, err := conn.Read(firstFrameCtx)
+	cancelFirstFrame()
 	if err != nil {
 		conn.CloseNow()
 		return
@@ -56,10 +98,18 @@ func (b *webBridge) serveWebSocket(writer http.ResponseWriter, request *http.Req
 	}
 	header, err := parseWebSocketHeader(firstMessage)
 	if err != nil {
-		b.logger.Error("parse websocket request metadata: ", err)
+		if b.logger != nil {
+			b.logger.Error("parse websocket request metadata: ", err)
+		}
 		conn.CloseNow()
 		return
 	}
+	idleTimeout := b.webSocketIdleTimeout
+	if idleTimeout <= 0 {
+		idleTimeout = webSocketDefaultIdleTimeout
+	}
+	activity := newWebSocketActivity(ctx, cancel, conn, idleTimeout)
+	defer activity.stop()
 	contentType := header.Get("Content-Type")
 	if contentType == "" {
 		header.Set("Content-Type", contentTypeGRPC)
@@ -67,7 +117,8 @@ func (b *webBridge) serveWebSocket(writer http.ResponseWriter, request *http.Req
 		header.Set("Content-Type", strings.Replace(contentType, contentTypeGRPCWeb, contentTypeGRPC, 1))
 	}
 	header.Del("Content-Length")
-	response := newWebSocketResponseWriter(ctx, conn)
+	response := newWebSocketResponseWriter(ctx, conn, activity)
+	var sessionWorkers sync.WaitGroup
 	grpcRequest := request.WithContext(ctx)
 	grpcRequest.Method = http.MethodPost
 	grpcRequest.ProtoMajor = 2
@@ -78,11 +129,18 @@ func (b *webBridge) serveWebSocket(writer http.ResponseWriter, request *http.Req
 		cancel:   cancel,
 		conn:     conn,
 		response: response,
+		activity: activity,
+		workers:  &sessionWorkers,
 	}
-	go keepWebSocketAlive(ctx, conn)
+	sessionWorkers.Go(func() {
+		keepWebSocketAlive(ctx, cancel, conn)
+	})
 	b.grpcServer.ServeHTTP(response, grpcRequest)
 	response.writeTrailerFrame()
-	conn.Close(websocket.StatusNormalClosure, "")
+	_ = conn.Close(websocket.StatusNormalClosure, "")
+	cancel()
+	sessionWorkers.Wait()
+	activity.wait()
 }
 
 func parseWebSocketHeader(content []byte) (http.Header, error) {
@@ -94,7 +152,7 @@ func parseWebSocketHeader(content []byte) (http.Header, error) {
 	return http.Header(mimeHeader), nil
 }
 
-func keepWebSocketAlive(ctx context.Context, conn *websocket.Conn) {
+func keepWebSocketAlive(ctx context.Context, cancel context.CancelFunc, conn *websocket.Conn) {
 	ticker := time.NewTicker(webSocketPingInterval)
 	defer ticker.Stop()
 	for {
@@ -102,27 +160,88 @@ func keepWebSocketAlive(ctx context.Context, conn *websocket.Conn) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			err := conn.Ping(ctx)
-			if err != nil {
+			if err := conn.Ping(ctx); err != nil {
+				cancel()
+				conn.CloseNow()
 				return
 			}
 		}
 	}
 }
 
+type webSocketActivity struct {
+	access  sync.Mutex
+	timer   *time.Timer
+	timeout time.Duration
+	done    chan struct{}
+	closed  bool
+}
+
+func newWebSocketActivity(ctx context.Context, cancel context.CancelFunc, conn *websocket.Conn, timeout time.Duration) *webSocketActivity {
+	activity := &webSocketActivity{timeout: timeout, done: make(chan struct{})}
+	activity.timer = time.AfterFunc(timeout, func() {
+		activity.access.Lock()
+		if activity.closed {
+			activity.access.Unlock()
+			return
+		}
+		activity.closed = true
+		activity.access.Unlock()
+		cancel()
+		conn.CloseNow()
+	})
+	go func() {
+		defer close(activity.done)
+		<-ctx.Done()
+		activity.stop()
+	}()
+	return activity
+}
+
+func (a *webSocketActivity) touch() {
+	if a == nil {
+		return
+	}
+	a.access.Lock()
+	if !a.closed {
+		a.timer.Reset(a.timeout)
+	}
+	a.access.Unlock()
+}
+
+func (a *webSocketActivity) stop() {
+	if a == nil {
+		return
+	}
+	a.access.Lock()
+	if !a.closed {
+		a.closed = true
+		a.timer.Stop()
+	}
+	a.access.Unlock()
+}
+
+func (a *webSocketActivity) wait() {
+	if a != nil {
+		<-a.done
+	}
+}
+
 type webSocketResponseWriter struct {
 	ctx           context.Context
 	conn          *websocket.Conn
+	activity      *webSocketActivity
 	header        http.Header
 	flushedHeader http.Header
 	wroteHeaders  bool
 	wroteTrailers bool
 }
 
-func newWebSocketResponseWriter(ctx context.Context, conn *websocket.Conn) *webSocketResponseWriter {
+func newWebSocketResponseWriter(ctx context.Context, conn *websocket.Conn, activity *webSocketActivity) *webSocketResponseWriter {
 	return &webSocketResponseWriter{
 		ctx:           ctx,
 		conn:          conn,
+		activity:      activity,
 		header:        make(http.Header),
 		flushedHeader: make(http.Header),
 	}
@@ -140,6 +259,7 @@ func (w *webSocketResponseWriter) Write(content []byte) (int, error) {
 	if err != nil {
 		return 0, err
 	}
+	w.activity.touch()
 	return len(content), nil
 }
 
@@ -169,7 +289,9 @@ func (w *webSocketResponseWriter) writeHeaderFrame(header http.Header) {
 	frame := make([]byte, 0, 5+headerBuffer.Len())
 	frame = append(frame, webMetadataFrameHeader(headerBuffer.Len())...)
 	frame = append(frame, headerBuffer.Bytes()...)
-	w.conn.Write(w.ctx, websocket.MessageBinary, frame)
+	if w.conn.Write(w.ctx, websocket.MessageBinary, frame) == nil {
+		w.activity.touch()
+	}
 }
 
 func (w *webSocketResponseWriter) writeTrailerFrame() {
@@ -197,6 +319,8 @@ type webSocketBodyReader struct {
 	cancel    context.CancelFunc
 	conn      *websocket.Conn
 	response  *webSocketResponseWriter
+	activity  *webSocketActivity
+	workers   *sync.WaitGroup
 	remaining []byte
 }
 
@@ -212,6 +336,7 @@ func (r *webSocketBodyReader) Read(buffer []byte) (int, error) {
 			r.cancel()
 			return 0, io.EOF
 		}
+		r.activity.touch()
 		if messageType != websocket.MessageBinary {
 			return 0, E.New("unexpected non-binary websocket message")
 		}
@@ -219,7 +344,11 @@ func (r *webSocketBodyReader) Read(buffer []byte) (int, error) {
 			continue
 		}
 		if payload[0] == 1 {
-			go r.waitForClose()
+			if r.workers != nil {
+				r.workers.Go(r.waitForClose)
+			} else {
+				go r.waitForClose()
+			}
 			return 0, io.EOF
 		}
 		content := payload[1:]
@@ -239,6 +368,7 @@ func (r *webSocketBodyReader) waitForClose() {
 			r.cancel()
 			return
 		}
+		r.activity.touch()
 	}
 }
 

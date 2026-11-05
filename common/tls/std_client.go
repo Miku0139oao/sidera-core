@@ -75,8 +75,23 @@ func (c *STDClientConfig) STDConfig() (*STDConfig, error) {
 }
 
 func (c *STDClientConfig) Client(conn net.Conn) (Conn, error) {
+	return c.client(conn, c.ctx)
+}
+
+func (c *STDClientConfig) ClientHandshake(ctx context.Context, conn net.Conn) (Conn, error) {
+	tlsConn, err := c.client(conn, ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err = tlsConn.HandshakeContext(ctx); err != nil {
+		return nil, err
+	}
+	return tlsConn, nil
+}
+
+func (c *STDClientConfig) client(conn net.Conn, ctx context.Context) (Conn, error) {
 	if c.fragment || c.recordFragment {
-		conn = tf.NewConn(conn, c.ctx, c.fragment, c.recordFragment, c.fragmentFallbackDelay)
+		conn = tf.NewConn(conn, ctx, c.fragment, c.recordFragment, c.fragmentFallbackDelay)
 	}
 	conn, err := applyTLSSpoof(conn, c.spoof, c.spoofMethod)
 	if err != nil {
@@ -276,6 +291,9 @@ func verifyConnection(rootCAs *x509.CertPool, timeFunc func() time.Time, serverN
 }
 
 func VerifyPublicKeySHA256(knownHashValues [][]byte, rawCerts [][]byte) error {
+	if len(rawCerts) == 0 {
+		return E.New("peer did not provide a certificate")
+	}
 	leafCertificate, err := x509.ParseCertificate(rawCerts[0])
 	if err != nil {
 		return E.Cause(err, "failed to parse leaf certificate")

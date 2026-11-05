@@ -325,6 +325,8 @@ func traffic(ctx context.Context, trafficManager *trafficcontrol.Manager) func(w
 			select {
 			case <-ctx.Done():
 				return
+			case <-r.Context().Done():
+				return
 			case <-tick.C:
 			}
 			buf.Reset()
@@ -397,6 +399,8 @@ func getLogs(ctx context.Context, logFactory log.ObservableFactory) func(w http.
 		for {
 			select {
 			case <-ctx.Done():
+				return
+			case <-r.Context().Done():
 				return
 			case <-done:
 				return

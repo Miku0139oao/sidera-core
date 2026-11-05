@@ -23,15 +23,17 @@ import (
 )
 
 const (
-	sessionTTL             = time.Minute
-	realmNamePattern       = `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`
-	maxRequestBodyBytes    = 4 << 10
-	maxAddresses           = 8
-	nonceHexLength         = 32
-	obfsHexLength          = 64
-	eventChannelSize       = 16
-	maxPendingAttempts     = 16
-	connectResponseTimeout = 10 * time.Second
+	sessionTTL              = time.Minute
+	realmNamePattern        = `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`
+	maxRequestBodyBytes     = 4 << 10
+	maxAddresses            = 8
+	nonceHexLength          = 32
+	obfsHexLength           = 64
+	eventChannelSize        = 16
+	maxPendingAttempts      = 16
+	defaultMaxRealmsPerUser = 64
+	defaultMaxRealmSessions = 1024
+	connectResponseTimeout  = 10 * time.Second
 )
 
 var realmPattern = regexp.MustCompile(realmNamePattern)
@@ -77,21 +79,23 @@ type punchResponsePayload struct {
 }
 
 type server struct {
-	access     sync.Mutex
-	realms     map[string]*realmSession
-	sessions   map[string]*realmSession
-	userCounts map[string]int
-	logger     log.ContextLogger
-	tokenMap   map[string]*realmUser
+	access      sync.Mutex
+	realms      map[string]*realmSession
+	sessions    map[string]*realmSession
+	userCounts  map[string]int
+	maxSessions int
+	logger      log.ContextLogger
+	tokenMap    map[string]*realmUser
 }
 
 func newServer(logger log.ContextLogger, tokenMap map[string]*realmUser) *server {
 	return &server{
-		realms:     make(map[string]*realmSession),
-		sessions:   make(map[string]*realmSession),
-		userCounts: make(map[string]int),
-		logger:     logger,
-		tokenMap:   tokenMap,
+		realms:      make(map[string]*realmSession),
+		sessions:    make(map[string]*realmSession),
+		userCounts:  make(map[string]int),
+		maxSessions: defaultMaxRealmSessions,
+		logger:      logger,
+		tokenMap:    tokenMap,
 	}
 }
 
@@ -280,10 +284,20 @@ func (s *server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		render.JSON(w, r, render.M{"error": "realm_taken", "message": "realm already registered"})
 		return
 	}
-	if user.maxRealms > 0 && s.userCounts[user.name] >= user.maxRealms {
+	userLimit := user.maxRealms
+	if userLimit == 0 {
+		userLimit = defaultMaxRealmsPerUser
+	}
+	if s.userCounts[user.name] >= userLimit {
 		s.access.Unlock()
 		render.Status(r, http.StatusTooManyRequests)
 		render.JSON(w, r, render.M{"error": "realm_limit_reached", "message": "per-user realm limit reached"})
+		return
+	}
+	if len(s.sessions) >= s.maxSessions {
+		s.access.Unlock()
+		render.Status(r, http.StatusTooManyRequests)
+		render.JSON(w, r, render.M{"error": "realm_capacity_reached", "message": "global realm limit reached"})
 		return
 	}
 	var b [16]byte

@@ -12,7 +12,17 @@ Sidera Core pins upstream revisions so compatibility targets remain reproducible
 | XTLS/Xray-core | Interoperability reference and selected MPL-2.0 ports | v26.3.27 | `6e3322d219140a025285ded1114fe17a5edb74d8` |
 | sagernet/cronet-go | Naive outbound native library builder | pin in `.github/CRONET_GO_VERSION` | `617d38f41f935b46a68f550d9add2e38abb3f168` |
 
-Naive/musl release jobs clone that Cronet pin and its `naiveproxy` submodule. That is a build dependency, not a parent project. A Sidera-owned mirror can be added later; do not drop naive outbound without a product decision.
+Naive/musl release jobs fetch that exact Cronet commit and its pinned
+`naiveproxy` submodule. That is a build dependency, not a parent project. A
+Sidera-owned mirror can be added later; do not drop naive outbound without a
+product decision.
+
+Release workflows pin third-party GitHub Actions to full commit SHA values and
+pin the `ghr` uploader revision. Updating a pin requires reviewing its diff and
+recording the new immutable revision in the same change. Release provenance is
+valid only when the source tag resolves to the attested commit, the checkout is
+clean (including untracked files), and every published artifact is listed in a
+sorted `SHA256SUMS`; see `release/RELEASE.md`.
 
 ## Porting Rules
 

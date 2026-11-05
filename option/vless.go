@@ -28,4 +28,6 @@ type VLESSOutboundOptions struct {
 	PacketEncoding *string                   `json:"packet_encoding,omitempty"`
 	// Xray uses ordinary VLESS UDP for DNS and QUIC, and XUDP for other ports by default.
 	XrayPacketEncoding bool `json:"-"`
+	// Xray rejects UDP/443 for normal Vision imports instead of tunneling it.
+	XrayVisionRejectUDP443 bool `json:"-"`
 }

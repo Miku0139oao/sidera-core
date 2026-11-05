@@ -21,6 +21,49 @@ import (
 	"github.com/openai/openai-go/v3/responses"
 )
 
+const (
+	maxWebSocketMessageBytes   = 32 << 20
+	webSocketFirstFrameTimeout = 10 * time.Second
+	webSocketIdleTimeout       = 2 * time.Minute
+)
+
+func readBoundedWebSocketData(readWriter io.ReadWriter, state ws.State) ([]byte, ws.OpCode, error) {
+	controlHandler := wsutil.ControlFrameHandler(readWriter, state)
+	reader := wsutil.Reader{
+		Source:         readWriter,
+		State:          state,
+		CheckUTF8:      true,
+		MaxFrameSize:   maxWebSocketMessageBytes,
+		OnIntermediate: controlHandler,
+	}
+	for {
+		header, err := reader.NextFrame()
+		if err != nil {
+			return nil, 0, err
+		}
+		if header.OpCode.IsControl() {
+			if err = controlHandler(header, &reader); err != nil {
+				return nil, 0, err
+			}
+			continue
+		}
+		if header.OpCode != ws.OpText && header.OpCode != ws.OpBinary {
+			if err = reader.Discard(); err != nil {
+				return nil, 0, err
+			}
+			continue
+		}
+		data, err := io.ReadAll(io.LimitReader(&reader, maxWebSocketMessageBytes+1))
+		if err != nil {
+			return nil, 0, err
+		}
+		if len(data) > maxWebSocketMessageBytes {
+			return nil, 0, E.New("websocket message exceeds limit")
+		}
+		return data, header.OpCode, nil
+	}
+}
+
 type webSocketSession struct {
 	clientConn   net.Conn
 	upstreamConn net.Conn
@@ -77,7 +120,20 @@ func isForwardableWebSocketRequestHeader(key string) bool {
 }
 
 func (s *Service) handleWebSocket(w http.ResponseWriter, r *http.Request, proxyPath string, username string) {
-	accessToken, err := s.getAccessToken()
+	if s.isShuttingDown() {
+		writeJSONError(w, r, http.StatusServiceUnavailable, "api_error", "service is shutting down")
+		return
+	}
+	if s.webSocketSlots != nil {
+		select {
+		case s.webSocketSlots <- struct{}{}:
+			defer func() { <-s.webSocketSlots }()
+		default:
+			writeJSONError(w, r, http.StatusTooManyRequests, "rate_limit_error", "websocket admission limit reached")
+			return
+		}
+	}
+	accessToken, err := s.getAccessToken(r.Context())
 	if err != nil {
 		s.logger.Error("get access token for websocket: ", err)
 		writeJSONError(w, r, http.StatusUnauthorized, "authentication_error", "authentication failed")
@@ -170,6 +226,8 @@ func (s *Service) handleWebSocket(w http.ResponseWriter, r *http.Request, proxyP
 		upstreamReadWriter = upstreamConn
 	}
 
+	_ = clientConn.SetReadDeadline(time.Now().Add(webSocketFirstFrameTimeout))
+	_ = upstreamConn.SetReadDeadline(time.Now().Add(webSocketFirstFrameTimeout))
 	modelChannel := make(chan string, 1)
 	var waitGroup sync.WaitGroup
 
@@ -182,20 +240,21 @@ func (s *Service) handleWebSocket(w http.ResponseWriter, r *http.Request, proxyP
 	go func() {
 		defer waitGroup.Done()
 		defer session.Close()
-		s.proxyWebSocketUpstreamToClient(upstreamReadWriter, clientConn, modelChannel, username, weeklyCycleHint)
+		s.proxyWebSocketUpstreamToClient(upstreamReadWriter, upstreamConn, clientConn, modelChannel, username, weeklyCycleHint)
 	}()
 	waitGroup.Wait()
 }
 
 func (s *Service) proxyWebSocketClientToUpstream(clientConn net.Conn, upstreamConn net.Conn, modelChannel chan<- string) {
 	for {
-		data, opCode, err := wsutil.ReadClientData(clientConn)
+		data, opCode, err := readBoundedWebSocketData(clientConn, ws.StateServerSide)
 		if err != nil {
 			if !E.IsClosedOrCanceled(err) {
 				s.logger.Debug("read client websocket: ", err)
 			}
 			return
 		}
+		_ = clientConn.SetReadDeadline(time.Now().Add(webSocketIdleTimeout))
 
 		if opCode == ws.OpText && s.usageTracker != nil {
 			var request struct {
@@ -220,16 +279,17 @@ func (s *Service) proxyWebSocketClientToUpstream(clientConn net.Conn, upstreamCo
 	}
 }
 
-func (s *Service) proxyWebSocketUpstreamToClient(upstreamReadWriter io.ReadWriter, clientConn net.Conn, modelChannel <-chan string, username string, weeklyCycleHint *WeeklyCycleHint) {
+func (s *Service) proxyWebSocketUpstreamToClient(upstreamReadWriter io.ReadWriter, upstreamConn net.Conn, clientConn net.Conn, modelChannel <-chan string, username string, weeklyCycleHint *WeeklyCycleHint) {
 	var requestModel string
 	for {
-		data, opCode, err := wsutil.ReadServerData(upstreamReadWriter)
+		data, opCode, err := readBoundedWebSocketData(upstreamReadWriter, ws.StateClientSide)
 		if err != nil {
 			if !E.IsClosedOrCanceled(err) {
 				s.logger.Debug("read upstream websocket: ", err)
 			}
 			return
 		}
+		_ = upstreamConn.SetReadDeadline(time.Now().Add(webSocketIdleTimeout))
 
 		if opCode == ws.OpText && s.usageTracker != nil {
 			select {
@@ -257,7 +317,7 @@ func (s *Service) proxyWebSocketUpstreamToClient(upstreamReadWriter io.ReadWrite
 						}
 						if responseModel != "" {
 							contextWindow := detectContextWindow(responseModel, serviceTier, inputTokens)
-							s.usageTracker.AddUsageWithCycleHint(
+							if usageErr := s.usageTracker.AddUsageWithCycleHint(
 								responseModel,
 								contextWindow,
 								inputTokens,
@@ -267,7 +327,9 @@ func (s *Service) proxyWebSocketUpstreamToClient(upstreamReadWriter io.ReadWrite
 								username,
 								time.Now(),
 								weeklyCycleHint,
-							)
+							); usageErr != nil {
+								s.logger.Warn("record OCM websocket usage: ", usageErr)
+							}
 						}
 					}
 				}

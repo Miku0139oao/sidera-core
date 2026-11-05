@@ -34,13 +34,172 @@ import (
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/go-chi/chi/v5"
 	"golang.org/x/net/http2"
+	"golang.org/x/sync/singleflight"
 )
 
 const (
-	contextWindowStandard   = 200000
-	contextWindowPremium    = 1000000
-	premiumContextThreshold = 200000
+	contextWindowStandard      = 200000
+	contextWindowPremium       = 1000000
+	premiumContextThreshold    = 200000
+	maxTrackedRequestBodyBytes = 32 << 20
+	maxTrackedResponseBytes    = 8 << 20
+	maxTrackedSSELineBytes     = 1 << 20
+	tokenRefreshTimeout        = 30 * time.Second
 )
+
+type boundedCapture struct {
+	data     []byte
+	limit    int
+	overflow bool
+}
+
+func (c *boundedCapture) Write(data []byte) (int, error) {
+	if !c.overflow {
+		remaining := c.limit - len(c.data)
+		if len(data) > remaining {
+			c.data = append(c.data, data[:max(remaining, 0)]...)
+			c.overflow = true
+		} else {
+			c.data = append(c.data, data...)
+		}
+	}
+	return len(data), nil
+}
+
+type boundedSSEParser struct {
+	line       []byte
+	discarding bool
+	overflow   bool
+}
+
+func (p *boundedSSEParser) consume(data []byte, handleLine func([]byte)) {
+	for len(data) > 0 {
+		newline := bytes.IndexByte(data, '\n')
+		var part []byte
+		if newline < 0 {
+			part = data
+			data = nil
+		} else {
+			part = data[:newline]
+			data = data[newline+1:]
+		}
+		if !p.discarding {
+			remaining := maxTrackedSSELineBytes - len(p.line)
+			if len(part) > remaining {
+				p.line = nil
+				p.discarding = true
+				p.overflow = true
+			} else {
+				p.line = append(p.line, part...)
+			}
+		}
+		if newline >= 0 {
+			if !p.discarding {
+				handleLine(p.line)
+			}
+			p.line = p.line[:0]
+			p.discarding = false
+		}
+	}
+}
+
+func (p *boundedSSEParser) finish(handleLine func([]byte)) {
+	if !p.discarding && len(p.line) > 0 {
+		handleLine(p.line)
+	}
+	p.line = nil
+	p.discarding = false
+}
+
+func readBoundedBody(body io.Reader, limit int64) ([]byte, bool, error) {
+	data, err := io.ReadAll(io.LimitReader(body, limit+1))
+	if err != nil {
+		return nil, false, err
+	}
+	if int64(len(data)) > limit {
+		return nil, true, nil
+	}
+	return data, false, nil
+}
+
+func skipJSONValue(decoder *json.Decoder) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	delimiter, nested := token.(json.Delim)
+	if !nested || (delimiter != '{' && delimiter != '[') {
+		return nil
+	}
+	depth := 1
+	for depth > 0 {
+		token, err = decoder.Token()
+		if err != nil {
+			return err
+		}
+		if delimiter, ok := token.(json.Delim); ok {
+			switch delimiter {
+			case '{', '[':
+				depth++
+			case '}', ']':
+				depth--
+			}
+		}
+	}
+	return nil
+}
+
+func parseRequestMetadata(data []byte) (string, int, error) {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	token, err := decoder.Token()
+	if err != nil {
+		return "", 0, err
+	}
+	if delimiter, ok := token.(json.Delim); !ok || delimiter != '{' {
+		return "", 0, E.New("request body must be a JSON object")
+	}
+	var model string
+	var messages int
+	for decoder.More() {
+		keyToken, keyErr := decoder.Token()
+		if keyErr != nil {
+			return "", 0, keyErr
+		}
+		key, ok := keyToken.(string)
+		if !ok {
+			return "", 0, E.New("invalid JSON object key")
+		}
+		switch key {
+		case "model":
+			if err = decoder.Decode(&model); err != nil {
+				return "", 0, err
+			}
+		case "messages":
+			arrayToken, arrayErr := decoder.Token()
+			if arrayErr != nil {
+				return "", 0, arrayErr
+			}
+			if delimiter, ok := arrayToken.(json.Delim); !ok || delimiter != '[' {
+				return "", 0, E.New("messages must be an array")
+			}
+			for decoder.More() {
+				if err = skipJSONValue(decoder); err != nil {
+					return "", 0, err
+				}
+				messages++
+			}
+			if _, err = decoder.Token(); err != nil {
+				return "", 0, err
+			}
+		default:
+			if err = skipJSONValue(decoder); err != nil {
+				return "", 0, err
+			}
+		}
+	}
+	_, err = decoder.Token()
+	return model, messages, err
+}
 
 func RegisterService(registry *boxService.Registry) {
 	boxService.Register[option.CCMServiceOptions](registry, C.TypeCCM, NewService)
@@ -111,19 +270,25 @@ func extractWeeklyCycleHint(headers http.Header) *WeeklyCycleHint {
 
 type Service struct {
 	boxService.Adapter
-	ctx            context.Context
-	logger         log.ContextLogger
-	credentialPath string
-	credentials    *oauthCredentials
-	users          []option.CCMUser
-	httpClient     *http.Client
-	httpHeaders    http.Header
-	listener       *listener.Listener
-	tlsConfig      tls.ServerConfig
-	httpServer     *http.Server
-	userManager    *UserManager
-	accessMutex    sync.RWMutex
-	usageTracker   *AggregatedUsage
+	ctx              context.Context
+	logger           log.ContextLogger
+	credentialPath   string
+	credentials      *oauthCredentials
+	users            []option.CCMUser
+	httpClient       *http.Client
+	httpHeaders      http.Header
+	listener         *listener.Listener
+	tlsConfig        tls.ServerConfig
+	httpServer       *http.Server
+	userManager      *UserManager
+	accessMutex      sync.RWMutex
+	usageTracker     *AggregatedUsage
+	refreshCtx       context.Context
+	refreshCancel    context.CancelFunc
+	refreshGroup     singleflight.Group
+	refreshLifecycle sync.Mutex
+	refreshClosing   bool
+	refreshWG        sync.WaitGroup
 }
 
 func NewService(ctx context.Context, logger log.ContextLogger, tag string, options option.CCMServiceOptions) (adapter.Service, error) {
@@ -166,6 +331,7 @@ func NewService(ctx context.Context, logger log.ContextLogger, tag string, optio
 		}
 	}
 
+	refreshCtx, refreshCancel := context.WithCancel(ctx)
 	service := &Service{
 		Adapter:        boxService.NewAdapter(C.TypeCCM, tag),
 		ctx:            ctx,
@@ -180,8 +346,10 @@ func NewService(ctx context.Context, logger log.ContextLogger, tag string, optio
 			Network: []string{N.NetworkTCP},
 			Listen:  options.ListenOptions,
 		}),
-		userManager:  userManager,
-		usageTracker: usageTracker,
+		userManager:   userManager,
+		usageTracker:  usageTracker,
+		refreshCtx:    refreshCtx,
+		refreshCancel: refreshCancel,
 	}
 
 	if options.TLS != nil {
@@ -211,7 +379,8 @@ func (s *Service) Start(stage adapter.StartStage) error {
 	if s.usageTracker != nil {
 		err = s.usageTracker.Load()
 		if err != nil {
-			s.logger.Warn("load usage statistics: ", err)
+			s.logger.Error("load usage statistics: ", err, ", usage tracking and saving disabled")
+			s.usageTracker = nil
 		}
 	}
 
@@ -232,6 +401,10 @@ func (s *Service) Start(stage adapter.StartStage) error {
 		return err
 	}
 
+	if s.usageTracker != nil {
+		s.usageTracker.startSaveWorker()
+	}
+
 	if s.tlsConfig != nil {
 		if !common.Contains(s.tlsConfig.NextProtos(), http2.NextProtoTLS) {
 			s.tlsConfig.SetNextProtos(append([]string{"h2"}, s.tlsConfig.NextProtos()...))
@@ -249,8 +422,12 @@ func (s *Service) Start(stage adapter.StartStage) error {
 	return nil
 }
 
-func (s *Service) getAccessToken() (string, error) {
+func (s *Service) getAccessToken(ctx context.Context) (string, error) {
 	s.accessMutex.RLock()
+	if s.credentials == nil {
+		s.accessMutex.RUnlock()
+		return "", net.ErrClosed
+	}
 	if !s.credentials.needsRefresh() {
 		token := s.credentials.AccessToken
 		s.accessMutex.RUnlock()
@@ -258,25 +435,59 @@ func (s *Service) getAccessToken() (string, error) {
 	}
 	s.accessMutex.RUnlock()
 
-	s.accessMutex.Lock()
-	defer s.accessMutex.Unlock()
-
-	if !s.credentials.needsRefresh() {
-		return s.credentials.AccessToken, nil
+	result := s.refreshGroup.DoChan("token", s.refreshAccessToken)
+	select {
+	case <-ctx.Done():
+		return "", context.Cause(ctx)
+	case <-s.refreshCtx.Done():
+		return "", context.Cause(s.refreshCtx)
+	case refreshed := <-result:
+		if refreshed.Err != nil {
+			return "", refreshed.Err
+		}
+		return refreshed.Val.(string), nil
 	}
+}
 
-	newCredentials, err := refreshToken(s.httpClient, s.credentials)
+func (s *Service) refreshAccessToken() (any, error) {
+	s.refreshLifecycle.Lock()
+	if s.refreshClosing {
+		s.refreshLifecycle.Unlock()
+		return "", net.ErrClosed
+	}
+	s.refreshWG.Add(1)
+	s.refreshLifecycle.Unlock()
+	defer s.refreshWG.Done()
+
+	s.accessMutex.RLock()
+	if s.credentials == nil {
+		s.accessMutex.RUnlock()
+		return "", net.ErrClosed
+	}
+	if !s.credentials.needsRefresh() {
+		token := s.credentials.AccessToken
+		s.accessMutex.RUnlock()
+		return token, nil
+	}
+	credentials := *s.credentials
+	credentials.Scopes = append([]string(nil), s.credentials.Scopes...)
+	s.accessMutex.RUnlock()
+
+	refreshCtx, cancel := context.WithTimeout(s.refreshCtx, tokenRefreshTimeout)
+	defer cancel()
+	newCredentials, err := refreshToken(refreshCtx, s.httpClient, &credentials)
 	if err != nil {
 		return "", err
 	}
-
+	if err = context.Cause(s.refreshCtx); err != nil {
+		return "", err
+	}
+	s.accessMutex.Lock()
 	s.credentials = newCredentials
-
-	err = platformWriteCredentials(s.ctx, newCredentials, s.credentialPath)
-	if err != nil {
+	s.accessMutex.Unlock()
+	if err = platformWriteCredentials(s.refreshCtx, newCredentials, s.credentialPath); err != nil {
 		s.logger.Warn("persist refreshed token: ", err)
 	}
-
 	return newCredentials.AccessToken, nil
 }
 
@@ -325,22 +536,32 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var messagesCount int
 
 	if s.usageTracker != nil && r.Body != nil {
-		bodyBytes, err := io.ReadAll(r.Body)
-		if err == nil {
-			var request struct {
-				Model    string                   `json:"model"`
-				Messages []anthropic.MessageParam `json:"messages"`
-			}
-			err := json.Unmarshal(bodyBytes, &request)
-			if err == nil {
-				requestModel = request.Model
-				messagesCount = len(request.Messages)
-			}
-			r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+		if r.ContentLength > maxTrackedRequestBodyBytes {
+			_ = r.Body.Close()
+			s.logger.Warn("reject oversized CCM request body from ", r.RemoteAddr)
+			writeJSONError(w, r, http.StatusRequestEntityTooLarge, "invalid_request_error", "request body exceeds usage-tracking limit")
+			return
 		}
+		originalBody := r.Body
+		bodyBytes, oversized, err := readBoundedBody(originalBody, maxTrackedRequestBodyBytes)
+		_ = originalBody.Close()
+		if err != nil {
+			writeJSONError(w, r, http.StatusBadRequest, "invalid_request_error", "failed to read request body")
+			return
+		}
+		if oversized {
+			s.logger.Warn("reject oversized CCM request body from ", r.RemoteAddr)
+			writeJSONError(w, r, http.StatusRequestEntityTooLarge, "invalid_request_error", "request body exceeds usage-tracking limit")
+			return
+		}
+		if parsedModel, parsedMessages, parseErr := parseRequestMetadata(bodyBytes); parseErr == nil {
+			requestModel = parsedModel
+			messagesCount = parsedMessages
+		}
+		r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 	}
 
-	accessToken, err := s.getAccessToken()
+	accessToken, err := s.getAccessToken(r.Context())
 	if err != nil {
 		s.logger.Error("get access token: ", err)
 		writeJSONError(w, r, http.StatusUnauthorized, "authentication_error", "Authentication failed")
@@ -433,17 +654,21 @@ func (s *Service) handleResponseWithTracking(writer http.ResponseWriter, respons
 	isStreaming := err == nil && mediaType == "text/event-stream"
 
 	if !isStreaming {
-		bodyBytes, err := io.ReadAll(response.Body)
-		if err != nil {
-			s.logger.Error("read response body: ", err)
+		capture := &boundedCapture{limit: maxTrackedResponseBytes}
+		_, copyErr := io.CopyBuffer(io.MultiWriter(writer, capture), response.Body, make([]byte, buf.BufferSize))
+		if copyErr != nil {
+			s.logger.Error("stream response body: ", copyErr)
+			return
+		}
+		if capture.overflow {
+			s.logger.Warn("CCM response exceeded usage-tracking limit; response was proxied without accounting")
 			return
 		}
 
 		var message anthropic.Message
 		var usage anthropic.Usage
 		var responseModel string
-		err = json.Unmarshal(bodyBytes, &message)
-		if err == nil {
+		if json.Unmarshal(capture.data, &message) == nil {
 			responseModel = string(message.Model)
 			usage = message.Usage
 		}
@@ -455,7 +680,7 @@ func (s *Service) handleResponseWithTracking(writer http.ResponseWriter, respons
 			if responseModel != "" {
 				totalInputTokens := usage.InputTokens + usage.CacheCreationInputTokens + usage.CacheReadInputTokens
 				contextWindow := detectContextWindow(anthropicBetaHeader, totalInputTokens)
-				s.usageTracker.AddUsageWithCycleHint(
+				if usageErr := s.usageTracker.AddUsageWithCycleHint(
 					responseModel,
 					contextWindow,
 					messagesCount,
@@ -468,11 +693,11 @@ func (s *Service) handleResponseWithTracking(writer http.ResponseWriter, respons
 					username,
 					time.Now(),
 					weeklyCycleHint,
-				)
+				); usageErr != nil {
+					s.logger.Warn("record CCM usage: ", usageErr)
+				}
 			}
 		}
-
-		_, _ = writer.Write(bodyBytes)
 		return
 	}
 
@@ -484,109 +709,103 @@ func (s *Service) handleResponseWithTracking(writer http.ResponseWriter, respons
 
 	var accumulatedUsage anthropic.Usage
 	var responseModel string
+	parser := &boundedSSEParser{}
+	handleLine := func(line []byte) {
+		line = bytes.TrimSpace(line)
+		eventData, isData := bytes.CutPrefix(line, []byte("data: "))
+		if !isData || bytes.Equal(eventData, []byte("[DONE]")) {
+			return
+		}
+		var event anthropic.MessageStreamEventUnion
+		if json.Unmarshal(eventData, &event) != nil {
+			return
+		}
+		switch event.Type {
+		case "message_start":
+			messageStart := event.AsMessageStart()
+			if messageStart.Message.Model != "" {
+				responseModel = string(messageStart.Message.Model)
+			}
+			if messageStart.Message.Usage.InputTokens > 0 {
+				accumulatedUsage.InputTokens = messageStart.Message.Usage.InputTokens
+				accumulatedUsage.CacheReadInputTokens = messageStart.Message.Usage.CacheReadInputTokens
+				accumulatedUsage.CacheCreationInputTokens = messageStart.Message.Usage.CacheCreationInputTokens
+				accumulatedUsage.CacheCreation.Ephemeral5mInputTokens = messageStart.Message.Usage.CacheCreation.Ephemeral5mInputTokens
+				accumulatedUsage.CacheCreation.Ephemeral1hInputTokens = messageStart.Message.Usage.CacheCreation.Ephemeral1hInputTokens
+			}
+		case "message_delta":
+			messageDelta := event.AsMessageDelta()
+			if messageDelta.Usage.OutputTokens > 0 {
+				accumulatedUsage.OutputTokens = messageDelta.Usage.OutputTokens
+			}
+		}
+	}
 	buffer := make([]byte, buf.BufferSize)
-	var leftover []byte
-
 	for {
-		n, err := response.Body.Read(buffer)
+		n, readErr := response.Body.Read(buffer)
 		if n > 0 {
-			data := append(leftover, buffer[:n]...)
-			lines := bytes.Split(data, []byte("\n"))
-
-			if err == nil {
-				leftover = lines[len(lines)-1]
-				lines = lines[:len(lines)-1]
-			} else {
-				leftover = nil
-			}
-
-			for _, line := range lines {
-				line = bytes.TrimSpace(line)
-				if len(line) == 0 {
-					continue
-				}
-
-				if after, ok0 := bytes.CutPrefix(line, []byte("data: ")); ok0 {
-					eventData := after
-					if bytes.Equal(eventData, []byte("[DONE]")) {
-						continue
-					}
-
-					var event anthropic.MessageStreamEventUnion
-					err := json.Unmarshal(eventData, &event)
-					if err != nil {
-						continue
-					}
-					switch event.Type {
-					case "message_start":
-						messageStart := event.AsMessageStart()
-						if messageStart.Message.Model != "" {
-							responseModel = string(messageStart.Message.Model)
-						}
-						if messageStart.Message.Usage.InputTokens > 0 {
-							accumulatedUsage.InputTokens = messageStart.Message.Usage.InputTokens
-							accumulatedUsage.CacheReadInputTokens = messageStart.Message.Usage.CacheReadInputTokens
-							accumulatedUsage.CacheCreationInputTokens = messageStart.Message.Usage.CacheCreationInputTokens
-							accumulatedUsage.CacheCreation.Ephemeral5mInputTokens = messageStart.Message.Usage.CacheCreation.Ephemeral5mInputTokens
-							accumulatedUsage.CacheCreation.Ephemeral1hInputTokens = messageStart.Message.Usage.CacheCreation.Ephemeral1hInputTokens
-						}
-					case "message_delta":
-						messageDelta := event.AsMessageDelta()
-						if messageDelta.Usage.OutputTokens > 0 {
-							accumulatedUsage.OutputTokens = messageDelta.Usage.OutputTokens
-						}
-					}
-				}
-			}
-
-			_, writeError := writer.Write(buffer[:n])
-			if writeError != nil {
-				s.logger.Error("write streaming response: ", writeError)
+			parser.consume(buffer[:n], handleLine)
+			if _, writeErr := writer.Write(buffer[:n]); writeErr != nil {
+				s.logger.Error("write streaming response: ", writeErr)
 				return
 			}
 			flusher.Flush()
 		}
-
-		if err != nil {
-			if responseModel == "" {
-				responseModel = requestModel
-			}
-
-			if accumulatedUsage.InputTokens > 0 || accumulatedUsage.OutputTokens > 0 {
-				if responseModel != "" {
-					totalInputTokens := accumulatedUsage.InputTokens + accumulatedUsage.CacheCreationInputTokens + accumulatedUsage.CacheReadInputTokens
-					contextWindow := detectContextWindow(anthropicBetaHeader, totalInputTokens)
-					s.usageTracker.AddUsageWithCycleHint(
-						responseModel,
-						contextWindow,
-						messagesCount,
-						accumulatedUsage.InputTokens,
-						accumulatedUsage.OutputTokens,
-						accumulatedUsage.CacheReadInputTokens,
-						accumulatedUsage.CacheCreationInputTokens,
-						accumulatedUsage.CacheCreation.Ephemeral5mInputTokens,
-						accumulatedUsage.CacheCreation.Ephemeral1hInputTokens,
-						username,
-						time.Now(),
-						weeklyCycleHint,
-					)
-				}
-			}
+		if readErr == nil {
+			continue
+		}
+		parser.finish(handleLine)
+		if readErr != io.EOF {
+			s.logger.Warn("read streaming response: ", readErr)
+		}
+		if parser.overflow {
+			s.logger.Warn("CCM SSE event exceeded usage-tracking limit; stream was proxied without accounting")
 			return
 		}
+		if responseModel == "" {
+			responseModel = requestModel
+		}
+		if (accumulatedUsage.InputTokens > 0 || accumulatedUsage.OutputTokens > 0) && responseModel != "" {
+			totalInputTokens := accumulatedUsage.InputTokens + accumulatedUsage.CacheCreationInputTokens + accumulatedUsage.CacheReadInputTokens
+			contextWindow := detectContextWindow(anthropicBetaHeader, totalInputTokens)
+			if usageErr := s.usageTracker.AddUsageWithCycleHint(
+				responseModel,
+				contextWindow,
+				messagesCount,
+				accumulatedUsage.InputTokens,
+				accumulatedUsage.OutputTokens,
+				accumulatedUsage.CacheReadInputTokens,
+				accumulatedUsage.CacheCreationInputTokens,
+				accumulatedUsage.CacheCreation.Ephemeral5mInputTokens,
+				accumulatedUsage.CacheCreation.Ephemeral1hInputTokens,
+				username,
+				time.Now(),
+				weeklyCycleHint,
+			); usageErr != nil {
+				s.logger.Warn("record CCM usage: ", usageErr)
+			}
+		}
+		return
 	}
 }
 
 func (s *Service) Close() error {
+	s.refreshLifecycle.Lock()
+	s.refreshClosing = true
+	if s.refreshCancel != nil {
+		s.refreshCancel()
+	}
+	s.refreshLifecycle.Unlock()
 	err := common.Close(
 		common.PtrOrNil(s.httpServer),
 		common.PtrOrNil(s.listener),
 		s.tlsConfig,
 	)
 
+	s.refreshWG.Wait()
+	s.httpClient.CloseIdleConnections()
 	if s.usageTracker != nil {
-		s.usageTracker.cancelPendingSave()
-		saveErr := s.usageTracker.Save()
+		saveErr := s.usageTracker.closeAndSave()
 		if saveErr != nil {
 			s.logger.Error("save usage statistics: ", saveErr)
 		}

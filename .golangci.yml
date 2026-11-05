@@ -1,6 +1,6 @@
 version: "2"
 run:
-  go: "1.24"
+  go: "1.27"
   build-tags:
     - with_gvisor
     - with_quic
@@ -37,6 +37,62 @@ linters:
     presets:
       - comments
       - common-false-positives
+    rules:
+      # TransportCredentials.Info must report a protocol info struct; these
+      # fields are what gRPC reads off it, and there is no replacement that
+      # keeps custom per-connection credentials working.
+      - path: transport/v2raygrpc/tls_credentials.go
+        linters:
+          - staticcheck
+        text: SA1019
+      - path: experimental/boxdd/peer_linux.go
+        linters:
+          - staticcheck
+        text: SA1019
+      - path: experimental/boxdd/peer_windows.go
+        linters:
+          - staticcheck
+        text: SA1019
+      # modernize's AsType, CutLast, Fields, new() and embedded-literal
+      # rewrites assume helpers and stdlib APIs that the pinned sing and x/net
+      # revisions do not all provide yet; they are behaviour-neutral tidy-ups to
+      # take with the next dependency bump, not something to rush here.
+      - linters:
+          - modernize
+        text: (errorsastype|stringscut|stditerators|newexpr|embedlit)
+      # x/net deprecated http2/h2c in favour of the Protocols field, but the
+      # replacement is Go 1.24+ only and this tree still builds h2c handlers on
+      # paths that do not go through http.Server.
+      - path: protocol/hysteria2/realm.go
+        linters:
+          - staticcheck
+        text: SA1019
+      - path: protocol/naive/inbound.go
+        linters:
+          - staticcheck
+        text: SA1019
+      - path: service/api/server.go
+        linters:
+          - staticcheck
+        text: SA1019
+      - path: service/derp/service.go
+        linters:
+          - staticcheck
+        text: SA1019
+      - path: transport/v2raygrpclite/server.go
+        linters:
+          - staticcheck
+        text: SA1019
+      - path: transport/v2rayhttp/server.go
+        linters:
+          - staticcheck
+        text: SA1019
+      # copyPacketExact records a non-nil error before returning, so these
+      # nil comparisons are unreachable by construction, not by accident.
+      - path: route/conn.go
+        linters:
+          - staticcheck
+        text: SA4023
     paths:
       - transport/simple-obfs
       - \.pb\.go$

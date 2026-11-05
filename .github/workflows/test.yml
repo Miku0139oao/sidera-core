@@ -33,9 +33,7 @@ jobs:
           - windows-latest
           - macos-latest
         go:
-          - 1.24.7
-          - 1.25.7
-          - 1.26.5
+          - 1.27.3
     runs-on: ${{ matrix.os }}
     env:
       GOTOOLCHAIN: local
@@ -43,7 +41,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: ${{ matrix.go }}
           cache-dependency-path: |
@@ -89,9 +87,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
-          go-version: 1.26.5
+          go-version: 1.27.3
           cache-dependency-path: go.sum
       - name: Set build flags
         shell: bash
@@ -117,9 +115,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
-          go-version: 1.26.5
+          go-version: 1.27.3
           cache-dependency-path: go.sum
       - name: Set build flags
         shell: bash
@@ -127,7 +125,12 @@ jobs:
           echo "BUILD_TAGS=$(cat release/DEFAULT_BUILD_TAGS_OTHERS),with_3xui_import" >> "$GITHUB_ENV"
           echo "LDFLAGS_SHARED=$(cat release/LDFLAGS)" >> "$GITHUB_ENV"
       - name: Test race-sensitive packages
-        run: go test -count=1 -race -tags "$BUILD_TAGS" -ldflags "$LDFLAGS_SHARED" ./adapter/service ./service/api ./cmd/sidera .
+        run: |
+          set -o pipefail
+          go test -count=1 -race -tags "$BUILD_TAGS" -ldflags "$LDFLAGS_SHARED" \
+            ./adapter/service ./service/api ./cmd/sidera . \
+            ./dns/... ./protocol/group/... ./common/interrupt/... ./common/listener/... \
+            ./common/process/... ./common/httpclient/... ./route/... ./common/srs/... | tee race.txt
 
   fuzz:
     name: Fuzz smoke tests
@@ -138,9 +141,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
-          go-version: 1.26.5
+          go-version: 1.27.3
           cache-dependency-path: go.sum
       - name: Fuzz QUIC sniffer
         run: go test ./common/sniff -run '^$' -fuzz '^FuzzSniffQUIC$' -fuzztime=20s
@@ -154,9 +157,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
-          go-version: 1.26.5
+          go-version: 1.27.3
           cache-dependency-path: go.sum
       - name: Run repeatable dashboard benchmarks
         shell: bash
@@ -166,10 +169,72 @@ jobs:
             -bench '^BenchmarkAdmin(AccountViews|MembershipPolicyUsage)$' \
             -benchmem -benchtime=1s -count=5 | tee benchmark.txt
       - name: Upload benchmark result
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: dashboard-benchmark
           path: benchmark.txt
+
+  benchmark-report:
+    name: Benchmark report
+    runs-on: ubuntu-latest
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
+      - name: Setup Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: 1.27.3
+          cache-dependency-path: go.sum
+      - name: Set build flags
+        shell: bash
+        run: |
+          echo "BUILD_TAGS=$(cat release/DEFAULT_BUILD_TAGS_OTHERS)" >> "$GITHUB_ENV"
+          echo "LDFLAGS_SHARED=$(cat release/LDFLAGS)" >> "$GITHUB_ENV"
+      - name: Run benchmarks
+        shell: bash
+        run: |
+          set -o pipefail
+          go test -run '^$' -bench . -benchmem -benchtime=1s -count=5 \
+            -tags "$BUILD_TAGS" -ldflags "$LDFLAGS_SHARED" \
+            ./common/sniff ./common/tls ./protocol/vless/xrayencryption | tee bench-core.txt
+      - name: Summarize
+        shell: bash
+        run: |
+          {
+            printf '# Benchmark report\n\n'
+            printf -- '- commit: `%s`\n' "$(git rev-parse HEAD)"
+            printf -- '- runner: %s / %s\n' "$(go env GOOS)" "$(go env GOARCH)"
+            printf -- '- go: %s\n' "$(go version | awk '{print $3}')"
+            printf -- '- tags: %s\n' "$BUILD_TAGS"
+            printf -- '- ldflags: %s\n\n' "$LDFLAGS_SHARED"
+            printf 'Median ns/op and B/op across the 5 rounds.\n\n'
+            printf '| benchmark | median ns/op | median B/op | median allocs/op |\n'
+            printf '| --- | ---: | ---: | ---: |\n'
+            awk '
+              /^Benchmark/ {
+                name=$1; sub(/-[0-9]+$/, "", name)
+                for (i=1; i<=NF; i++) {
+                  if ($i ~ /ns\/op/) ns[name]=$(i-1)
+                  if ($i ~ /B\/op/)  bp[name]=$(i-1)
+                  if ($i ~ /allocs\/op/) al[name]=$(i-1)
+                }
+                seen[name]=1
+              }
+              END {
+                for (n in seen) printf "| `%s` | %s | %s | %s |\n", n, ns[n], bp[n], al[n]
+              }
+            ' bench-core.txt | sort
+          } > benchmark-report.md
+          cat benchmark-report.md
+      - name: Upload benchmark report
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: benchmark-report
+          path: |
+            bench-core.txt
+            benchmark-report.md
 
   windows-integration:
     name: Windows privileged integration
@@ -180,9 +245,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
-          go-version: 1.26.5
+          go-version: 1.27.3
           cache-dependency-path: go.sum
       - name: Set build flags
         shell: bash

@@ -245,6 +245,12 @@ func QUICClientHello(ctx context.Context, metadata *adapter.InboundContext, pack
 			if err != nil {
 				return err
 			}
+			if length == 0 {
+				continue
+			}
+			if length > uint64(decryptedReader.Len()) || offset > ^uint64(0)-length {
+				return os.ErrInvalid
+			}
 			index := len(decrypted) - decryptedReader.Len()
 			fragments = append(fragments, qCryptoFragment{offset, length, decrypted[index : index+int(length)]})
 			_, err = decryptedReader.Seek(int64(length), io.SeekCurrent)
@@ -277,29 +283,17 @@ func QUICClientHello(ctx context.Context, metadata *adapter.InboundContext, pack
 		fragments = append(fragments, metadata.SniffContext.([]qCryptoFragment)...)
 		metadata.SniffContext = nil
 	}
-	var frameLen uint64
-	for _, fragment := range fragments {
-		frameLen += fragment.length
+	fragments, contiguous, err := normalizeQUICCryptoFragments(fragments)
+	if err != nil {
+		return err
 	}
-	buffer := buf.NewSize(5 + int(frameLen))
+	frameLen := len(contiguous)
+	buffer := buf.NewSize(5 + frameLen)
 	defer buffer.Release()
 	buffer.WriteByte(0x16)
 	binary.Write(buffer, binary.BigEndian, uint16(0x0303))
 	binary.Write(buffer, binary.BigEndian, uint16(frameLen))
-	var index uint64
-	var length int
-find:
-	for {
-		for _, fragment := range fragments {
-			if fragment.offset == index {
-				buffer.Write(fragment.payload)
-				index = fragment.offset + fragment.length
-				length++
-				continue find
-			}
-		}
-		break
-	}
+	buffer.Write(contiguous)
 	metadata.Protocol = C.ProtocolQUIC
 	fingerprint, err := ja3.Compute(buffer.Bytes())
 	if err != nil {
@@ -366,8 +360,56 @@ func count(slices []uint8, value uint8) int {
 	return times
 }
 
+const maxQUICCryptoData = 1<<16 - 1
+
 type qCryptoFragment struct {
 	offset  uint64
 	length  uint64
 	payload []byte
+}
+
+func normalizeQUICCryptoFragments(fragments []qCryptoFragment) ([]qCryptoFragment, []byte, error) {
+	var maxEnd uint64
+	for _, fragment := range fragments {
+		if fragment.length != uint64(len(fragment.payload)) || fragment.offset > maxQUICCryptoData || fragment.length > maxQUICCryptoData-fragment.offset {
+			return nil, nil, os.ErrInvalid
+		}
+		maxEnd = max(maxEnd, fragment.offset+fragment.length)
+	}
+	data := make([]byte, int(maxEnd))
+	present := make([]bool, int(maxEnd))
+	for _, fragment := range fragments {
+		for index, value := range fragment.payload {
+			position := int(fragment.offset) + index
+			if present[position] {
+				if data[position] != value {
+					return nil, nil, os.ErrInvalid
+				}
+				continue
+			}
+			data[position] = value
+			present[position] = true
+		}
+	}
+	contiguousLength := 0
+	for contiguousLength < len(present) && present[contiguousLength] {
+		contiguousLength++
+	}
+	var normalized []qCryptoFragment
+	for start := 0; start < len(present); {
+		for start < len(present) && !present[start] {
+			start++
+		}
+		if start == len(present) {
+			break
+		}
+		end := start + 1
+		for end < len(present) && present[end] {
+			end++
+		}
+		payload := append([]byte(nil), data[start:end]...)
+		normalized = append(normalized, qCryptoFragment{offset: uint64(start), length: uint64(len(payload)), payload: payload})
+		start = end
+	}
+	return normalized, data[:contiguousLength], nil
 }

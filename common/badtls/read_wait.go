@@ -8,7 +8,10 @@ import (
 	"github.com/sagernet/sing/common/tls"
 )
 
-var _ N.ReadWaiter = (*ReadWaitConn)(nil)
+var (
+	_ N.ReadWaiter  = (*ReadWaitConn)(nil)
+	_ N.WriteCloser = (*ReadWaitConn)(nil)
+)
 
 type ReadWaitConn struct {
 	tls.Conn
@@ -62,7 +65,7 @@ func (c *ReadWaitConn) WaitReadBuffer() (buffer *buf.Buffer, err error) {
 	}
 	buffer.Truncate(n)
 
-	if n != 0 && c.rawConn.Input.Len() == 0 && c.rawConn.Input.Len() > 0 &&
+	if n != 0 && c.rawConn.Input.Len() == 0 && c.rawConn.RawInput.Len() > 0 &&
 		// recordType(c.RawInput.Bytes()[0]) == recordTypeAlert {
 		c.rawConn.RawInput.Bytes()[0] == 21 {
 		_ = c.rawConn.ReadRecord()
@@ -71,6 +74,10 @@ func (c *ReadWaitConn) WaitReadBuffer() (buffer *buf.Buffer, err error) {
 
 	c.readWaitOptions.PostReturn(buffer)
 	return
+}
+
+func (c *ReadWaitConn) CloseWrite() error {
+	return N.CloseWrite(c.Conn)
 }
 
 func (c *ReadWaitConn) Upstream() any {

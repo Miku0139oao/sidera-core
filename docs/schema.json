@@ -4157,6 +4157,18 @@
               "type": "string",
               "x-tag-reference": "inbound"
             },
+            "proxy_protocol": {
+              "type": "boolean"
+            },
+            "proxy_protocol_accept_no_header": {
+              "type": "boolean"
+            },
+            "proxy_protocol_trusted_upstream": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
             "system": {
               "type": "boolean"
             },
@@ -5758,6 +5770,18 @@
               "type": "string",
               "x-tag-reference": "inbound"
             },
+            "proxy_protocol": {
+              "type": "boolean"
+            },
+            "proxy_protocol_accept_no_header": {
+              "type": "boolean"
+            },
+            "proxy_protocol_trusted_upstream": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
             "tls": {
               "$ref": "#/$defs/InboundTLSOptions"
             },
@@ -5910,6 +5934,18 @@
               "type": "string",
               "x-tag-reference": "inbound"
             },
+            "proxy_protocol": {
+              "type": "boolean"
+            },
+            "proxy_protocol_accept_no_header": {
+              "type": "boolean"
+            },
+            "proxy_protocol_trusted_upstream": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
             "network": {
               "anyOf": [
                 {
@@ -6009,6 +6045,18 @@
               "type": "string",
               "x-tag-reference": "inbound"
             },
+            "proxy_protocol": {
+              "type": "boolean"
+            },
+            "proxy_protocol_accept_no_header": {
+              "type": "boolean"
+            },
+            "proxy_protocol_trusted_upstream": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
             "users": {
               "type": "array",
               "items": {
@@ -6093,6 +6141,18 @@
             "detour": {
               "type": "string",
               "x-tag-reference": "inbound"
+            },
+            "proxy_protocol": {
+              "type": "boolean"
+            },
+            "proxy_protocol_accept_no_header": {
+              "type": "boolean"
+            },
+            "proxy_protocol_trusted_upstream": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
             },
             "up": {
               "anyOf": [
@@ -6240,6 +6300,18 @@
             "detour": {
               "type": "string",
               "x-tag-reference": "inbound"
+            },
+            "proxy_protocol": {
+              "type": "boolean"
+            },
+            "proxy_protocol_accept_no_header": {
+              "type": "boolean"
+            },
+            "proxy_protocol_trusted_upstream": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
             },
             "up_mbps": {
               "type": "integer"
@@ -6485,6 +6557,18 @@
               "type": "string",
               "x-tag-reference": "inbound"
             },
+            "proxy_protocol": {
+              "type": "boolean"
+            },
+            "proxy_protocol_accept_no_header": {
+              "type": "boolean"
+            },
+            "proxy_protocol_trusted_upstream": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
             "users": {
               "type": "array",
               "items": {
@@ -6569,6 +6653,18 @@
             "detour": {
               "type": "string",
               "x-tag-reference": "inbound"
+            },
+            "proxy_protocol": {
+              "type": "boolean"
+            },
+            "proxy_protocol_accept_no_header": {
+              "type": "boolean"
+            },
+            "proxy_protocol_trusted_upstream": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
             },
             "users": {
               "type": "array",
@@ -6680,6 +6776,18 @@
             "detour": {
               "type": "string",
               "x-tag-reference": "inbound"
+            },
+            "proxy_protocol": {
+              "type": "boolean"
+            },
+            "proxy_protocol_accept_no_header": {
+              "type": "boolean"
+            },
+            "proxy_protocol_trusted_upstream": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
             }
           },
           "required": [
@@ -6750,6 +6858,18 @@
             "detour": {
               "type": "string",
               "x-tag-reference": "inbound"
+            },
+            "proxy_protocol": {
+              "type": "boolean"
+            },
+            "proxy_protocol_accept_no_header": {
+              "type": "boolean"
+            },
+            "proxy_protocol_trusted_upstream": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
             },
             "network": {
               "anyOf": [
@@ -6877,6 +6997,18 @@
               "type": "string",
               "x-tag-reference": "inbound"
             },
+            "proxy_protocol": {
+              "type": "boolean"
+            },
+            "proxy_protocol_accept_no_header": {
+              "type": "boolean"
+            },
+            "proxy_protocol_trusted_upstream": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
             "version": {
               "type": "integer",
               "enum": [
@@ -6990,6 +7122,18 @@
                   "type": "string",
                   "x-tag-reference": "inbound"
                 },
+                "proxy_protocol": {
+                  "type": "boolean"
+                },
+                "proxy_protocol_accept_no_header": {
+                  "type": "boolean"
+                },
+                "proxy_protocol_trusted_upstream": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
                 "psk": {
                   "type": "string"
                 },
@@ -7081,6 +7225,18 @@
                   "type": "string",
                   "x-tag-reference": "inbound"
                 },
+                "proxy_protocol": {
+                  "type": "boolean"
+                },
+                "proxy_protocol_accept_no_header": {
+                  "type": "boolean"
+                },
+                "proxy_protocol_trusted_upstream": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
                 "psk": {
                   "type": "string"
                 },
@@ -7171,6 +7327,18 @@
               "type": "string",
               "x-tag-reference": "inbound"
             },
+            "proxy_protocol": {
+              "type": "boolean"
+            },
+            "proxy_protocol_accept_no_header": {
+              "type": "boolean"
+            },
+            "proxy_protocol_trusted_upstream": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
             "users": {
               "type": "array",
               "items": {
@@ -7249,6 +7417,18 @@
             "detour": {
               "type": "string",
               "x-tag-reference": "inbound"
+            },
+            "proxy_protocol": {
+              "type": "boolean"
+            },
+            "proxy_protocol_accept_no_header": {
+              "type": "boolean"
+            },
+            "proxy_protocol_trusted_upstream": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
             },
             "network": {
               "anyOf": [
@@ -7364,6 +7544,18 @@
               "type": "string",
               "x-tag-reference": "inbound"
             },
+            "proxy_protocol": {
+              "type": "boolean"
+            },
+            "proxy_protocol_accept_no_header": {
+              "type": "boolean"
+            },
+            "proxy_protocol_trusted_upstream": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
             "users": {
               "type": "array",
               "items": {
@@ -7457,6 +7649,18 @@
             "detour": {
               "type": "string",
               "x-tag-reference": "inbound"
+            },
+            "proxy_protocol": {
+              "type": "boolean"
+            },
+            "proxy_protocol_accept_no_header": {
+              "type": "boolean"
+            },
+            "proxy_protocol_trusted_upstream": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
             },
             "users": {
               "type": "array",
@@ -7975,11 +8179,26 @@
               "type": "string",
               "x-tag-reference": "inbound"
             },
+            "proxy_protocol": {
+              "type": "boolean"
+            },
+            "proxy_protocol_accept_no_header": {
+              "type": "boolean"
+            },
+            "proxy_protocol_trusted_upstream": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
             "users": {
               "type": "array",
               "items": {
                 "$ref": "#/$defs/VLESSUser"
               }
+            },
+            "decryption": {
+              "type": "string"
             },
             "tls": {
               "$ref": "#/$defs/InboundTLSOptions"
@@ -8059,6 +8278,18 @@
             "detour": {
               "type": "string",
               "x-tag-reference": "inbound"
+            },
+            "proxy_protocol": {
+              "type": "boolean"
+            },
+            "proxy_protocol_accept_no_header": {
+              "type": "boolean"
+            },
+            "proxy_protocol_trusted_upstream": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
             },
             "users": {
               "type": "array",
@@ -8260,6 +8491,12 @@
               }
             }
           ]
+        },
+        "min_client_version": {
+          "type": "string"
+        },
+        "max_client_version": {
+          "type": "string"
         },
         "max_time_difference": {
           "$ref": "#/$defs/Duration"
@@ -8469,6 +8706,9 @@
           "type": "boolean"
         },
         "kernel_rx": {
+          "type": "boolean"
+        },
+        "disable_session_tickets": {
           "type": "boolean"
         },
         "handshake_timeout": {
@@ -13575,6 +13815,9 @@
             "flow": {
               "type": "string"
             },
+            "encryption": {
+              "type": "string"
+            },
             "network": {
               "anyOf": [
                 {
@@ -14934,112 +15177,6 @@
           "type": "object",
           "properties": {
             "action": {
-              "const": "direct"
-            },
-            "bind_interface": {
-              "type": "string"
-            },
-            "inet4_bind_address": {
-              "type": "string"
-            },
-            "inet6_bind_address": {
-              "type": "string"
-            },
-            "bind_address_no_port": {
-              "type": "boolean"
-            },
-            "protect_path": {
-              "type": "string"
-            },
-            "routing_mark": {
-              "anyOf": [
-                {
-                  "type": "integer",
-                  "minimum": 0,
-                  "maximum": 4294967295
-                },
-                {
-                  "type": "string"
-                }
-              ]
-            },
-            "reuse_addr": {
-              "type": "boolean"
-            },
-            "netns": {
-              "type": "string",
-              "x-tag-reference": "network_namespace"
-            },
-            "connect_timeout": {
-              "$ref": "#/$defs/Duration"
-            },
-            "tcp_fast_open": {
-              "type": "boolean"
-            },
-            "tcp_multi_path": {
-              "type": "boolean"
-            },
-            "disable_tcp_keep_alive": {
-              "type": "boolean"
-            },
-            "tcp_keep_alive": {
-              "$ref": "#/$defs/Duration"
-            },
-            "tcp_keep_alive_interval": {
-              "$ref": "#/$defs/Duration"
-            },
-            "udp_fragment": {
-              "type": "boolean"
-            },
-            "domain_resolver": {
-              "$ref": "#/$defs/DomainResolver"
-            },
-            "network_strategy": {
-              "type": "string",
-              "enum": [
-                "default",
-                "fallback",
-                "hybrid"
-              ]
-            },
-            "network_type": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/InterfaceType"
-                },
-                {
-                  "type": "array",
-                  "items": {
-                    "$ref": "#/$defs/InterfaceType"
-                  }
-                }
-              ]
-            },
-            "fallback_network_type": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/InterfaceType"
-                },
-                {
-                  "type": "array",
-                  "items": {
-                    "$ref": "#/$defs/InterfaceType"
-                  }
-                }
-              ]
-            },
-            "fallback_delay": {
-              "$ref": "#/$defs/Duration"
-            }
-          },
-          "required": [
-            "action"
-          ]
-        },
-        {
-          "type": "object",
-          "properties": {
-            "action": {
               "const": "bypass"
             },
             "outbound": {
@@ -15425,6 +15562,18 @@
               "type": "string",
               "x-tag-reference": "inbound"
             },
+            "proxy_protocol": {
+              "type": "boolean"
+            },
+            "proxy_protocol_accept_no_header": {
+              "type": "boolean"
+            },
+            "proxy_protocol_trusted_upstream": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
             "secret": {
               "type": "string"
             },
@@ -15470,6 +15619,12 @@
                       "type": "string"
                     },
                     "download_url": {
+                      "type": "string"
+                    },
+                    "data_path": {
+                      "type": "string"
+                    },
+                    "public_base_url": {
                       "type": "string"
                     },
                     "http_client": {
@@ -15555,6 +15710,18 @@
             "detour": {
               "type": "string",
               "x-tag-reference": "outbound"
+            },
+            "proxy_protocol": {
+              "type": "boolean"
+            },
+            "proxy_protocol_accept_no_header": {
+              "type": "boolean"
+            },
+            "proxy_protocol_trusted_upstream": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
             },
             "tls": {
               "$ref": "#/$defs/InboundTLSOptions"
@@ -15643,6 +15810,18 @@
             "detour": {
               "type": "string",
               "x-tag-reference": "inbound"
+            },
+            "proxy_protocol": {
+              "type": "boolean"
+            },
+            "proxy_protocol_accept_no_header": {
+              "type": "boolean"
+            },
+            "proxy_protocol_trusted_upstream": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
             },
             "tls": {
               "$ref": "#/$defs/InboundTLSOptions"
@@ -16119,6 +16298,18 @@
                     "detour": {
                       "type": "string",
                       "x-tag-reference": "inbound"
+                    },
+                    "proxy_protocol": {
+                      "type": "boolean"
+                    },
+                    "proxy_protocol_accept_no_header": {
+                      "type": "boolean"
+                    },
+                    "proxy_protocol_trusted_upstream": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
                     }
                   },
                   "additionalProperties": false
@@ -16194,6 +16385,18 @@
             "detour": {
               "type": "string",
               "x-tag-reference": "inbound"
+            },
+            "proxy_protocol": {
+              "type": "boolean"
+            },
+            "proxy_protocol_accept_no_header": {
+              "type": "boolean"
+            },
+            "proxy_protocol_trusted_upstream": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
             },
             "tls": {
               "$ref": "#/$defs/InboundTLSOptions"
@@ -16304,6 +16507,18 @@
             "detour": {
               "type": "string",
               "x-tag-reference": "outbound"
+            },
+            "proxy_protocol": {
+              "type": "boolean"
+            },
+            "proxy_protocol_accept_no_header": {
+              "type": "boolean"
+            },
+            "proxy_protocol_trusted_upstream": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
             },
             "tls": {
               "$ref": "#/$defs/InboundTLSOptions"
@@ -16435,6 +16650,18 @@
             "detour": {
               "type": "string",
               "x-tag-reference": "inbound"
+            },
+            "proxy_protocol": {
+              "type": "boolean"
+            },
+            "proxy_protocol_accept_no_header": {
+              "type": "boolean"
+            },
+            "proxy_protocol_trusted_upstream": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
             }
           },
           "required": [
@@ -16505,6 +16732,18 @@
             "detour": {
               "type": "string",
               "x-tag-reference": "inbound"
+            },
+            "proxy_protocol": {
+              "type": "boolean"
+            },
+            "proxy_protocol_accept_no_header": {
+              "type": "boolean"
+            },
+            "proxy_protocol_trusted_upstream": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
             },
             "servers": {
               "type": "object",
@@ -16725,6 +16964,18 @@
                   "type": "string",
                   "x-tag-reference": "inbound"
                 },
+                "proxy_protocol": {
+                  "type": "boolean"
+                },
+                "proxy_protocol_accept_no_header": {
+                  "type": "boolean"
+                },
+                "proxy_protocol_trusted_upstream": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
                 "devices": {
                   "type": "array",
                   "items": {
@@ -16803,6 +17054,18 @@
                 "detour": {
                   "type": "string",
                   "x-tag-reference": "inbound"
+                },
+                "proxy_protocol": {
+                  "type": "boolean"
+                },
+                "proxy_protocol_accept_no_header": {
+                  "type": "boolean"
+                },
+                "proxy_protocol_trusted_upstream": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
                 }
               },
               "required": [
@@ -17075,6 +17338,24 @@
         },
         "stats": {
           "$ref": "#/$defs/V2RayStatsServiceOptions"
+        },
+        "metrics": {
+          "$ref": "#/$defs/V2RayMetricsOptions"
+        },
+        "xray_services": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "V2RayMetricsOptions": {
+      "type": "object",
+      "properties": {
+        "listen": {
+          "type": "string"
         }
       },
       "additionalProperties": false
@@ -17098,6 +17379,12 @@
           }
         },
         "users": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "users_online": {
           "type": "array",
           "items": {
             "type": "string"

@@ -1,6 +1,7 @@
 package adapter
 
 import (
+	"errors"
 	"reflect"
 	"strings"
 	"time"
@@ -9,6 +10,8 @@ import (
 	E "github.com/sagernet/sing/common/exceptions"
 	F "github.com/sagernet/sing/common/format"
 )
+
+var ErrLifecycleBusy = errors.New("lifecycle callback in progress")
 
 type SimpleLifecycle interface {
 	Start() error
@@ -97,6 +100,16 @@ func StartNamed(logger log.ContextLogger, stage StartStage, services []Lifecycle
 		}
 	}
 	return nil
+}
+
+// CloseWithPanic captures a child panic so an owner can continue closing the
+// remaining children before propagating the first panic.
+func CloseWithPanic(closeFunc func() error) (panicValue any, err error) {
+	defer func() {
+		panicValue = recover()
+	}()
+	err = closeFunc()
+	return nil, err
 }
 
 func LogElapsed(logger log.ContextLogger, description ...any) func() {

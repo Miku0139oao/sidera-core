@@ -42,6 +42,10 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  release_gate:
+    name: Release gate
+    uses: ./.github/workflows/release-gate.yml
+
   calculate_version:
     name: Calculate version
     runs-on: ubuntu-latest
@@ -53,27 +57,31 @@ jobs:
         with:
           fetch-depth: 0
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
-          go-version: 1.26.5
+          go-version: 1.27.3
           cache: false
       - name: Cache Go modules
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ~/go/pkg/mod
           key: go-mod-linux-${{ hashFiles('go.sum') }}
           restore-keys: go-mod-linux-
       - name: Cache Go tool builds
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ~/.cache/go-build
           key: go-build-tools-linux-${{ hashFiles('go.sum') }}
           restore-keys: go-build-tools-linux-
       - name: Check input version
         if: github.event_name == 'workflow_dispatch'
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         run: |-
-          echo "version=${{ inputs.version }}"
-          echo "version=${{ inputs.version }}" >> "$GITHUB_ENV"
+          set -euo pipefail
+          [[ "$INPUT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]
+          echo "version=$INPUT_VERSION"
+          echo "version=$INPUT_VERSION" >> "$GITHUB_ENV"
       - name: Calculate version
         if: github.event_name != 'workflow_dispatch'
         run: |-
@@ -82,6 +90,33 @@ jobs:
         id: outputs
         run: |-
           echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  publish_provenance:
+    name: Verify immutable store publication source
+    if: github.event_name == 'workflow_dispatch' && (inputs.build == 'publish-android' || inputs.build == 'All' || inputs.build == 'Apple' || inputs.build == 'iOS' || inputs.build == 'macOS' || inputs.build == 'tvOS')
+    runs-on: ubuntu-latest
+    needs:
+      - release_gate
+      - calculate_version
+    steps:
+      - name: Checkout immutable workflow commit
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify release tag provenance
+        env:
+          RELEASE_VERSION: ${{ needs.calculate_version.outputs.version }}
+        run: |-
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          tag="v${RELEASE_VERSION}"
+          git ls-remote --exit-code --refs origin "refs/tags/${tag}" >/dev/null
+          git fetch --force --depth=1 origin "refs/tags/${tag}"
+          test "$(git rev-parse 'FETCH_HEAD^{commit}')" = "$GITHUB_SHA"
+
   build:
     name: Build binary
     if: github.event_name != 'workflow_dispatch' || inputs.build == 'All' || inputs.build == 'Binary'
@@ -130,10 +165,6 @@ jobs:
           - { os: linux, arch: riscv64 }
           - { os: linux, arch: loong64 }
 
-          - { os: windows, arch: amd64 }
-          - { os: windows, arch: "386" }
-          - { os: windows, arch: arm64 }
-
           - { os: android, arch: arm64, ndk: "aarch64-linux-android23" }
           - { os: android, arch: arm, ndk: "armv7a-linux-androideabi23" }
           - { os: android, arch: amd64, ndk: "x86_64-linux-android23" }
@@ -144,19 +175,19 @@ jobs:
         with:
           fetch-depth: 1
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
-          go-version: 1.26.5
+          go-version: 1.27.3
           cache: false
       - name: Cache Go modules
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ~/go/pkg/mod
           key: go-mod-linux-${{ hashFiles('go.sum') }}
           restore-keys: go-mod-linux-
       - name: Setup Android NDK
         if: matrix.os == 'android'
-        uses: nttld/setup-ndk@v1
+        uses: nttld/setup-ndk@ed92fe6cadad69be94a966a7ee3271275e62f779 # v1
         with:
           ndk-version: r28
       - name: Clone cronet-go
@@ -307,6 +338,12 @@ jobs:
           BUILD_GOOS: ${{ matrix.os }}
           BUILD_GOARCH: ${{ matrix.arch }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Verify binary provenance
+        run: |-
+          set -euo pipefail
+          go version -m dist/sidera | tee dist/sidera.buildinfo
+          grep -F $'build\tvcs.revision='"$GITHUB_SHA" dist/sidera.buildinfo
+          grep -F $'build\tvcs.modified=false' dist/sidera.buildinfo
       - name: Set name
         run: |-
           DIR_NAME="sidera-${{ needs.calculate_version.outputs.version }}-${{ matrix.os }}-${{ matrix.arch }}"
@@ -316,8 +353,6 @@ jobs:
             DIR_NAME="${DIR_NAME}-${{ matrix.go386 }}"
           elif [[ -n "${{ matrix.gomips }}" && "${{ matrix.gomips }}" != 'hardfloat' ]]; then
             DIR_NAME="${DIR_NAME}-${{ matrix.gomips }}"
-          elif [[ -n "${{ matrix.legacy_name }}" ]]; then
-            DIR_NAME="${DIR_NAME}-legacy-${{ matrix.legacy_name }}"
           fi
           if [[ "${{ matrix.variant }}" == "glibc" ]]; then
             DIR_NAME="${DIR_NAME}-glibc"
@@ -332,14 +367,19 @@ jobs:
         if: matrix.debian != ''
         run: |
           set -xeuo pipefail
-          sudo gem install fpm
+          sudo gem install --no-document fpm -v 1.16.0
+          echo '%_rpmformat 4' > "$HOME/.rpmmacros"
           sudo apt-get install -y debsigs
           cp .fpm_systemd .fpm
           fpm -t deb \
             -v "$PKG_VERSION" \
             -p "dist/sidera_${{ needs.calculate_version.outputs.version }}_${{ matrix.os }}_${{ matrix.debian }}.deb" \
             --architecture ${{ matrix.debian }} \
-            dist/sidera=/usr/bin/sidera
+            dist/sidera=/usr/bin/sidera \
+            dist/sidera.buildinfo=/usr/share/doc/sidera/sidera.buildinfo \
+            NOTICE.md=/usr/share/doc/sidera/NOTICE.md \
+            UPSTREAM.md=/usr/share/doc/sidera/UPSTREAM.md \
+            release/licenses/=/usr/share/licenses/sidera/third-party/
           rm -rf $HOME/.gnupg
           gpg --pinentry-mode loopback --passphrase "${{ secrets.GPG_PASSPHRASE }}" --import <<EOF
           ${{ secrets.GPG_KEY }}
@@ -349,13 +389,18 @@ jobs:
         if: matrix.rpm != ''
         run: |-
           set -xeuo pipefail
-          sudo gem install fpm
+          sudo gem install --no-document fpm -v 1.16.0
+          echo '%_rpmformat 4' > "$HOME/.rpmmacros"
           cp .fpm_systemd .fpm
           fpm -t rpm \
             -v "$PKG_VERSION" \
             -p "dist/sidera_${{ needs.calculate_version.outputs.version }}_${{ matrix.os }}_${{ matrix.rpm }}.rpm" \
             --architecture ${{ matrix.rpm }} \
-            dist/sidera=/usr/bin/sidera
+            dist/sidera=/usr/bin/sidera \
+            dist/sidera.buildinfo=/usr/share/doc/sidera/sidera.buildinfo \
+            NOTICE.md=/usr/share/doc/sidera/NOTICE.md \
+            UPSTREAM.md=/usr/share/doc/sidera/UPSTREAM.md \
+            release/licenses/=/usr/share/licenses/sidera/third-party/
           cat > $HOME/.rpmmacros <<EOF
           %_gpg_name ${{ secrets.GPG_KEY_ID }}
           %_gpg_sign_cmd_extra_args --pinentry-mode loopback --passphrase ${{ secrets.GPG_PASSPHRASE }}
@@ -368,7 +413,8 @@ jobs:
         if: matrix.pacman != ''
         run: |-
           set -xeuo pipefail
-          sudo gem install fpm
+          sudo gem install --no-document fpm -v 1.16.0
+          echo '%_rpmformat 4' > "$HOME/.rpmmacros"
           sudo apt-get update || true
           sudo apt-get install -y libarchive-tools
           cp .fpm_pacman .fpm
@@ -376,18 +422,27 @@ jobs:
             -v "$PKG_VERSION" \
             -p "dist/sidera_${{ needs.calculate_version.outputs.version }}_${{ matrix.os }}_${{ matrix.pacman }}.pkg.tar.zst" \
             --architecture ${{ matrix.pacman }} \
-            dist/sidera=/usr/bin/sidera
+            dist/sidera=/usr/bin/sidera \
+            dist/sidera.buildinfo=/usr/share/doc/sidera/sidera.buildinfo \
+            NOTICE.md=/usr/share/doc/sidera/NOTICE.md \
+            UPSTREAM.md=/usr/share/doc/sidera/UPSTREAM.md \
+            release/licenses/=/usr/share/licenses/sidera/third-party/
       - name: Package OpenWrt
         if: matrix.openwrt != ''
         run: |-
           set -xeuo pipefail
-          sudo gem install fpm
+          sudo gem install --no-document fpm -v 1.16.0
+          echo '%_rpmformat 4' > "$HOME/.rpmmacros"
           cp .fpm_openwrt .fpm
           fpm -t deb \
             -v "$PKG_VERSION" \
             -p "dist/openwrt.deb" \
             --architecture all \
-            dist/sidera=/usr/bin/sidera
+            dist/sidera=/usr/bin/sidera \
+            dist/sidera.buildinfo=/usr/share/doc/sidera/sidera.buildinfo \
+            NOTICE.md=/usr/share/doc/sidera/NOTICE.md \
+            UPSTREAM.md=/usr/share/doc/sidera/UPSTREAM.md \
+            release/licenses/=/usr/share/licenses/sidera/third-party/
           for architecture in ${{ matrix.openwrt }}; do
             .github/deb2ipk.sh "$architecture" "dist/openwrt.deb" "dist/sidera_${{ needs.calculate_version.outputs.version }}_openwrt_${architecture}.ipk"
           done
@@ -421,7 +476,8 @@ jobs:
           set -xeuo pipefail
           cd dist
           mkdir -p "${DIR_NAME}"
-          cp ../LICENSE "${DIR_NAME}"
+          cp ../LICENSE ../NOTICE.md ../UPSTREAM.md sidera.buildinfo "${DIR_NAME}"
+          cp -R ../release/licenses "${DIR_NAME}/licenses"
           if [ '${{ matrix.os }}' = 'windows' ]; then
             cp sidera "${DIR_NAME}/sidera.exe"
             zip -r "${DIR_NAME}.zip" "${DIR_NAME}"
@@ -434,11 +490,11 @@ jobs:
           fi
           rm -r "${DIR_NAME}"
       - name: Cleanup
-        run: rm -f dist/sidera dist/libcronet.so
+        run: rm -f dist/sidera dist/libcronet.so dist/sidera.buildinfo
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: binary-${{ matrix.os }}_${{ matrix.arch }}${{ matrix.goarm && format('v{0}', matrix.goarm) }}${{ matrix.go386 && format('_{0}', matrix.go386) }}${{ matrix.gomips && format('_{0}', matrix.gomips) }}${{ matrix.legacy_name && format('-legacy-{0}', matrix.legacy_name) }}${{ matrix.variant && format('-{0}', matrix.variant) }}
+          name: binary-${{ matrix.os }}_${{ matrix.arch }}${{ matrix.goarm && format('v{0}', matrix.goarm) }}${{ matrix.go386 && format('_{0}', matrix.go386) }}${{ matrix.gomips && format('_{0}', matrix.gomips) }}${{ matrix.variant && format('-{0}', matrix.variant) }}
           path: "dist"
   build_darwin:
     name: Build Darwin binaries
@@ -458,12 +514,12 @@ jobs:
         with:
           fetch-depth: 1
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
-          go-version: 1.26.5
+          go-version: 1.27.3
           cache: false
       - name: Cache Go modules
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ~/go/pkg/mod
           key: go-mod-macos-${{ hashFiles('go.sum') }}
@@ -491,28 +547,32 @@ jobs:
           GOOS: darwin
           GOARCH: ${{ matrix.arch }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Verify binary provenance
+        run: |-
+          set -euo pipefail
+          go version -m dist/sidera | tee dist/sidera.buildinfo
+          grep -F $'build\tvcs.revision='"$GITHUB_SHA" dist/sidera.buildinfo
+          grep -F $'build\tvcs.modified=false' dist/sidera.buildinfo
       - name: Set name
         run: |-
           DIR_NAME="sidera-${{ needs.calculate_version.outputs.version }}-darwin-${{ matrix.arch }}"
-          if [[ -n "${{ matrix.legacy_name }}" ]]; then
-            DIR_NAME="${DIR_NAME}-legacy-${{ matrix.legacy_name }}"
-          fi
           echo "DIR_NAME=${DIR_NAME}" >> "${GITHUB_ENV}"
       - name: Archive
         run: |
           set -xeuo pipefail
           cd dist
           mkdir -p "${DIR_NAME}"
-          cp ../LICENSE "${DIR_NAME}"
+          cp ../LICENSE ../NOTICE.md ../UPSTREAM.md sidera.buildinfo "${DIR_NAME}"
+          cp -R ../release/licenses "${DIR_NAME}/licenses"
           cp sidera "${DIR_NAME}"
           tar -czvf "${DIR_NAME}.tar.gz" "${DIR_NAME}"
           rm -r "${DIR_NAME}"
       - name: Cleanup
-        run: rm dist/sidera
+        run: rm dist/sidera dist/sidera.buildinfo
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: binary-darwin_${{ matrix.arch }}${{ matrix.legacy_name && format('-legacy-{0}', matrix.legacy_name) }}
+          name: binary-darwin_${{ matrix.arch }}
           path: "dist"
   build_windows:
     name: Build Windows binaries
@@ -532,12 +592,12 @@ jobs:
         with:
           fetch-depth: 1
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
-          go-version: 1.26.5
+          go-version: 1.27.3
           cache: false
       - name: Cache Go modules
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ~/go/pkg/mod
           key: go-mod-windows-${{ hashFiles('go.sum') }}
@@ -574,6 +634,16 @@ jobs:
           GOOS: windows
           GOARCH: ${{ matrix.arch }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Verify binary provenance
+        run: |
+          $BuildInfo = go version -m dist/sidera.exe
+          $BuildInfo | Set-Content -Encoding utf8NoBOM dist/sidera.buildinfo
+          if (-not ($BuildInfo -match "build\s+vcs.revision=$env:GITHUB_SHA")) {
+            throw "binary has the wrong or missing VCS revision"
+          }
+          if (-not ($BuildInfo -match "build\s+vcs.modified=false")) {
+            throw "binary was built from a dirty source identity"
+          }
       - name: Extract libcronet.dll
         if: matrix.naive
         run: |
@@ -592,7 +662,8 @@ jobs:
         run: |
           $DIR_NAME = "sidera-${{ needs.calculate_version.outputs.version }}-windows-${{ matrix.arch }}"
           mkdir "dist/$DIR_NAME"
-          Copy-Item LICENSE "dist/$DIR_NAME"
+          Copy-Item -Path LICENSE, NOTICE.md, UPSTREAM.md, "dist/sidera.buildinfo" -Destination "dist/$DIR_NAME"
+          Copy-Item -Recurse release/licenses "dist/$DIR_NAME/licenses"
           Copy-Item "dist/sidera.exe" "dist/$DIR_NAME"
           Copy-Item "dist/libcronet.dll" "dist/$DIR_NAME"
           Compress-Archive -Path "dist/$DIR_NAME" -DestinationPath "dist/$DIR_NAME.zip"
@@ -602,18 +673,19 @@ jobs:
         run: |
           $DIR_NAME = "sidera-${{ needs.calculate_version.outputs.version }}-windows-${{ matrix.arch }}"
           mkdir "dist/$DIR_NAME"
-          Copy-Item LICENSE "dist/$DIR_NAME"
+          Copy-Item -Path LICENSE, NOTICE.md, UPSTREAM.md, "dist/sidera.buildinfo" -Destination "dist/$DIR_NAME"
+          Copy-Item -Recurse release/licenses "dist/$DIR_NAME/licenses"
           Copy-Item "dist/sidera.exe" "dist/$DIR_NAME"
           Compress-Archive -Path "dist/$DIR_NAME" -DestinationPath "dist/$DIR_NAME.zip"
           Remove-Item -Recurse "dist/$DIR_NAME"
       - name: Cleanup
         if: matrix.naive
-        run: Remove-Item dist/sidera.exe, dist/libcronet.dll
+        run: Remove-Item dist/sidera.exe, dist/libcronet.dll, dist/sidera.buildinfo
       - name: Cleanup
         if: ${{ !matrix.naive }}
-        run: Remove-Item dist/sidera.exe
+        run: Remove-Item dist/sidera.exe, dist/sidera.buildinfo
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: binary-windows_${{ matrix.arch }}
           path: "dist"
@@ -637,19 +709,19 @@ jobs:
         with:
           fetch-depth: 1
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
-          go-version: 1.26.5
+          go-version: 1.27.3
           cache: false
       - name: Cache Go modules
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ~/go/pkg/mod
           key: go-mod-linux-${{ hashFiles('go.sum') }}
           restore-keys: go-mod-linux-
       - name: Setup Android NDK
         id: setup-ndk
-        uses: nttld/setup-ndk@v1
+        uses: nttld/setup-ndk@ed92fe6cadad69be94a966a7ee3271275e62f779 # v1
         with:
           ndk-version: r28
       - name: Setup OpenJDK
@@ -671,7 +743,7 @@ jobs:
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
       - name: Upload library
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: libbox-android-${{ matrix.go_arch }}
           path: dist
@@ -701,25 +773,25 @@ jobs:
       - name: Checkout Android client
         run: git submodule update --init clients/android
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
-          go-version: 1.26.5
+          go-version: 1.27.3
           cache: false
       - name: Cache Go modules
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ~/go/pkg/mod
           key: go-mod-linux-${{ hashFiles('go.sum') }}
           restore-keys: go-mod-linux-
       - name: Cache Go tool builds
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ~/.cache/go-build
           key: go-build-tools-linux-${{ hashFiles('go.sum') }}
           restore-keys: go-build-tools-linux-
       - name: Setup Android NDK
         id: setup-ndk
-        uses: nttld/setup-ndk@v1
+        uses: nttld/setup-ndk@ed92fe6cadad69be94a966a7ee3271275e62f779 # v1
         with:
           ndk-version: r28
       - name: Setup OpenJDK
@@ -732,7 +804,7 @@ jobs:
           git ls-remote --exit-code --tags origin v${{ needs.calculate_version.outputs.version }} || echo "PUBLISHED=false" >> "$GITHUB_ENV"
           git tag v${{ needs.calculate_version.outputs.version }} -f
       - name: Download libraries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: libbox-android-*
           path: libbox-inputs
@@ -790,7 +862,7 @@ jobs:
           EOF
           cat dist/SFA-version-metadata.json
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: binary-android-apks-${{ matrix.variant }}
           path: 'dist'
@@ -800,6 +872,7 @@ jobs:
     runs-on: ubuntu-latest
     needs:
       - calculate_version
+      - publish_provenance
       - build_android_library
     steps:
       - name: Checkout
@@ -809,25 +882,25 @@ jobs:
       - name: Checkout Android client
         run: git submodule update --init clients/android
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
-          go-version: 1.26.5
+          go-version: 1.27.3
           cache: false
       - name: Cache Go modules
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ~/go/pkg/mod
           key: go-mod-linux-${{ hashFiles('go.sum') }}
           restore-keys: go-mod-linux-
       - name: Cache Go tool builds
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ~/.cache/go-build
           key: go-build-tools-linux-${{ hashFiles('go.sum') }}
           restore-keys: go-build-tools-linux-
       - name: Setup Android NDK
         id: setup-ndk
-        uses: nttld/setup-ndk@v1
+        uses: nttld/setup-ndk@ed92fe6cadad69be94a966a7ee3271275e62f779 # v1
         with:
           ndk-version: r28
       - name: Setup OpenJDK
@@ -840,7 +913,7 @@ jobs:
           git ls-remote --exit-code --tags origin v${{ needs.calculate_version.outputs.version }} || echo "PUBLISHED=false" >> "$GITHUB_ENV"
           git tag v${{ needs.calculate_version.outputs.version }} -f
       - name: Download libraries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: libbox-android-*
           path: libbox-inputs
@@ -919,22 +992,22 @@ jobs:
       - name: Checkout desktop submodules
         run: git -C clients/desktop submodule update --init --recursive
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
-          go-version: 1.26.5
+          go-version: 1.27.3
           cache: false
       - name: Cache Go modules
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ~/go/pkg/mod
           key: go-mod-desktop-windows-${{ hashFiles('go.sum') }}
           restore-keys: go-mod-desktop-windows-
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@1.88.0
+        uses: dtolnay/rust-toolchain@2eae45db285e407f22119950686d47e1101e071b # 1.88.0
         with:
           targets: ${{ matrix.rust_target }}
       - name: Cache Windows sharing module
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/git
@@ -943,11 +1016,11 @@ jobs:
           key: windows-share-${{ matrix.rust_target }}-${{ hashFiles('clients/desktop/native/windows-share/Cargo.lock') }}
           restore-keys: windows-share-${{ matrix.rust_target }}-
       - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           package_json_file: clients/desktop/package.json
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version-file: clients/desktop/package.json
           cache: pnpm
@@ -999,7 +1072,7 @@ jobs:
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item $artifacts.FullName dist
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: binary-windows-client-${{ matrix.desktop_arch }}
           path: 'dist'
@@ -1028,22 +1101,22 @@ jobs:
       - name: Checkout desktop submodules
         run: git -C clients/desktop submodule update --init --recursive
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
-          go-version: 1.26.5
+          go-version: 1.27.3
           cache: false
       - name: Cache Go modules
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ~/go/pkg/mod
           key: go-mod-desktop-linux-${{ hashFiles('go.sum') }}
           restore-keys: go-mod-desktop-linux-
       - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           package_json_file: clients/desktop/package.json
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version-file: clients/desktop/package.json
           cache: pnpm
@@ -1150,7 +1223,7 @@ jobs:
           mkdir -p dist
           cp "${artifacts[@]}" dist
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: binary-linux-client-${{ matrix.desktop_arch }}
           path: 'dist'
@@ -1184,24 +1257,24 @@ jobs:
           fetch-depth: 1
       - name: Setup Go
         if: matrix.build
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
-          go-version: 1.26.5
+          go-version: 1.27.3
           cache: false
       - name: Cache Go modules
         if: matrix.build
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ~/go/pkg/mod
           key: go-mod-macos-${{ hashFiles('go.sum') }}
           restore-keys: go-mod-macos-
       - name: Cache Go build
         if: matrix.build
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ~/Library/Caches/go-build
-          key: libbox-go-build-${{ matrix.artifact }}-1.26.5-${{ hashFiles('go.sum') }}
-          restore-keys: libbox-go-build-${{ matrix.artifact }}-1.26.5-
+          key: libbox-go-build-${{ matrix.artifact }}-1.27.3-${{ hashFiles('go.sum') }}
+          restore-keys: libbox-go-build-${{ matrix.artifact }}-1.27.3-
       - name: Set tag
         if: matrix.build
         run: git tag v${{ needs.calculate_version.outputs.version }} -f
@@ -1215,7 +1288,7 @@ jobs:
           tar -cf dist/Libbox-${{ matrix.artifact }}.tar Libbox.xcframework
       - name: Upload library
         if: matrix.build
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: libbox-apple-${{ matrix.artifact }}
           path: dist
@@ -1262,20 +1335,20 @@ jobs:
         run: git submodule update --init --recursive clients/apple
       - name: Setup Go
         if: matrix.if
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
-          go-version: 1.26.5
+          go-version: 1.27.3
           cache: false
       - name: Cache Go modules
         if: matrix.if
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ~/go/pkg/mod
           key: go-mod-macos-${{ hashFiles('go.sum') }}
           restore-keys: go-mod-macos-
       - name: Cache Go tool builds
         if: matrix.if
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ~/Library/Caches/go-build
           key: go-build-tools-macos-${{ hashFiles('go.sum') }}
@@ -1298,14 +1371,14 @@ jobs:
           git checkout dev
       - name: Cache Swift packages
         if: matrix.if
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ${{ runner.temp }}/SourcePackages
           key: apple-spm-${{ hashFiles('clients/apple/sing-box.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved') }}
           restore-keys: apple-spm-
       - name: Cache Xcode build data
         if: matrix.if
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ${{ matrix.type == 'standalone' && 'clients/apple/build/SFM.System-*.dd' || matrix.type == 'jailbreak' && 'clients/apple/build/jailbreak/DerivedData' || format('{0}/DerivedData', runner.temp) }}
           key: apple-derived-data-${{ matrix.type }}-${{ matrix.platform }}-${{ matrix.variant || 'default' }}-${{ hashFiles('clients/apple/sing-box.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved') }}-${{ github.sha }}
@@ -1409,7 +1482,7 @@ jobs:
           defaults write com.apple.dt.Xcode IDESkipPackagePluginFingerprintValidatation -bool YES
       - name: Download library
         if: matrix.if
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: ${{ matrix.type == 'standalone' && format('libbox-apple-macos-{0}', matrix.library_arch) || format('libbox-apple-{0}-*', matrix.platform) }}
           path: libbox-inputs
@@ -1515,7 +1588,7 @@ jobs:
         run: rm -rf "$RUNNER_TEMP/SourcePackages/repositories"
       - name: Upload release artifact
         if: matrix.if && (matrix.type == 'standalone' || matrix.type == 'jailbreak')
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: binary-apple-${{ matrix.type }}${{ matrix.variant && format('-{0}', matrix.variant) || '' }}
           path: 'dist'
@@ -1525,6 +1598,7 @@ jobs:
     if: github.event_name == 'workflow_dispatch' && (inputs.build == 'All' || inputs.build == 'Apple' || inputs.build == 'iOS' || inputs.build == 'macOS' || inputs.build == 'tvOS')
     needs:
       - calculate_version
+      - publish_provenance
       - build_apple_library
     strategy:
       fail-fast: false
@@ -1562,8 +1636,10 @@ jobs:
             library_arch: ''
     steps: *build_apple_steps
   upload:
-    name: Upload builds
-    if: "!failure() && github.event_name == 'workflow_dispatch' && (inputs.build == 'All' || inputs.build == 'Binary' || inputs.build == 'Android' || inputs.build == 'Windows' || inputs.build == 'Linux' || inputs.build == 'Apple-release' || inputs.build == 'macOS-standalone' || inputs.build == 'iOS-jailbreak')"
+    name: Upload complete release inventory
+    # Partial build selections remain downloadable workflow artifacts, but may
+    # not replace a shared GitHub release or its checksum manifest.
+    if: "always() && !failure() && !cancelled() && github.event_name == 'workflow_dispatch' && inputs.build == 'All'"
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -1571,6 +1647,7 @@ jobs:
       attestations: write
       artifact-metadata: write
     needs:
+      - release_gate
       - calculate_version
       - build
       - build_darwin
@@ -1585,32 +1662,57 @@ jobs:
       - name: Checkout
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
         with:
-          fetch-depth: 1
-      - name: Cache ghr
-        uses: actions/cache@v4
-        id: cache-ghr
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Setup Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
-          path: |
-            ~/go/bin/ghr
-          key: ghr
-      - name: Setup ghr
-        if: steps.cache-ghr.outputs.cache-hit != 'true'
+          go-version: 1.27.3
+          cache: false
+      - name: Build pinned ghr
+        env:
+          GHR_REVISION: 610bfc9f5712eac7fe65a31fb1a214b64fb2b86c
         run: |-
-          cd $HOME
-          git clone https://github.com/nekohasekai/ghr ghr
-          cd ghr
-          go install -v .
-      - name: Set tag
+          set -euo pipefail
+          rm -rf "$RUNNER_TEMP/ghr"
+          git init -q "$RUNNER_TEMP/ghr"
+          git -C "$RUNNER_TEMP/ghr" remote add origin https://github.com/nekohasekai/ghr.git
+          git -C "$RUNNER_TEMP/ghr" fetch --depth=1 origin "$GHR_REVISION"
+          test "$(git -C "$RUNNER_TEMP/ghr" rev-parse FETCH_HEAD)" = "$GHR_REVISION"
+          git -C "$RUNNER_TEMP/ghr" checkout --detach FETCH_HEAD
+          GOBIN="$HOME/go/bin" go -C "$RUNNER_TEMP/ghr" install -v .
+      - name: Verify source and tag provenance
+        env:
+          RELEASE_VERSION: ${{ needs.calculate_version.outputs.version }}
         run: |-
-          git ls-remote --exit-code --tags origin v${{ needs.calculate_version.outputs.version }} || echo "PUBLISHED=false" >> "$GITHUB_ENV"
-          git tag v${{ needs.calculate_version.outputs.version }} -f
-          echo "VERSION=${{ needs.calculate_version.outputs.version }}" >> "$GITHUB_ENV"
+          set -euo pipefail
+          [[ "$RELEASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          git diff --check
+          tag="v${RELEASE_VERSION}"
+          if git ls-remote --exit-code --refs origin "refs/tags/${tag}" >/dev/null; then
+            git fetch --force --depth=1 origin "refs/tags/${tag}"
+            test "$(git rev-parse 'FETCH_HEAD^{commit}')" = "$GITHUB_SHA"
+            echo "PUBLISHED=true" >> "$GITHUB_ENV"
+          else
+            echo "PUBLISHED=false" >> "$GITHUB_ENV"
+          fi
+          git tag --force "$tag" "$GITHUB_SHA"
+          echo "VERSION=$RELEASE_VERSION" >> "$GITHUB_ENV"
       - name: Download builds
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
           pattern: binary-*
           path: dist
           merge-multiple: true
+      - name: Generate SHA256SUMS
+        run: |-
+          set -euo pipefail
+          test -n "$(find dist -type f -print -quit)"
+          cd dist
+          find . -type f ! -name SHA256SUMS -print0 | LC_ALL=C sort -z | xargs -0 sha256sum > SHA256SUMS
+          sha256sum --check SHA256SUMS
       - name: Attest build provenance
         uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
         with:
@@ -1619,14 +1721,14 @@ jobs:
         if: ${{ env.PUBLISHED == 'false' }}
         run: |-
           export PATH="$PATH:$HOME/go/bin"
-          ghr --replace --draft --prerelease -p 5 "v${VERSION}" dist
+          ghr --commitish "$GITHUB_SHA" --replace --draft --prerelease -p 5 "v${VERSION}" dist
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Replace builds
         if: ${{ env.PUBLISHED != 'false' }}
         run: |-
           export PATH="$PATH:$HOME/go/bin"
-          ghr --replace -p 5 "v${VERSION}" dist
+          ghr --commitish "$GITHUB_SHA" --replace -p 5 "v${VERSION}" dist
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
   cache_gc:

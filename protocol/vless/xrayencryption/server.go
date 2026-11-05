@@ -8,6 +8,7 @@ package xrayencryption
 
 import (
 	"bytes"
+	"context"
 	"crypto/cipher"
 	"crypto/ecdh"
 	"crypto/mlkem"
@@ -22,9 +23,23 @@ import (
 	"lukechampine.com/blake3"
 )
 
+const (
+	maxServerSessions = 4096
+	maxSessionResumes = 1024
+	maxReplayEntries  = 65536
+)
+
+var (
+	errExpiredTicket     = errors.New("expired ticket")
+	errReplayDetected    = errors.New("replay detected")
+	errTicketResumeLimit = errors.New("ticket resume limit exceeded")
+	errGlobalReplayLimit = errors.New("global replay limit exceeded")
+)
+
 type ServerSession struct {
-	PfsKey  []byte
-	NfsKeys sync.Map
+	PfsKey   []byte
+	ExpireAt time.Time
+	NfsKeys  map[[32]byte]struct{}
 }
 
 type ServerInstance struct {
@@ -38,12 +53,19 @@ type ServerInstance struct {
 	PaddingLens   [][3]int
 	PaddingGaps   [][3]int
 
-	RWLock   sync.RWMutex
-	Closed   bool
-	done     chan struct{}
-	Lasts    map[int64][16]byte
-	Tickets  [][16]byte
-	Sessions map[[16]byte]*ServerSession
+	RWLock           sync.RWMutex
+	Closed           bool
+	generation       uint64
+	lifecycleCtx     context.Context
+	lifecycleCancel  context.CancelFunc
+	handshakeWait    sync.WaitGroup
+	activeHandshakes int
+	Sessions         map[[16]byte]*ServerSession
+	replayEntries    int
+	sessionLimit     int
+	resumeLimit      int
+	replayLimit      int
+	now              func() time.Time
 }
 
 func (i *ServerInstance) Init(nfsSKeysBytes [][]byte, xorMode uint32, secondsFrom, secondsTo int64, padding string) error {
@@ -90,59 +112,92 @@ func (i *ServerInstance) Init(nfsSKeysBytes [][]byte, xorMode uint32, secondsFro
 	if err := ParsePadding(padding, &i.PaddingLens, &i.PaddingGaps); err != nil {
 		return err
 	}
+	i.sessionLimit = maxServerSessions
+	i.resumeLimit = maxSessionResumes
+	i.replayLimit = maxReplayEntries
+	i.now = time.Now
+	i.generation = 1
+	i.lifecycleCtx, i.lifecycleCancel = context.WithCancel(context.Background())
 	if secondsFrom > 0 || secondsTo > 0 {
-		i.Lasts = make(map[int64][16]byte)
-		i.Tickets = make([][16]byte, 0, 1024)
-		i.Sessions = make(map[[16]byte]*ServerSession)
-		i.done = make(chan struct{})
-		go i.expireSessions()
+		i.Sessions = make(map[[16]byte]*ServerSession, min(maxServerSessions, 1024))
 	}
 	return nil
-}
-
-func (i *ServerInstance) expireSessions() {
-	ticker := time.NewTicker(time.Minute)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ticker.C:
-			i.RWLock.Lock()
-			minute := time.Now().Unix() / 60
-			last := i.Lasts[minute]
-			delete(i.Lasts, minute)
-			delete(i.Lasts, minute-1)
-			if last != [16]byte{} {
-				for index, ticket := range i.Tickets {
-					delete(i.Sessions, ticket)
-					if ticket == last {
-						i.Tickets = i.Tickets[index+1:]
-						break
-					}
-				}
-			}
-			i.RWLock.Unlock()
-		case <-i.done:
-			return
-		}
-	}
 }
 
 func (i *ServerInstance) Close() error {
 	i.RWLock.Lock()
-	if !i.Closed {
-		i.Closed = true
-		if i.done != nil {
-			close(i.done)
-		}
+	if i.Closed {
+		i.RWLock.Unlock()
+		return nil
 	}
+	i.Closed = true
+	i.generation++
+	cancel := i.lifecycleCancel
+	i.Sessions = nil
+	i.replayEntries = 0
 	i.RWLock.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	i.handshakeWait.Wait()
 	return nil
 }
 
 func (i *ServerInstance) Handshake(conn net.Conn, fallback *[]byte) (*CommonConn, error) {
-	if i.NfsSKeys == nil {
+	return i.HandshakeContext(context.Background(), conn, fallback)
+}
+
+func (i *ServerInstance) HandshakeContext(ctx context.Context, conn net.Conn, fallback *[]byte) (*CommonConn, error) {
+	i.RWLock.Lock()
+	if i.NfsSKeys == nil || i.lifecycleCtx == nil {
+		i.RWLock.Unlock()
 		return nil, errors.New("uninitialized")
 	}
+	if i.Closed {
+		i.RWLock.Unlock()
+		return nil, net.ErrClosed
+	}
+	generation := i.generation
+	lifecycleCtx := i.lifecycleCtx
+	i.handshakeWait.Add(1)
+	i.activeHandshakes++
+	i.RWLock.Unlock()
+	defer i.finishHandshake()
+
+	handshakeCtx, cancelHandshake := context.WithCancel(ctx)
+	lifecycleCancellationDone := make(chan struct{})
+	stopLifecycleCancellation := context.AfterFunc(lifecycleCtx, func() {
+		cancelHandshake()
+		close(lifecycleCancellationDone)
+	})
+	result, err := handshakeWithContext(handshakeCtx, conn, func(ctx context.Context) (*CommonConn, error) {
+		return i.handshake(ctx, conn, fallback, generation)
+	})
+	if !stopLifecycleCancellation() {
+		<-lifecycleCancellationDone
+	}
+	cancelHandshake()
+
+	i.RWLock.RLock()
+	generationValid := !i.Closed && i.generation == generation
+	i.RWLock.RUnlock()
+	if !generationValid {
+		if result != nil {
+			_ = result.Close()
+		}
+		return nil, net.ErrClosed
+	}
+	return result, err
+}
+
+func (i *ServerInstance) finishHandshake() {
+	i.RWLock.Lock()
+	i.activeHandshakes--
+	i.RWLock.Unlock()
+	i.handshakeWait.Done()
+}
+
+func (i *ServerInstance) handshake(ctx context.Context, conn net.Conn, fallback *[]byte, generation uint64) (*CommonConn, error) {
 	c := NewCommonConn(conn, true)
 
 	ivAndRelays := make([]byte, 16+i.RelaysLength)
@@ -275,13 +330,9 @@ func (i *ServerInstance) Handshake(conn net.Conn, fallback *[]byte) (*CommonConn
 			return nil, err
 		}
 	}
-	copy(ticket[:], EncodeLength(int(seconds)))
-	if seconds > 0 {
-		i.RWLock.Lock()
-		i.Lasts[(time.Now().Unix()+max(i.SecondsFrom, i.SecondsTo))/60+2] = ticket
-		i.Tickets = append(i.Tickets, ticket)
-		i.Sessions[ticket] = &ServerSession{PfsKey: pfsKey}
-		i.RWLock.Unlock()
+	_, err = i.issueTicket(generation, &ticket, pfsKey, seconds)
+	if err != nil {
+		return nil, err
 	}
 
 	const pfsKeyExchangeLength = 1088 + 32 + 16
@@ -306,7 +357,9 @@ func (i *ServerInstance) Handshake(conn net.Conn, fallback *[]byte) (*CommonConn
 			serverHello = serverHello[fragmentLength:]
 		}
 		if len(paddingGaps) > index {
-			time.Sleep(paddingGaps[index])
+			if err := waitContext(ctx, paddingGaps[index]); err != nil {
+				return nil, err
+			}
 		}
 	}
 	if err := readAndOpenPadding(conn, nfsAEAD, encryptedLength); err != nil {
@@ -317,6 +370,117 @@ func (i *ServerInstance) Handshake(conn net.Conn, fallback *[]byte) (*CommonConn
 		c.Conn = NewXorConn(conn, NewCTR(c.UnitedKey, ticket[:]), NewCTR(c.UnitedKey, iv), 0, 0)
 	}
 	return c, nil
+}
+
+func (i *ServerInstance) issueTicket(generation uint64, ticket *[16]byte, pfsKey []byte, seconds int64) (int64, error) {
+	copy(ticket[:], EncodeLength(0))
+	if seconds <= 0 {
+		return 0, nil
+	}
+
+	i.RWLock.Lock()
+	defer i.RWLock.Unlock()
+	if i.Closed || i.generation != generation {
+		return 0, net.ErrClosed
+	}
+	now := i.currentTimeLocked()
+	sessionLimit := i.sessionLimit
+	if sessionLimit <= 0 {
+		sessionLimit = maxServerSessions
+	}
+	replayLimit := i.replayLimit
+	if replayLimit <= 0 {
+		replayLimit = maxReplayEntries
+	}
+	if len(i.Sessions) >= sessionLimit || i.replayEntries >= replayLimit {
+		i.pruneExpiredLocked(now)
+		if len(i.Sessions) >= sessionLimit || i.replayEntries >= replayLimit {
+			return 0, nil
+		}
+	}
+	if i.Sessions == nil {
+		i.Sessions = make(map[[16]byte]*ServerSession)
+	}
+	copy(ticket[:], EncodeLength(int(seconds)))
+	if _, loaded := i.Sessions[*ticket]; loaded {
+		return 0, errors.New("ticket collision")
+	}
+	i.Sessions[*ticket] = &ServerSession{
+		PfsKey:   append([]byte(nil), pfsKey...),
+		ExpireAt: now.Add(time.Duration(seconds) * time.Second),
+	}
+	return seconds, nil
+}
+
+func (i *ServerInstance) acceptResume(ticket [16]byte, nfsKey [32]byte) ([]byte, error) {
+	i.RWLock.Lock()
+	defer i.RWLock.Unlock()
+	if i.Closed {
+		return nil, net.ErrClosed
+	}
+	now := i.currentTimeLocked()
+	session := i.Sessions[ticket]
+	if session != nil && !now.Before(session.ExpireAt) {
+		i.deleteSessionLocked(ticket)
+		session = nil
+	}
+	if session == nil {
+		return nil, errExpiredTicket
+	}
+	if session.NfsKeys == nil {
+		session.NfsKeys = make(map[[32]byte]struct{})
+	}
+	if _, loaded := session.NfsKeys[nfsKey]; loaded {
+		return nil, errReplayDetected
+	}
+	resumeLimit := i.resumeLimit
+	if resumeLimit <= 0 {
+		resumeLimit = maxSessionResumes
+	}
+	if len(session.NfsKeys) >= resumeLimit {
+		i.deleteSessionLocked(ticket)
+		return nil, errTicketResumeLimit
+	}
+	replayLimit := i.replayLimit
+	if replayLimit <= 0 {
+		replayLimit = maxReplayEntries
+	}
+	if i.replayEntries >= replayLimit {
+		i.pruneExpiredLocked(now)
+		if i.replayEntries >= replayLimit {
+			return nil, errGlobalReplayLimit
+		}
+	}
+	session.NfsKeys[nfsKey] = struct{}{}
+	i.replayEntries++
+	return append([]byte(nil), session.PfsKey...), nil
+}
+
+func (i *ServerInstance) currentTimeLocked() time.Time {
+	if i.now != nil {
+		return i.now()
+	}
+	return time.Now()
+}
+
+func (i *ServerInstance) pruneExpiredLocked(now time.Time) {
+	for ticket, session := range i.Sessions {
+		if !now.Before(session.ExpireAt) {
+			i.deleteSessionLocked(ticket)
+		}
+	}
+}
+
+func (i *ServerInstance) deleteSessionLocked(ticket [16]byte) {
+	session := i.Sessions[ticket]
+	if session == nil {
+		return
+	}
+	delete(i.Sessions, ticket)
+	i.replayEntries -= len(session.NfsKeys)
+	if i.replayEntries < 0 {
+		i.replayEntries = 0
+	}
 }
 
 func (i *ServerInstance) resume(conn net.Conn, c *CommonConn, iv, nfsKey []byte, nfsAEAD *AEAD) (*CommonConn, error) {
@@ -331,30 +495,30 @@ func (i *ServerInstance) resume(conn net.Conn, c *CommonConn, iv, nfsKey []byte,
 	if err != nil {
 		return nil, err
 	}
-	i.RWLock.RLock()
-	session := i.Sessions[[16]byte(ticket)]
-	i.RWLock.RUnlock()
-	if session == nil {
-		noiseLength, randomErr := randBetween(1279, 2279)
-		if randomErr != nil {
-			return nil, randomErr
-		}
-		noise := make([]byte, noiseLength)
-		for {
-			if _, randomErr = rand.Read(noise); randomErr != nil {
+	ticketID := [16]byte(ticket)
+	pfsKey, err := i.acceptResume(ticketID, [32]byte(nfsKey))
+	if err != nil {
+		if errors.Is(err, errExpiredTicket) {
+			noiseLength, randomErr := randBetween(1279, 2279)
+			if randomErr != nil {
 				return nil, randomErr
 			}
-			if _, headerErr := DecodeHeader(noise); headerErr != nil {
-				break
+			noise := make([]byte, noiseLength)
+			for {
+				if _, randomErr = rand.Read(noise); randomErr != nil {
+					return nil, randomErr
+				}
+				if _, headerErr := DecodeHeader(noise); headerErr != nil {
+					break
+				}
 			}
+			_ = writeFull(conn, noise)
 		}
-		_ = writeFull(conn, noise)
-		return nil, errors.New("expired ticket")
+		return nil, err
 	}
-	if _, loaded := session.NfsKeys.LoadOrStore([32]byte(nfsKey), true); loaded {
-		return nil, errors.New("replay detected")
-	}
-	c.UnitedKey = append(session.PfsKey, nfsKey...)
+	c.UnitedKey = make([]byte, 0, len(pfsKey)+len(nfsKey))
+	c.UnitedKey = append(c.UnitedKey, pfsKey...)
+	c.UnitedKey = append(c.UnitedKey, nfsKey...)
 	c.PreWrite = make([]byte, 16)
 	if _, err := rand.Read(c.PreWrite); err != nil {
 		return nil, err

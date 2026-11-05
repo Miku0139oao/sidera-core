@@ -24,13 +24,13 @@ import (
 	"net/http"
 	"reflect"
 	"strings"
+	"sync"
 	"time"
 	"unsafe"
 
 	"github.com/Miku0139oao/sidera-core/adapter"
 	C "github.com/Miku0139oao/sidera-core/constant"
 	"github.com/Miku0139oao/sidera-core/option"
-	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/debug"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
@@ -145,22 +145,6 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
 	if err != nil {
 		return nil, err
 	}
-	for _, extension := range uConn.Extensions {
-		if ce, ok := extension.(*utls.SupportedCurvesExtension); ok {
-			ce.Curves = common.Filter(ce.Curves, func(curveID utls.CurveID) bool {
-				return curveID != utls.X25519MLKEM768
-			})
-		}
-		if ks, ok := extension.(*utls.KeyShareExtension); ok {
-			ks.KeyShares = common.Filter(ks.KeyShares, func(share utls.KeyShare) bool {
-				return share.Group != utls.X25519MLKEM768
-			})
-		}
-	}
-	err = uConn.BuildHandshakeState()
-	if err != nil {
-		return nil, err
-	}
 
 	if len(uConfig.NextProtos) > 0 {
 		for _, extension := range uConn.Extensions {
@@ -181,13 +165,7 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
 	} else {
 		nowTime = time.Now()
 	}
-	binary.BigEndian.PutUint64(hello.SessionId, uint64(nowTime.Unix()))
-
-	hello.SessionId[0] = 1
-	hello.SessionId[1] = 8
-	hello.SessionId[2] = 1
-	binary.BigEndian.PutUint32(hello.SessionId[4:], uint32(time.Now().Unix()))
-	copy(hello.SessionId[8:], e.shortID[:])
+	populateRealitySessionID(hello.SessionId, nowTime, e.shortID)
 	if debug.Enabled {
 		fmt.Printf("REALITY hello.sessionId[:16]: %v\n", hello.SessionId[:16])
 	}
@@ -201,7 +179,10 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
 	}
 	ecdheKey := keyShareKeys.Ecdhe
 	if ecdheKey == nil {
-		return nil, E.New("nil ecdheKey")
+		ecdheKey = keyShareKeys.MlkemEcdhe
+	}
+	if ecdheKey == nil {
+		return nil, E.New("fingerprint does not provide a TLS 1.3 ECDHE key")
 	}
 	authKey, err := ecdheKey.ECDH(publicKey)
 	if err != nil {
@@ -234,35 +215,104 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
 	}
 
 	if !verifier.verified {
-		go realityClientFallback(e.ctx, uConn, e.uClient.ServerName(), e.uClient.id)
+		// The dialer closes conn as soon as this method returns an error. Keep
+		// fallback ownership here and join it before releasing the connection.
+		fallbackCtx, cancelFallback := boundedRealityFallbackContext(ctx, e.HandshakeTimeout())
+		_ = realityClientFallback(fallbackCtx, e.ctx, uConn, e.uClient.ServerName(), e.uClient.id)
+		cancelFallback()
 		return nil, E.New("reality verification failed")
 	}
 
 	return &realityClientConnWrapper{uConn}, nil
 }
 
-func realityClientFallback(ctx context.Context, uConn net.Conn, serverName string, fingerprint utls.ClientHelloID) {
+const realityFallbackMaxResponseSize = 1 << 20
+
+func populateRealitySessionID(sessionID []byte, now time.Time, shortID [8]byte) {
+	clear(sessionID)
+	if len(sessionID) < 16 {
+		return
+	}
+	// Keep the capability version aligned with the pinned Xray baseline.
+	sessionID[0] = 26
+	sessionID[1] = 7
+	sessionID[2] = 11
+	sessionID[3] = 0 // reserved
+	binary.BigEndian.PutUint32(sessionID[4:8], uint32(now.Unix()))
+	copy(sessionID[8:16], shortID[:])
+}
+
+func boundedRealityFallbackContext(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	if timeout <= 0 {
+		timeout = C.TCPTimeout
+	}
+	// WithTimeout preserves an earlier caller deadline while bounding callers
+	// that supplied no deadline or an excessively distant one.
+	return context.WithTimeout(ctx, timeout)
+}
+
+func realityClientFallback(ctx context.Context, configContext context.Context, uConn net.Conn, serverName string, fingerprint utls.ClientHelloID) error {
+	uConn = &realityFallbackConn{Conn: uConn}
+	if deadline, hasDeadline := ctx.Deadline(); hasDeadline {
+		_ = uConn.SetDeadline(deadline)
+	}
+	interruptDone := make(chan struct{})
+	stopInterrupt := context.AfterFunc(ctx, func() {
+		_ = uConn.SetDeadline(time.Now())
+		_ = uConn.Close()
+		close(interruptDone)
+	})
+	defer func() {
+		if !stopInterrupt() {
+			<-interruptDone
+		}
+	}()
 	defer uConn.Close()
-	client := &http.Client{
-		Transport: &http2.Transport{
-			DialTLSContext: func(ctx context.Context, network, addr string, config *tls.Config) (net.Conn, error) {
-				return uConn, nil
-			},
-			TLSClientConfig: &tls.Config{
-				Time:    ntp.TimeFuncFromContext(ctx),
-				RootCAs: adapter.RootPoolFromContext(ctx),
-			},
+
+	transport := &http2.Transport{
+		DialTLSContext: func(context.Context, string, string, *tls.Config) (net.Conn, error) {
+			return uConn, nil
+		},
+		TLSClientConfig: &tls.Config{
+			Time:    ntp.TimeFuncFromContext(configContext),
+			RootCAs: adapter.RootPoolFromContext(configContext),
 		},
 	}
-	request, _ := http.NewRequest("GET", "https://"+serverName, nil)
+	defer transport.CloseIdleConnections()
+	client := &http.Client{Transport: transport}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://"+serverName+"/", nil)
+	if err != nil {
+		return err
+	}
 	request.Header.Set("User-Agent", fingerprint.Client)
 	request.AddCookie(&http.Cookie{Name: "padding", Value: strings.Repeat("0", mRand.Intn(32)+30)})
 	response, err := client.Do(request)
 	if err != nil {
-		return
+		return err
 	}
-	_, _ = io.Copy(io.Discard, response.Body)
-	response.Body.Close()
+	defer response.Body.Close()
+
+	read, err := io.CopyN(io.Discard, response.Body, realityFallbackMaxResponseSize+1)
+	if err != nil && err != io.EOF {
+		return err
+	}
+	if read > realityFallbackMaxResponseSize {
+		return E.New("reality fallback response exceeds limit")
+	}
+	return nil
+}
+
+type realityFallbackConn struct {
+	net.Conn
+	closeOnce sync.Once
+	closeErr  error
+}
+
+func (c *realityFallbackConn) Close() error {
+	c.closeOnce.Do(func() {
+		c.closeErr = c.Conn.Close()
+	})
+	return c.closeErr
 }
 
 func (e *RealityClientConfig) Clone() Config {
@@ -332,10 +382,8 @@ func (c *realityClientConnWrapper) Upstream() any {
 	return c.UConn
 }
 
-// Due to low implementation quality, the reality server intercepted half close and caused memory leaks.
-// We fixed it by calling Close() directly.
 func (c *realityClientConnWrapper) CloseWrite() error {
-	return c.Close()
+	return c.UConn.CloseWrite()
 }
 
 func (c *realityClientConnWrapper) ReaderReplaceable() bool {

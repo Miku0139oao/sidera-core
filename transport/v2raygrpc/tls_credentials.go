@@ -77,7 +77,7 @@ func (c *TLSTransportCredentials) ServerHandshake(rawConn net.Conn) (net.Conn, c
 }
 
 func (c *TLSTransportCredentials) Clone() credentials.TransportCredentials {
-	return NewTLSTransportCredentials(c.config)
+	return NewTLSTransportCredentials(c.config.Clone())
 }
 
 func (c *TLSTransportCredentials) OverrideServerName(serverNameOverride string) error {

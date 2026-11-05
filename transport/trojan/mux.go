@@ -58,21 +58,24 @@ func newMuxConnection0(ctx context.Context, conn net.Conn, source M.Socksaddr, h
 	if err != nil {
 		return E.Cause(err, "read destination")
 	}
-	if reader.Buffered() > 0 {
-		buffer := buf.NewSize(reader.Buffered())
-		_, err = buffer.ReadFullFrom(reader, buffer.Len())
+	switch command {
+	case CommandTCP, CommandUDP:
+	default:
+		return E.New("unknown command ", command)
+	}
+	if cacheLen := reader.Buffered(); cacheLen > 0 {
+		buffer := buf.NewSize(cacheLen)
+		_, err = buffer.ReadFullFrom(reader, cacheLen)
 		if err != nil {
+			buffer.Release()
 			return err
 		}
 		conn = bufio.NewCachedConn(conn, buffer)
 	}
-	switch command {
-	case CommandTCP:
+	if command == CommandTCP {
 		handler.NewConnectionEx(ctx, conn, source, destination, nil)
-	case CommandUDP:
+	} else {
 		handler.NewPacketConnectionEx(ctx, &PacketConn{Conn: conn}, source, destination, nil)
-	default:
-		return E.New("unknown command ", command)
 	}
 	return nil
 }

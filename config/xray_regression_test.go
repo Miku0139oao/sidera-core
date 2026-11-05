@@ -56,6 +56,27 @@ func requireXrayTestError(t *testing.T, content string, message string) {
 	require.ErrorContains(t, err, message)
 }
 
+func TestDecodeXrayVLESSWireCompatibility(t *testing.T) {
+	t.Run("Vision rejects UDP 443", func(t *testing.T) {
+		document := strings.Replace(xrayVLESSDocument(`{"network":"raw"}`), `"encryption": "none"`, `"encryption": "none", "flow": "xtls-rprx-vision"`, 1)
+		options := decodeXrayTestConfig(t, document)
+		vlessOptions := options.Outbounds[0].Options.(*option.VLESSOutboundOptions)
+		require.True(t, vlessOptions.XrayVisionRejectUDP443)
+	})
+
+	t.Run("gRPC service name escaping", func(t *testing.T) {
+		options := decodeXrayTestConfig(t, xrayVLESSDocument(`{"network":"grpc","grpcSettings":{"serviceName":"foo/bar"}}`))
+		vlessOptions := options.Outbounds[0].Options.(*option.VLESSOutboundOptions)
+		require.Equal(t, "foo%2Fbar", vlessOptions.Transport.GRPCOptions.ServiceName)
+	})
+
+	t.Run("invalid UUID and long alias", func(t *testing.T) {
+		base := xrayVLESSDocument(`{"network":"raw"}`)
+		requireXrayTestError(t, strings.Replace(base, "27848739-7e62-4138-9fd3-098a63964b6b", "zzzzzzzz-7e62-4138-9fd3-098a63964b6b", 1), "invalid VLESS user id")
+		requireXrayTestError(t, strings.Replace(base, "27848739-7e62-4138-9fd3-098a63964b6b", strings.Repeat("a", 31), 1), "invalid VLESS user id")
+	})
+}
+
 func TestDecodeXrayTLSCompatibility(t *testing.T) {
 	t.Run("removed allowInsecure", func(t *testing.T) {
 		requireXrayTestError(t, xrayVLESSDocument(`{
@@ -185,6 +206,25 @@ func TestDecodeXrayRoutingCompatibility(t *testing.T) {
 			"outboundTag": "block"
 		}`))
 		require.Equal(t, []string{"^[^.]*ads[^.]*$", "^[^.]*$"}, []string(options.Route.Rules[0].DefaultOptions.DomainRegex))
+	})
+
+	t.Run("literal domains use Xray lowercase semantics", func(t *testing.T) {
+		options := decodeXrayTestConfig(t, xrayRoutingDocument(`{
+			"domain": ["full:Example.COM", "domain:Example.ORG", "keyword:TRACKER", "BareLiteral", "regexp:^CaseSensitive$"],
+			"outboundTag": "block"
+		}`))
+		rule := options.Route.Rules[0].DefaultOptions
+		require.Equal(t, []string{"example.com"}, []string(rule.Domain))
+		require.Equal(t, []string{"example.org"}, []string(rule.DomainSuffix))
+		require.Equal(t, []string{"tracker", "bareliteral"}, []string(rule.DomainKeyword))
+		require.Equal(t, []string{"^CaseSensitive$"}, []string(rule.DomainRegex))
+	})
+
+	t.Run("protocol prefix matcher is rejected", func(t *testing.T) {
+		requireXrayTestError(t, xrayRoutingDocument(`{
+			"protocol": ["http"],
+			"outboundTag": "block"
+		}`), "prefix matching")
 	})
 
 	t.Run("negated IP is rejected early", func(t *testing.T) {
@@ -355,7 +395,11 @@ func TestDecodeXrayVLESSInboundWithRealityEncryption(t *testing.T) {
 				}
 			}
 		}],
-		"outbounds": [{"protocol": "freedom", "tag": "direct"}]
+		"outbounds": [{
+			"protocol": "freedom",
+			"tag": "direct",
+			"settings": {"finalRules": [{"action": "allow"}]}
+		}]
 	}`)
 	require.Len(t, options.Inbounds, 1)
 	require.Equal(t, "vless", options.Inbounds[0].Type)
@@ -373,7 +417,7 @@ func TestDecodeXrayVLESSInboundWithRealityEncryption(t *testing.T) {
 	require.Equal(t, "gateway.example", vlessOptions.TLS.ServerName)
 	require.Equal(t, "gateway.example", vlessOptions.TLS.Reality.Handshake.Server)
 	require.Equal(t, uint16(443), vlessOptions.TLS.Reality.Handshake.ServerPort)
-	require.Empty(t, vlessOptions.TLS.Reality.MinClientVersion)
+	require.Equal(t, "26.3.27", vlessOptions.TLS.Reality.MinClientVersion)
 	require.Equal(t, time.Second, time.Duration(vlessOptions.TLS.Reality.MaxTimeDifference))
 }
 
@@ -390,6 +434,23 @@ func TestDecodeXrayVLESSInboundDefaultsToRawTCP(t *testing.T) {
 	}`)
 	require.Len(t, options.Inbounds, 1)
 	require.Equal(t, "vless", options.Inbounds[0].Type)
+}
+
+func TestDecodeXrayCanonicalizesAcceptedUUIDSpellings(t *testing.T) {
+	const canonical = "27848739-7e62-4138-9fd3-098a63964b6b"
+	const xrayAccepted = "-278487397e6241389fd3098a63964b6b"
+	outboundDocument := strings.Replace(xrayVLESSDocument(`{"network":"raw"}`), canonical, xrayAccepted, 1)
+	outboundOptions := decodeXrayTestConfig(t, outboundDocument).Outbounds[0].Options.(*option.VLESSOutboundOptions)
+	require.Equal(t, canonical, outboundOptions.UUID)
+
+	inboundOptions := decodeXrayTestConfig(t, `{
+		"inbounds": [{
+			"protocol": "vless",
+			"port": 443,
+			"settings": {"clients": [{"id": "`+xrayAccepted+`"}], "decryption": "none"}
+		}]
+	}`).Inbounds[0].Options.(*option.VLESSInboundOptions)
+	require.Equal(t, canonical, inboundOptions.Users[0].UUID)
 }
 
 func TestDecodeXrayVLESSEncryptionSecuresPublicOutbound(t *testing.T) {
@@ -529,8 +590,7 @@ func TestDecodeXrayLiveServerManagementAndHysteria2(t *testing.T) {
 			"domainStrategy": "AsIs",
 			"rules": [
 				{"type": "field", "inboundTag": ["api"], "outboundTag": "api"},
-				{"type": "field", "ip": ["geoip:private"], "outboundTag": "blocked"},
-				{"type": "field", "protocol": ["bittorrent"], "outboundTag": "blocked"}
+				{"type": "field", "ip": ["geoip:private"], "outboundTag": "blocked"}
 			]
 		}
 	}`)
@@ -561,14 +621,56 @@ func TestDecodeXrayLiveServerManagementAndHysteria2(t *testing.T) {
 	require.ElementsMatch(t, []string{"alice", "bob"}, options.Experimental.V2RayAPI.Stats.Users)
 	require.ElementsMatch(t, []string{"alice", "bob"}, options.Experimental.V2RayAPI.Stats.UsersOnline)
 
-	require.Len(t, options.Route.Rules, 2)
+	require.Len(t, options.Route.Rules, 1)
 	privateRule := options.Route.Rules[0].DefaultOptions
 	require.Contains(t, []string(privateRule.IPCIDR), "10.0.0.0/8")
 	require.Contains(t, []string(privateRule.IPCIDR), "100.64.0.0/10")
 	require.Equal(t, "blocked", privateRule.RouteOptions.Outbound)
-	bittorrentRule := options.Route.Rules[1].DefaultOptions
-	require.Equal(t, []string{"bittorrent"}, []string(bittorrentRule.Protocol))
-	require.Equal(t, "blocked", bittorrentRule.RouteOptions.Outbound)
+}
+
+func TestDecodeXrayFreedomPrivateAddressDefault(t *testing.T) {
+	const inbound = `"inbounds": [{
+		"protocol": "vless",
+		"tag": "vless-in",
+		"port": 443,
+		"settings": {
+			"clients": [{"email": "alice", "id": "27848739-7e62-4138-9fd3-098a63964b6b"}],
+			"decryption": "none"
+		},
+		"streamSettings": {"network": "raw", "security": "none"}
+	}],`
+
+	requireXrayTestError(t, `{`+inbound+`
+		"outbounds": [{"protocol": "freedom", "tag": "direct", "settings": {}}]
+	}`, "private-address policy")
+
+	options := decodeXrayTestConfig(t, `{`+inbound+`
+		"outbounds": [{
+			"protocol": "freedom",
+			"tag": "direct",
+			"settings": {"finalRules": [{"action": "allow"}]}
+		}]
+	}`)
+	require.Len(t, options.Outbounds, 1)
+	require.Equal(t, "direct", options.Outbounds[0].Type)
+}
+
+func TestDecodeXrayPrivateSingleLabelSemantics(t *testing.T) {
+	privateDocument := func(address string) string {
+		return `{
+			"outbounds": [{
+				"protocol": "vless",
+				"settings": {
+					"address": "` + address + `",
+					"port": 443,
+					"id": "27848739-7e62-4138-9fd3-098a63964b6b",
+					"encryption": "none"
+				}
+			}]
+		}`
+	}
+	decodeXrayTestConfig(t, privateDocument("gateway"))
+	requireXrayTestError(t, privateDocument("bad_name"), "prohibited for a public server address")
 }
 
 func TestDecodeXrayRejectsNonEquivalentHysteriaWindows(t *testing.T) {

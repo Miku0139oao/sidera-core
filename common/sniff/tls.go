@@ -10,19 +10,25 @@ import (
 	C "github.com/Miku0139oao/sidera-core/constant"
 	"github.com/sagernet/sing/common/bufio"
 	E "github.com/sagernet/sing/common/exceptions"
+	M "github.com/sagernet/sing/common/metadata"
 )
+
+// errTLSClientHelloCaptured aborts crypto/tls after ClientHello is parsed.
+// GetConfigForClient already has SNI; continuing the handshake (version
+// negotiation, PSK/ticket resumption, certificate selection) is unused work.
+var errTLSClientHelloCaptured = errors.New("tls client hello captured")
 
 func TLSClientHello(ctx context.Context, metadata *adapter.InboundContext, reader io.Reader) error {
 	var clientHello *tls.ClientHelloInfo
 	err := tls.Server(bufio.NewReadOnlyConn(reader), &tls.Config{
 		GetConfigForClient: func(argHello *tls.ClientHelloInfo) (*tls.Config, error) {
 			clientHello = argHello
-			return nil, nil
+			return nil, errTLSClientHelloCaptured
 		},
 	}).HandshakeContext(ctx)
 	if clientHello != nil {
 		metadata.Protocol = C.ProtocolTLS
-		metadata.Domain = clientHello.ServerName
+		metadata.Domain = M.ParseSocksaddrHostPort(clientHello.ServerName, 0).Fqdn
 		return nil
 	}
 	if errors.Is(err, io.ErrUnexpectedEOF) {

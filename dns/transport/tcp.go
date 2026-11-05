@@ -134,17 +134,22 @@ func ReadMessage(reader io.Reader) (*mDNS.Msg, error) {
 }
 
 func WriteMessage(writer io.Writer, messageId uint16, message *mDNS.Msg) error {
-	requestLen := message.Len()
-	buffer := buf.NewSize(3 + requestLen)
+	// miekg/dns requires one byte beyond the uncompressed length when a
+	// caller-provided PackBuffer is used.
+	buffer := buf.NewSize(3 + message.Len())
 	defer buffer.Release()
-	common.Must(binary.Write(buffer, binary.BigEndian, uint16(requestLen)))
-	exMessage := *message
+	buffer.Extend(2)
+	exMessage := message.Copy()
 	exMessage.Id = messageId
 	exMessage.Compress = true
 	rawMessage, err := exMessage.PackBuffer(buffer.FreeBytes())
 	if err != nil {
 		return err
 	}
+	if len(rawMessage) > 1<<16-1 {
+		return E.New("DNS message exceeds TCP framing limit: ", len(rawMessage))
+	}
+	binary.BigEndian.PutUint16(buffer.Bytes()[:2], uint16(len(rawMessage)))
 	buffer.Truncate(2 + len(rawMessage))
 	return common.Error(writer.Write(buffer.Bytes()))
 }

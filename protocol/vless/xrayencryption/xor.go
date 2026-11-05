@@ -11,7 +11,9 @@ import (
 	"crypto/cipher"
 	"errors"
 	"net"
+	"sync"
 
+	"github.com/sagernet/sing/common/buf"
 	N "github.com/sagernet/sing/common/network"
 
 	"lukechampine.com/blake3"
@@ -29,12 +31,14 @@ func NewCTR(key, iv []byte) cipher.Stream {
 
 type XorConn struct {
 	net.Conn
-	CTR       cipher.Stream
-	PeerCTR   cipher.Stream
-	OutSkip   int
-	OutHeader []byte
-	InSkip    int
-	InHeader  []byte
+	CTR         cipher.Stream
+	PeerCTR     cipher.Stream
+	OutSkip     int
+	OutHeader   []byte
+	InSkip      int
+	InHeader    []byte
+	readAccess  sync.Mutex
+	writeAccess sync.Mutex
 }
 
 var (
@@ -59,13 +63,30 @@ func (c *XorConn) UpstreamReader() any { return c.Conn }
 func (c *XorConn) UpstreamWriter() any { return c.Conn }
 
 func (c *XorConn) Write(b []byte) (int, error) {
+	c.writeAccess.Lock()
+	defer c.writeAccess.Unlock()
 	if len(b) == 0 {
 		return 0, nil
 	}
 	if c.CTR == nil {
 		return 0, errors.New("xray encryption: missing outbound XOR stream")
 	}
-	for remaining := b; ; {
+
+	var encoded []byte
+	// A pooled Buffer itself has allocation/coordination overhead. Retain the
+	// original path for tiny writes and for sizes the backing pool cannot reuse.
+	if len(b) < 1024 || len(b) > buf.MaxPooledBufferSize {
+		encoded = append([]byte(nil), b...)
+	} else {
+		scratch := buf.NewSize(len(b))
+		defer func() {
+			clear(scratch.Bytes())
+			scratch.Release()
+		}()
+		encoded = scratch.Extend(len(b))
+		copy(encoded, b)
+	}
+	for remaining := encoded; ; {
 		if len(remaining) <= c.OutSkip {
 			c.OutSkip -= len(remaining)
 			break
@@ -83,13 +104,12 @@ func (c *XorConn) Write(b []byte) (int, error) {
 		c.CTR.XORKeyStream(remaining[:need], remaining[:need])
 		remaining = remaining[need:]
 	}
-	if err := writeFull(c.Conn, b); err != nil {
-		return 0, err
-	}
-	return len(b), nil
+	return writeFullCount(c.Conn, encoded)
 }
 
 func (c *XorConn) Read(b []byte) (int, error) {
+	c.readAccess.Lock()
+	defer c.readAccess.Unlock()
 	if len(b) == 0 {
 		return 0, nil
 	}

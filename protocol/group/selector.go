@@ -3,6 +3,7 @@ package group
 import (
 	"context"
 	"net"
+	"slices"
 
 	"github.com/Miku0139oao/sidera-core/adapter"
 	"github.com/Miku0139oao/sidera-core/adapter/outbound"
@@ -60,6 +61,11 @@ func NewSelector(ctx context.Context, router adapter.Router, logger log.ContextL
 	}
 	if len(outbound.tags) == 0 {
 		return nil, E.New("missing tags")
+	}
+	for i, tag := range outbound.tags {
+		if slices.Contains(outbound.tags[:i], tag) {
+			return nil, E.New("duplicate tag: ", tag)
+		}
 	}
 	return outbound, nil
 }
@@ -166,7 +172,7 @@ func (s *Selector) NewConnection(ctx context.Context, conn net.Conn, metadata ad
 	if outboundHandler, isHandler := selected.(adapter.ConnectionHandler); isHandler {
 		outboundHandler.NewConnection(ctx, conn, metadata, onClose)
 	} else {
-		s.connection.NewConnection(ctx, selected, conn, metadata, onClose)
+		s.connection.NewConnection(ctx, s, conn, metadata, onClose)
 	}
 }
 
@@ -176,7 +182,7 @@ func (s *Selector) NewPacketConnection(ctx context.Context, conn N.PacketConn, m
 	if outboundHandler, isHandler := selected.(adapter.PacketConnectionHandler); isHandler {
 		outboundHandler.NewPacketConnection(ctx, conn, metadata, onClose)
 	} else {
-		s.connection.NewPacketConnection(ctx, selected, conn, metadata, onClose)
+		s.connection.NewPacketConnection(ctx, s, conn, metadata, onClose)
 	}
 }
 

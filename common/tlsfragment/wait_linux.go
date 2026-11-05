@@ -10,12 +10,12 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func writeAndWaitAck(ctx context.Context, conn *net.TCPConn, payload []byte, fallbackDelay time.Duration) error {
-	_, err := conn.Write(payload)
+func writeAndWaitAck(ctx context.Context, conn *net.TCPConn, payload []byte, fallbackDelay time.Duration) (int, error) {
+	written, err := writeFull(conn.Write, payload)
 	if err != nil {
-		return err
+		return written, err
 	}
-	return control.Conn(conn, func(fd uintptr) error {
+	err = control.Conn(conn, func(fd uintptr) error {
 		start := time.Now()
 		for {
 			select {
@@ -30,11 +30,14 @@ func writeAndWaitAck(ctx context.Context, conn *net.TCPConn, payload []byte, fal
 			if tcpInfo.Unacked == 0 {
 				if time.Since(start) <= 20*time.Millisecond {
 					// under transparent proxy
-					time.Sleep(fallbackDelay)
+					return waitForDelay(ctx, fallbackDelay)
 				}
 				return nil
 			}
-			time.Sleep(10 * time.Millisecond)
+			if waitErr := waitForDelay(ctx, 10*time.Millisecond); waitErr != nil {
+				return waitErr
+			}
 		}
 	})
+	return written, err
 }

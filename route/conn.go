@@ -31,14 +31,24 @@ import (
 var _ adapter.ConnectionManager = (*ConnectionManager)(nil)
 
 type ConnectionManager struct {
-	logger      logger.ContextLogger
-	access      sync.Mutex
-	connections list.List[io.Closer]
+	logger         logger.ContextLogger
+	ctx            context.Context
+	cancel         context.CancelCauseFunc
+	access         sync.Mutex
+	connections    list.List[io.Closer]
+	activeRelays   map[*relayLease]struct{}
+	operationGroup sync.WaitGroup
+	relayGroup     sync.WaitGroup
+	closed         bool
 }
 
 func NewConnectionManager(logger logger.ContextLogger) *ConnectionManager {
+	ctx, cancel := context.WithCancelCause(context.Background())
 	return &ConnectionManager{
-		logger: logger,
+		logger:       logger,
+		ctx:          ctx,
+		cancel:       cancel,
+		activeRelays: make(map[*relayLease]struct{}),
 	}
 }
 
@@ -47,6 +57,8 @@ func (m *ConnectionManager) Start(stage adapter.StartStage) error {
 }
 
 func (m *ConnectionManager) Count() int {
+	m.access.Lock()
+	defer m.access.Unlock()
 	return m.connections.Len()
 }
 
@@ -66,12 +78,39 @@ func (m *ConnectionManager) CloseAll() {
 }
 
 func (m *ConnectionManager) Close() error {
-	m.CloseAll()
+	m.access.Lock()
+	if m.closed {
+		m.access.Unlock()
+		return nil
+	}
+	m.closed = true
+	m.cancel(net.ErrClosed)
+	var closers []io.Closer
+	for element := m.connections.Front(); element != nil; {
+		nextElement := element.Next()
+		closers = append(closers, element.Value)
+		m.connections.Remove(element)
+		element = nextElement
+	}
+	for relay := range m.activeRelays {
+		closers = append(closers, relay.closers...)
+	}
+	m.access.Unlock()
+	for _, closer := range closers {
+		common.Close(closer)
+	}
+	m.operationGroup.Wait()
+	m.relayGroup.Wait()
 	return nil
 }
 
 func (m *ConnectionManager) TrackConn(conn net.Conn) net.Conn {
 	m.access.Lock()
+	if m.closed {
+		m.access.Unlock()
+		_ = conn.Close()
+		return conn
+	}
 	element := m.connections.PushBack(conn)
 	m.access.Unlock()
 	return &trackedConn{
@@ -83,6 +122,11 @@ func (m *ConnectionManager) TrackConn(conn net.Conn) net.Conn {
 
 func (m *ConnectionManager) TrackPacketConn(conn net.PacketConn) net.PacketConn {
 	m.access.Lock()
+	if m.closed {
+		m.access.Unlock()
+		_ = conn.Close()
+		return conn
+	}
 	element := m.connections.PushBack(conn)
 	m.access.Unlock()
 	return &trackedPacketConn{
@@ -93,7 +137,13 @@ func (m *ConnectionManager) TrackPacketConn(conn net.PacketConn) net.PacketConn 
 }
 
 func (m *ConnectionManager) NewConnection(ctx context.Context, this N.Dialer, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
-	ctx = adapter.WithContext(ctx, &metadata)
+	operationCtx, operation, loaded := m.beginOperation(ctx)
+	if !loaded {
+		N.CloseOnHandshakeFailure(conn, onClose, net.ErrClosed)
+		return
+	}
+	defer operation.finish()
+	ctx = adapter.WithContext(operationCtx, &metadata)
 	var (
 		remoteConn net.Conn
 		err        error
@@ -142,19 +192,41 @@ func (m *ConnectionManager) NewConnection(ctx context.Context, this N.Dialer, co
 		remoteConn = spoofConn
 	}
 	serverFirst := sniff.Skip(&metadata)
-	var done atomic.Bool
-	if m.kickWriteHandshake(ctx, conn, remoteConn, serverFirst, false, &done, onClose) {
+	var handshakeDone atomic.Bool
+	if m.kickWriteHandshake(ctx, conn, remoteConn, serverFirst, false, &handshakeDone, onClose) {
 		return
 	}
-	if m.kickWriteHandshake(ctx, remoteConn, conn, serverFirst, true, &done, onClose) {
+	if m.kickWriteHandshake(ctx, remoteConn, conn, serverFirst, true, &handshakeDone, onClose) {
 		return
 	}
-	go m.connectionCopy(ctx, conn, remoteConn, false, &done, onClose)
-	go m.connectionCopy(ctx, remoteConn, conn, true, &done, onClose)
+	relayState := &connectionRelayState{onClose: onClose}
+	relay := m.beginRelays(2, conn, remoteConn)
+	if relay == nil {
+		common.Close(conn, remoteConn)
+		if onClose != nil {
+			onClose(net.ErrClosed)
+		}
+		return
+	}
+	operation.transferTo(relay)
+	go func() {
+		defer relay.Done()
+		m.connectionCopy(ctx, conn, remoteConn, false, relayState)
+	}()
+	go func() {
+		defer relay.Done()
+		m.connectionCopy(ctx, remoteConn, conn, true, relayState)
+	}()
 }
 
 func (m *ConnectionManager) NewPacketConnection(ctx context.Context, this N.Dialer, conn N.PacketConn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
-	ctx = adapter.WithContext(ctx, &metadata)
+	operationCtx, operation, loaded := m.beginOperation(ctx)
+	if !loaded {
+		N.CloseOnHandshakeFailure(conn, onClose, net.ErrClosed)
+		return
+	}
+	defer operation.finish()
+	ctx = adapter.WithContext(operationCtx, &metadata)
 	var (
 		remotePacketConn   net.PacketConn
 		remoteConn         net.Conn
@@ -220,9 +292,10 @@ func (m *ConnectionManager) NewPacketConnection(ctx context.Context, this N.Dial
 	}
 	err = N.ReportPacketConnHandshakeSuccess(conn, remotePacketConn)
 	if err != nil {
-		conn.Close()
+		err = E.Cause(err, "report handshake success")
 		remotePacketConn.Close()
-		m.logger.ErrorContext(ctx, "report handshake success: ", err)
+		N.CloseOnHandshakeFailure(conn, onClose, err)
+		m.logger.ErrorContext(ctx, err)
 		return
 	}
 	if destinationAddress.IsValid() {
@@ -266,28 +339,161 @@ func (m *ConnectionManager) NewPacketConnection(ctx context.Context, this N.Dial
 	}
 	destination := bufio.NewPacketConn(remotePacketConn)
 	var done atomic.Bool
-	go m.packetConnectionCopy(ctx, conn, destination, false, &done, onClose)
-	go m.packetConnectionCopy(ctx, destination, conn, true, &done, onClose)
+	relay := m.beginRelays(2, conn, remotePacketConn)
+	if relay == nil {
+		common.Close(conn, remotePacketConn)
+		if onClose != nil {
+			onClose(net.ErrClosed)
+		}
+		return
+	}
+	operation.transferTo(relay)
+	go func() {
+		defer relay.Done()
+		m.packetConnectionCopy(ctx, conn, destination, false, &done, onClose)
+	}()
+	go func() {
+		defer relay.Done()
+		m.packetConnectionCopy(ctx, destination, conn, true, &done, onClose)
+	}()
 }
 
-func (m *ConnectionManager) connectionCopy(ctx context.Context, source net.Conn, destination net.Conn, direction bool, done *atomic.Bool, onClose N.CloseHandlerFunc) {
+// connectionOperation separates setup joining from the lifetime of the context
+// retained by dialers and wrappers. Only the setup goroutine calls transferTo
+// and finish; transferTo must precede starting the relay goroutines.
+type connectionOperation struct {
+	manager        *ConnectionManager
+	releaseContext func()
+	transferred    bool
+}
+
+func (o *connectionOperation) transferTo(relay *relayLease) {
+	relay.releaseContext = o.releaseContext
+	o.transferred = true
+}
+
+func (o *connectionOperation) finish() {
+	if !o.transferred {
+		o.releaseContext()
+	}
+	o.manager.operationGroup.Done()
+}
+
+func (m *ConnectionManager) beginOperation(parent context.Context) (context.Context, *connectionOperation, bool) {
+	m.access.Lock()
+	if m.closed {
+		m.access.Unlock()
+		return nil, nil, false
+	}
+	m.operationGroup.Add(1)
+	managerCtx := m.ctx
+	m.access.Unlock()
+
+	operationCtx, cancel := context.WithCancelCause(parent)
+	stopManager := context.AfterFunc(managerCtx, func() {
+		cancel(context.Cause(managerCtx))
+	})
+	if cause := context.Cause(managerCtx); cause != nil {
+		cancel(cause)
+	}
+	return operationCtx, &connectionOperation{
+		manager: m,
+		releaseContext: func() {
+			stopManager()
+			cancel(nil)
+		},
+	}, true
+}
+
+type relayLease struct {
+	manager        *ConnectionManager
+	closers        []io.Closer
+	remaining      atomic.Int32
+	releaseContext func()
+}
+
+func (m *ConnectionManager) beginRelays(count int, closers ...io.Closer) *relayLease {
+	m.access.Lock()
+	defer m.access.Unlock()
+	if m.closed {
+		return nil
+	}
+	relay := &relayLease{manager: m, closers: closers}
+	relay.remaining.Store(int32(count))
+	m.activeRelays[relay] = struct{}{}
+	m.relayGroup.Add(count)
+	return relay
+}
+
+func (r *relayLease) Done() {
+	if r.remaining.Add(-1) == 0 {
+		if r.releaseContext != nil {
+			r.releaseContext()
+		}
+		r.manager.access.Lock()
+		delete(r.manager.activeRelays, r)
+		r.manager.access.Unlock()
+	}
+	r.manager.relayGroup.Done()
+}
+
+type connectionRelayState struct {
+	access          sync.Mutex
+	completed       int
+	firstErr        error
+	firstMeaningful error
+	onClose         N.CloseHandlerFunc
+}
+
+func (s *connectionRelayState) record(err error) {
+	if err == nil {
+		return
+	}
+	s.access.Lock()
+	if s.firstErr == nil {
+		s.firstErr = err
+	}
+	if s.firstMeaningful == nil && !E.IsClosedOrCanceled(err) {
+		s.firstMeaningful = err
+	}
+	s.access.Unlock()
+}
+
+func (s *connectionRelayState) finish(source net.Conn, destination net.Conn) {
+	s.access.Lock()
+	s.completed++
+	if s.completed != 2 {
+		s.access.Unlock()
+		return
+	}
+	err := s.firstMeaningful
+	if err == nil {
+		err = s.firstErr
+	}
+	onClose := s.onClose
+	s.access.Unlock()
+	if onClose != nil {
+		onClose(err)
+	}
+	common.Close(source, destination)
+}
+
+func (m *ConnectionManager) connectionCopy(ctx context.Context, source net.Conn, destination net.Conn, direction bool, state *connectionRelayState) {
 	_, err := bufio.CopyWithIncreateBuffer(destination, source, bufio.DefaultIncreaseBufferAfter, bufio.DefaultBatchSize)
 	if err != nil {
+		state.record(err)
 		common.Close(source, destination)
-	} else if duplexDst, isDuplex := destination.(N.WriteCloser); isDuplex {
+	} else if duplexDst, isDuplex := N.UnwrapWriter(destination).(N.WriteCloser); isDuplex {
 		err = duplexDst.CloseWrite()
+		state.record(err)
 		if err != nil {
 			common.Close(source, destination)
 		}
 	} else {
-		destination.Close()
+		err = destination.Close()
+		state.record(err)
 	}
-	if done.Swap(true) {
-		if onClose != nil {
-			onClose(err)
-		}
-		common.Close(source, destination)
-	}
+	state.finish(source, destination)
 	if !direction {
 		if err == nil {
 			m.logger.DebugContext(ctx, "connection upload finished")
@@ -304,6 +510,34 @@ func (m *ConnectionManager) connectionCopy(ctx context.Context, source net.Conn,
 		} else {
 			m.logger.TraceContext(ctx, "connection download closed")
 		}
+	}
+}
+
+func copyPacketExact(destination N.PacketWriter, source N.PacketReader) (n int64, err error) {
+	// A UDP datagram must be forwarded in full or not at all. The upstream copy
+	// fast path uses 8/16 KiB pooled buffers and some recvmmsg implementations
+	// ignore MSG_TRUNC, which can turn a valid large datagram into a corrupt
+	// prefix. A maximum-size managed buffer keeps packet boundaries exact.
+	const maxUDPPayloadSize = 65535
+	options := N.NewReadWaitOptions(source, destination)
+	for {
+		buffer := options.NewBufferSize(maxUDPPayloadSize)
+		packetDestination, readErr := source.ReadPacket(buffer)
+		if readErr != nil {
+			buffer.Release()
+			return n, readErr
+		}
+		dataLen := buffer.Len()
+		if dataLen > maxUDPPayloadSize {
+			buffer.Release()
+			return n, E.New("UDP packet exceeds maximum payload size")
+		}
+		options.PostReturn(buffer)
+		if writeErr := destination.WritePacket(buffer, packetDestination); writeErr != nil {
+			buffer.Leak()
+			return n, writeErr
+		}
+		n += int64(dataLen)
 	}
 }
 
@@ -366,7 +600,7 @@ func (m *ConnectionManager) kickWriteHandshake(ctx context.Context, source net.C
 }
 
 func (m *ConnectionManager) packetConnectionCopy(ctx context.Context, source N.PacketReader, destination N.PacketWriter, direction bool, done *atomic.Bool, onClose N.CloseHandlerFunc) {
-	_, err := bufio.CopyPacket(destination, source)
+	_, err := copyPacketExact(destination, source)
 	if !direction {
 		if err == nil {
 			m.logger.DebugContext(ctx, "packet upload finished")

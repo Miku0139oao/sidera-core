@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"io"
 	"net/http"
 	"os"
 	"os/user"
@@ -16,11 +15,12 @@ import (
 )
 
 const (
-	oauth2ClientID          = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
-	oauth2TokenURL          = "https://console.anthropic.com/v1/oauth/token"
-	claudeAPIBaseURL        = "https://api.anthropic.com"
-	tokenRefreshBufferMs    = 60000
-	anthropicBetaOAuthValue = "oauth-2025-04-20"
+	oauth2ClientID             = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+	oauth2TokenURL             = "https://console.anthropic.com/v1/oauth/token"
+	claudeAPIBaseURL           = "https://api.anthropic.com"
+	tokenRefreshBufferMs       = 60000
+	anthropicBetaOAuthValue    = "oauth-2025-04-20"
+	maxCredentialResponseBytes = 1 << 20
 )
 
 func getRealUser() (*user.User, error) {
@@ -88,7 +88,7 @@ func (c *oauthCredentials) needsRefresh() bool {
 	return time.Now().UnixMilli() >= c.ExpiresAt-tokenRefreshBufferMs
 }
 
-func refreshToken(httpClient *http.Client, credentials *oauthCredentials) (*oauthCredentials, error) {
+func refreshToken(ctx context.Context, httpClient *http.Client, credentials *oauthCredentials) (*oauthCredentials, error) {
 	if credentials.RefreshToken == "" {
 		return nil, E.New("refresh token is empty")
 	}
@@ -102,7 +102,7 @@ func refreshToken(httpClient *http.Client, credentials *oauthCredentials) (*oaut
 		return nil, E.Cause(err, "marshal request")
 	}
 
-	request, err := http.NewRequest("POST", oauth2TokenURL, bytes.NewReader(requestBody))
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, oauth2TokenURL, bytes.NewReader(requestBody))
 	if err != nil {
 		return nil, err
 	}
@@ -115,9 +115,15 @@ func refreshToken(httpClient *http.Client, credentials *oauthCredentials) (*oaut
 	}
 	defer response.Body.Close()
 
+	responseBody, oversized, err := readBoundedBody(response.Body, maxCredentialResponseBytes)
+	if err != nil {
+		return nil, E.Cause(err, "read refresh response")
+	}
+	if oversized {
+		return nil, E.New("refresh response exceeds limit")
+	}
 	if response.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(response.Body)
-		return nil, E.New("refresh failed: ", response.Status, " ", string(body))
+		return nil, E.New("refresh failed: ", response.Status, " ", string(responseBody))
 	}
 
 	var tokenResponse struct {
@@ -125,7 +131,7 @@ func refreshToken(httpClient *http.Client, credentials *oauthCredentials) (*oaut
 		RefreshToken string `json:"refresh_token"`
 		ExpiresIn    int    `json:"expires_in"`
 	}
-	err = json.NewDecoder(response.Body).Decode(&tokenResponse)
+	err = json.Unmarshal(responseBody, &tokenResponse)
 	if err != nil {
 		return nil, E.Cause(err, "decode response")
 	}

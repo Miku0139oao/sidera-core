@@ -3,7 +3,6 @@ package tuic
 import (
 	"context"
 	"errors"
-	"maps"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -34,6 +33,11 @@ func RegisterInbound(registry *inbound.Registry) {
 
 var _ adapter.ManagedUserService = (*Inbound)(nil)
 
+type authenticatedTUICUser struct {
+	UUID string
+	Name string
+}
+
 type Inbound struct {
 	inbound.Adapter
 	ctx             context.Context
@@ -42,7 +46,7 @@ type Inbound struct {
 	listenOptions   option.ListenOptions
 	listener        *listener.Listener
 	tlsConfig       tls.ServerConfig
-	server          *tuic.Service[string]
+	server          *tuic.Service[authenticatedTUICUser]
 	serviceOptions  tuic.ServiceOptions
 	serviceAccess   sync.Mutex
 	started         bool
@@ -118,30 +122,17 @@ func (h *Inbound) ManagedUsers() []adapter.ManagedUser {
 }
 
 func (h *Inbound) UpdateManagedUsers(users []adapter.ManagedUser) error {
+	h.serviceAccess.Lock()
+	defer h.serviceAccess.Unlock()
 	service, managedUsers, userMap, err := h.buildService(users)
 	if err != nil {
 		return err
 	}
-	h.serviceAccess.Lock()
-	defer h.serviceAccess.Unlock()
-	oldUsers := h.ManagedUsers()
-	h.usersAccess.Lock()
-	if h.users == nil {
-		h.users = make(map[string]option.TUICUser)
-	}
-	maps.Copy(h.users, userMap)
-	h.usersAccess.Unlock()
-	if err = h.replaceServiceLocked(service, oldUsers); err != nil {
-		return err
-	}
-	h.usersAccess.Lock()
-	h.managedUsers = managedUsers
-	h.usersAccess.Unlock()
-	return nil
+	return h.replaceServiceLocked(service, managedUsers, userMap, h.startService)
 }
 
-func (h *Inbound) buildService(users []adapter.ManagedUser) (*tuic.Service[string], []adapter.ManagedUser, map[string]option.TUICUser, error) {
-	userList := make([]string, len(users))
+func (h *Inbound) buildService(users []adapter.ManagedUser) (*tuic.Service[authenticatedTUICUser], []adapter.ManagedUser, map[string]option.TUICUser, error) {
+	userList := make([]authenticatedTUICUser, len(users))
 	uuidList := make([][16]byte, len(users))
 	passwordList := make([]string, len(users))
 	userMap := make(map[string]option.TUICUser, len(users))
@@ -158,14 +149,19 @@ func (h *Inbound) buildService(users []adapter.ManagedUser) (*tuic.Service[strin
 			return nil, nil, nil, E.Cause(err, "invalid uuid for user ", index)
 		}
 		userID := userUUID.String()
+		if _, exists := userMap[userID]; exists {
+			return nil, nil, nil, E.New("duplicate uuid for user ", index, ": ", userID)
+		}
 		protocolUser := option.TUICUser{Name: user.Name, UUID: user.UUID, Password: user.Password}
-		userList[index] = userID
+		// The service writes this generation's immutable identity into the
+		// authenticated context; callbacks must not resolve through a newer map.
+		userList[index] = authenticatedTUICUser{UUID: userID, Name: user.Name}
 		uuidList[index] = userUUID
 		passwordList[index] = user.Password
 		userMap[userID] = protocolUser
 		managedUsers[index] = adapter.ManagedUser{Name: user.Name, UUID: user.UUID, Password: user.Password}
 	}
-	service, err := tuic.NewService[string](h.serviceOptions)
+	service, err := tuic.NewService[authenticatedTUICUser](h.serviceOptions)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -173,27 +169,47 @@ func (h *Inbound) buildService(users []adapter.ManagedUser) (*tuic.Service[strin
 	return service, managedUsers, userMap, nil
 }
 
-func (h *Inbound) replaceServiceLocked(newService *tuic.Service[string], oldUsers []adapter.ManagedUser) error {
+func (h *Inbound) replaceServiceLocked(
+	newService *tuic.Service[authenticatedTUICUser],
+	newUsers []adapter.ManagedUser,
+	newUserMap map[string]option.TUICUser,
+	startService func(*tuic.Service[authenticatedTUICUser]) (*listener.Listener, error),
+) error {
+	h.usersAccess.RLock()
+	oldUsers := append([]adapter.ManagedUser(nil), h.managedUsers...)
+	oldUserMap := h.users
+	h.usersAccess.RUnlock()
 	if !h.started {
 		if h.server != nil {
 			_ = h.server.Close()
 		}
 		h.server = newService
+		h.publishUserGeneration(newUsers, newUserMap)
 		return nil
 	}
-	_ = h.server.Close()
-	_ = h.listener.Close()
-	newListener, err := h.startService(newService)
+	if h.server != nil {
+		_ = h.server.Close()
+	}
+	if h.listener != nil {
+		_ = h.listener.Close()
+	}
+
+	// Publish UUID-to-identity metadata before Start can authenticate traffic.
+	h.publishUserGeneration(newUsers, newUserMap)
+	newListener, err := startService(newService)
 	if err == nil {
 		h.server = newService
 		h.listener = newListener
 		return nil
 	}
+
+	// Restore the previous metadata before the rollback listener admits traffic.
+	h.publishUserGeneration(oldUsers, oldUserMap)
 	rollbackService, _, _, rollbackBuildErr := h.buildService(oldUsers)
 	if rollbackBuildErr != nil {
 		return errors.Join(err, E.Cause(rollbackBuildErr, "rebuild previous TUIC service"))
 	}
-	rollbackListener, rollbackErr := h.startService(rollbackService)
+	rollbackListener, rollbackErr := startService(rollbackService)
 	if rollbackErr != nil {
 		return errors.Join(err, E.Cause(rollbackErr, "restore previous TUIC service"))
 	}
@@ -202,10 +218,19 @@ func (h *Inbound) replaceServiceLocked(newService *tuic.Service[string], oldUser
 	return err
 }
 
-func (h *Inbound) startService(service *tuic.Service[string]) (*listener.Listener, error) {
+func (h *Inbound) publishUserGeneration(users []adapter.ManagedUser, userMap map[string]option.TUICUser) {
+	h.usersAccess.Lock()
+	h.users = userMap
+	h.managedUsers = users
+	h.usersAccess.Unlock()
+}
+
+func (h *Inbound) startService(service *tuic.Service[authenticatedTUICUser]) (*listener.Listener, error) {
 	newListener := listener.New(listener.Options{Context: h.ctx, Logger: h.logger, Listen: h.listenOptions})
 	packetConn, err := newListener.ListenUDP()
 	if err != nil {
+		_ = newListener.Close()
+		_ = service.Close()
 		return nil, err
 	}
 	address := newListener.UDPAddr()
@@ -225,6 +250,14 @@ func (h *Inbound) userName(userID string) string {
 	return user.Name
 }
 
+func authenticatedUserName(ctx context.Context) string {
+	user, loaded := auth.UserFromContext[authenticatedTUICUser](ctx)
+	if !loaded {
+		return ""
+	}
+	return user.Name
+}
+
 func (h *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
 	ctx = log.ContextWithNewID(ctx)
 	var metadata adapter.InboundContext
@@ -239,11 +272,7 @@ func (h *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, source M.S
 	metadata.Source = source
 	metadata.Destination = destination
 	h.logger.InfoContext(ctx, "inbound connection from ", metadata.Source)
-	userID, loaded := auth.UserFromContext[string](ctx)
-	var userName string
-	if loaded {
-		userName = h.userName(userID)
-	}
+	userName := authenticatedUserName(ctx)
 	if userName != "" {
 		metadata.User = userName
 		h.logger.InfoContext(ctx, "[", userName, "] inbound connection to ", metadata.Destination)
@@ -267,11 +296,7 @@ func (h *Inbound) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, 
 	metadata.Source = source
 	metadata.Destination = destination
 	h.logger.InfoContext(ctx, "inbound packet connection from ", metadata.Source)
-	userID, loaded := auth.UserFromContext[string](ctx)
-	var userName string
-	if loaded {
-		userName = h.userName(userID)
-	}
+	userName := authenticatedUserName(ctx)
 	if userName != "" {
 		metadata.User = userName
 		h.logger.InfoContext(ctx, "[", userName, "] inbound packet connection to ", metadata.Destination)

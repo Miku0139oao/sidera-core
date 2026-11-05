@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -452,6 +453,256 @@ func TestMultiplexerTimeoutInvalidatesConn(t *testing.T) {
 	case <-accepted:
 	case <-time.After(time.Second):
 		t.Fatal("expected a fresh connection for the second query")
+	}
+}
+
+func TestSingleExchangeIgnoresMismatchUntilCorrectResponse(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer serverConn.Close()
+
+	wireID := make(chan uint16, 1)
+	multiplexer := newQueryMultiplexer(queryMultiplexerOptions{
+		dial: func(context.Context) (net.Conn, error) {
+			return clientConn, nil
+		},
+		write: func(_ net.Conn, _ *mDNS.Msg, queryID uint16) error {
+			wireID <- queryID
+			return nil
+		},
+		readNext: func(conn net.Conn) (*mDNS.Msg, error) {
+			return ReadMessage(conn)
+		},
+	})
+	defer multiplexer.Close()
+
+	query := new(mDNS.Msg)
+	query.SetQuestion("expected.example.", mDNS.TypeA)
+	query.Id = 0x1234
+
+	oldID := mDNS.Id
+	mDNS.Id = func() uint16 { return 0xBEEF }
+	defer func() { mDNS.Id = oldID }()
+
+	serverErr := make(chan error, 1)
+	go func() {
+		queryID := <-wireID
+		correct := new(mDNS.Msg)
+		correct.SetReply(query)
+
+		wrongID := correct.Copy()
+		if err := WriteMessage(serverConn, queryID+1, wrongID); err != nil {
+			serverErr <- err
+			return
+		}
+		wrongQuestion := correct.Copy()
+		wrongQuestion.Question[0].Name = "wrong.example."
+		if err := WriteMessage(serverConn, queryID, wrongQuestion); err != nil {
+			serverErr <- err
+			return
+		}
+		wrongQR := correct.Copy()
+		wrongQR.Response = false
+		if err := WriteMessage(serverConn, queryID, wrongQR); err != nil {
+			serverErr <- err
+			return
+		}
+		wrongOpcode := correct.Copy()
+		wrongOpcode.Opcode = mDNS.OpcodeStatus
+		if err := WriteMessage(serverConn, queryID, wrongOpcode); err != nil {
+			serverErr <- err
+			return
+		}
+		serverErr <- WriteMessage(serverConn, queryID, correct)
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	response, err := multiplexer.exchangeSingle(ctx, query)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = <-serverErr; err != nil {
+		t.Fatal(err)
+	}
+	if response.Id != query.Id {
+		t.Fatalf("restored response ID = %d, want %d", response.Id, query.Id)
+	}
+	if response.Question[0] != query.Question[0] {
+		t.Fatalf("response question = %v, want %v", response.Question[0], query.Question[0])
+	}
+}
+
+type blockedProbeConn struct {
+	closed    chan struct{}
+	closeOnce sync.Once
+}
+
+func newBlockedProbeConn() *blockedProbeConn {
+	return &blockedProbeConn{closed: make(chan struct{})}
+}
+
+func (c *blockedProbeConn) Read([]byte) (int, error) {
+	<-c.closed
+	return 0, net.ErrClosed
+}
+
+func (c *blockedProbeConn) Write(payload []byte) (int, error) { return len(payload), nil }
+func (c *blockedProbeConn) Close() error {
+	c.closeOnce.Do(func() { close(c.closed) })
+	return nil
+}
+func (c *blockedProbeConn) LocalAddr() net.Addr              { return blockedProbeAddr("local") }
+func (c *blockedProbeConn) RemoteAddr() net.Addr             { return blockedProbeAddr("remote") }
+func (c *blockedProbeConn) SetDeadline(time.Time) error      { return nil }
+func (c *blockedProbeConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *blockedProbeConn) SetWriteDeadline(time.Time) error { return nil }
+
+type blockedProbeAddr string
+
+func (a blockedProbeAddr) Network() string { return string(a) }
+func (a blockedProbeAddr) String() string  { return string(a) }
+
+func newBlockedProbeMultiplexer() (*queryMultiplexer, *atomic.Int32, <-chan struct{}, <-chan struct{}) {
+	var dialCount atomic.Int32
+	readStarted := make(chan struct{})
+	readExited := make(chan struct{})
+	multiplexer := newQueryMultiplexer(queryMultiplexerOptions{
+		probeReuse: true,
+		dial: func(context.Context) (net.Conn, error) {
+			dialCount.Add(1)
+			return newBlockedProbeConn(), nil
+		},
+		write: func(net.Conn, *mDNS.Msg, uint16) error { return nil },
+		readNext: func(conn net.Conn) (*mDNS.Msg, error) {
+			close(readStarted)
+			var payload [1]byte
+			_, err := conn.Read(payload[:])
+			close(readExited)
+			return nil, err
+		},
+	})
+	message := new(mDNS.Msg)
+	message.SetQuestion("probe.example.", mDNS.TypeA)
+	multiplexer.maybeStartProbe(context.Background(), message)
+	return multiplexer, &dialCount, readStarted, readExited
+}
+
+func TestMultiplexerResetJoinsBlockedProbe(t *testing.T) {
+	multiplexer, dialCount, readStarted, readExited := newBlockedProbeMultiplexer()
+	defer multiplexer.Close()
+	select {
+	case <-readStarted:
+	case <-time.After(time.Second):
+		t.Fatal("probe did not block in read")
+	}
+
+	resetDone := make(chan struct{})
+	go func() {
+		multiplexer.Reset()
+		close(resetDone)
+	}()
+	select {
+	case <-resetDone:
+	case <-time.After(time.Second):
+		t.Fatal("Reset did not cancel and join the probe")
+	}
+	select {
+	case <-readExited:
+	default:
+		t.Fatal("Reset returned before the probe read exited")
+	}
+	if count := dialCount.Load(); count != 1 {
+		t.Fatalf("probe dials = %d, want 1", count)
+	}
+	if state := multiplexer.reuseState.Load(); state != reuseStateUnknown {
+		t.Fatalf("reuse state after Reset = %d, want unknown", state)
+	}
+}
+
+func TestMultiplexerCloseJoinsBlockedProbe(t *testing.T) {
+	multiplexer, dialCount, readStarted, readExited := newBlockedProbeMultiplexer()
+	select {
+	case <-readStarted:
+	case <-time.After(time.Second):
+		t.Fatal("probe did not block in read")
+	}
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- multiplexer.Close() }()
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close did not cancel and join the probe")
+	}
+	select {
+	case <-readExited:
+	default:
+		t.Fatal("Close returned before the probe read exited")
+	}
+	if err := multiplexer.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	message := new(mDNS.Msg)
+	message.SetQuestion("after-close.example.", mDNS.TypeA)
+	_, err := multiplexer.Exchange(context.Background(), message)
+	if !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("post-close exchange error = %v, want %v", err, net.ErrClosed)
+	}
+	if count := dialCount.Load(); count != 1 {
+		t.Fatalf("post-close probe dials = %d, want 1", count)
+	}
+}
+
+func TestMultiplexerCancellationCallbackMayClose(t *testing.T) {
+	readStarted := make(chan struct{})
+	var readOnce sync.Once
+	multiplexer := newQueryMultiplexer(queryMultiplexerOptions{
+		probeReuse: true,
+		dial: func(context.Context) (net.Conn, error) {
+			client, server := net.Pipe()
+			t.Cleanup(func() { _ = server.Close() })
+			return client, nil
+		},
+		write: func(net.Conn, *mDNS.Msg, uint16) error { return nil },
+		readNext: func(conn net.Conn) (*mDNS.Msg, error) {
+			readOnce.Do(func() { close(readStarted) })
+			var buffer [1]byte
+			_, err := conn.Read(buffer[:])
+			return nil, err
+		},
+	})
+	message := new(mDNS.Msg)
+	message.SetQuestion("close-reentry.example.", mDNS.TypeA)
+	callbackDone := make(chan error, 1)
+	multiplexer.ExchangeAsync(context.Background(), message, func(*mDNS.Msg, error) {
+		callbackDone <- multiplexer.Close()
+	})
+	select {
+	case <-readStarted:
+	case <-time.After(time.Second):
+		t.Fatal("single-query worker did not start")
+	}
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- multiplexer.Close() }()
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("outer Close deadlocked")
+	}
+	select {
+	case err := <-callbackDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cancellation callback deadlocked in Close")
 	}
 }
 

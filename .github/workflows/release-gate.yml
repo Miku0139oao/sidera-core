@@ -1,0 +1,174 @@
+name: Release Gate
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-gate-${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+env:
+  GOTOOLCHAIN: local
+  GOFLAGS: -mod=readonly
+
+jobs:
+  source:
+    name: Source, config, and generated artifacts
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Setup Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: 1.27.3
+          cache-dependency-path: go.sum
+      - name: Validate pinned inputs and modules
+        run: bash script/ci-release-gate.sh inputs
+      - name: Execute literal documented low-memory build
+        run: bash script/ci-release-gate.sh literal-low-memory-build
+      - name: Validate full and low-memory configuration/schema surfaces
+        run: bash script/ci-release-gate.sh config
+      - name: Reject schema or completion drift
+        run: bash script/ci-release-gate.sh generated
+      - name: Reject a dirty checkout
+        run: bash script/ci-release-gate.sh clean-tree
+
+  native:
+    name: Native ${{ matrix.target }} ${{ matrix.profile }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: linux-amd64
+            profile: full
+          - runner: ubuntu-24.04
+            target: linux-amd64
+            profile: low
+          - runner: windows-2025
+            target: windows-amd64
+            profile: full
+          - runner: windows-2025
+            target: windows-amd64
+            profile: low
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
+        with:
+          persist-credentials: false
+      - name: Setup Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: 1.27.3
+          cache-dependency-path: go.sum
+      - name: Compile all packages and release command
+        shell: bash
+        run: bash script/ci-release-gate.sh native "${{ matrix.profile }}"
+
+  cross-compile:
+    name: Compile ${{ matrix.goos }}/${{ matrix.goarch }} ${{ matrix.profile }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        goos:
+          - linux
+          - windows
+        goarch:
+          - amd64
+          - arm64
+          - '386'
+        profile:
+          - full
+          - low
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
+        with:
+          persist-credentials: false
+      - name: Setup Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: 1.27.3
+          cache-dependency-path: go.sum
+      - name: Compile command
+        run: >-
+          bash script/ci-release-gate.sh compile
+          "${{ matrix.goos }}" "${{ matrix.goarch }}" "${{ matrix.profile }}"
+
+  race:
+    name: Targeted race detector
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
+        with:
+          persist-credentials: false
+      - name: Setup Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: 1.27.3
+          cache-dependency-path: go.sum
+      - name: Run race-sensitive packages serially
+        run: bash script/ci-release-gate.sh race
+
+  reproducible:
+    name: Deterministic binaries and SHA-256
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Setup Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: 1.27.3
+          cache: false
+      - name: Build each profile twice with separate caches
+        run: bash script/ci-release-gate.sh reproducible
+      - name: Upload SHA-256 evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-gate-sha256
+          path: ${{ runner.temp }}/sidera-release-gate/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14
+
+  gate:
+    name: Gate
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    needs:
+      - source
+      - native
+      - cross-compile
+      - race
+      - reproducible
+    steps:
+      - name: Require every release gate
+        env:
+          SOURCE_RESULT: ${{ needs.source.result }}
+          NATIVE_RESULT: ${{ needs.native.result }}
+          CROSS_RESULT: ${{ needs.cross-compile.result }}
+          RACE_RESULT: ${{ needs.race.result }}
+          REPRO_RESULT: ${{ needs.reproducible.result }}
+        run: |
+          set -euo pipefail
+          test "$SOURCE_RESULT" = success
+          test "$NATIVE_RESULT" = success
+          test "$CROSS_RESULT" = success
+          test "$RACE_RESULT" = success
+          test "$REPRO_RESULT" = success
