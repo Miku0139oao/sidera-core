@@ -3,9 +3,11 @@ package listener
 import (
 	"bytes"
 	"context"
+	"errors"
 	"net"
 	"net/netip"
 	"strconv"
+	"syscall"
 	"testing"
 	"time"
 
@@ -27,6 +29,12 @@ type udpIntegrityPacketHandler struct {
 func (h *udpIntegrityPacketHandler) NewPacket(buffer *buf.Buffer, source M.Socksaddr) {
 	packet := append([]byte(nil), buffer.Bytes()...)
 	h.packets <- packet
+}
+
+// isDatagramTooLarge reports the EMSGSIZE error the kernel returns when a
+// datagram does not fit the sender's socket send buffer.
+func isDatagramTooLarge(err error) bool {
+	return errors.Is(err, syscall.EMSGSIZE)
 }
 
 func TestUDPListenerDeliversExactDatagramOrCountsTruncatedDrop(t *testing.T) {
@@ -53,6 +61,12 @@ func TestUDPListenerDeliversExactDatagramOrCountsTruncatedDrop(t *testing.T) {
 			payload := bytes.Repeat([]byte{byte(size), byte(size >> 8), byte(size >> 16)}, (size+2)/3)[:size]
 			beforeDrops := listener.UDPTruncatedPackets()
 			_, err = client.Write(payload)
+			if isDatagramTooLarge(err) {
+				// The host socket buffer is smaller than the datagram, so the
+				// kernel rejected it before the listener ever saw it. That is a
+				// property of this runner, not of the listener.
+				t.Skipf("write of %d bytes rejected by the host socket buffer: %v", size, err)
+			}
 			require.NoError(t, err)
 			deadline := time.NewTimer(2 * time.Second)
 			defer deadline.Stop()
