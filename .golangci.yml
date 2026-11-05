@@ -53,6 +53,13 @@ linters:
         linters:
           - staticcheck
         text: SA1019
+      # modernize's AsType, CutLast, Fields, new() and embedded-literal
+      # rewrites assume helpers and stdlib APIs that the pinned sing and x/net
+      # revisions do not all provide yet; they are behaviour-neutral tidy-ups to
+      # take with the next dependency bump, not something to rush here.
+      - linters:
+          - modernize
+        text: (errorsastype|stringscut|stditerators|newexpr|embedlit)
       # x/net deprecated http2/h2c in favour of the Protocols field, but the
       # replacement is Go 1.24+ only and this tree still builds h2c handlers on
       # paths that do not go through http.Server.
@@ -65,6 +72,18 @@ linters:
           - staticcheck
         text: SA1019
       - path: service/api/server.go
+        linters:
+          - staticcheck
+        text: SA1019
+      - path: service/derp/service.go
+        linters:
+          - staticcheck
+        text: SA1019
+      - path: transport/v2raygrpclite/server.go
+        linters:
+          - staticcheck
+        text: SA1019
+      - path: transport/v2rayhttp/server.go
         linters:
           - staticcheck
         text: SA1019

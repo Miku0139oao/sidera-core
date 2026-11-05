@@ -278,15 +278,15 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		}
 		disableNFTables, dErr := strconv.ParseBool(os.Getenv("DISABLE_NFTABLES"))
 		inbound.autoRedirect, err = tun.NewAutoRedirect(tun.AutoRedirectOptions{
-			TunOptions:             &inbound.tunOptions,
-			Context:                ctx,
-			Handler:                (*autoRedirectHandler)(inbound),
-			Logger:                 logger,
-			NetworkMonitor:         networkManager.NetworkMonitor(),
-			InterfaceFinder:        networkManager.InterfaceFinder(),
-			TableName:              "sing-box",
-			DisableNFTables:        dErr == nil && disableNFTables,
-			RouteAddressSet:        inbound.routeAddressSetPrefixes,
+			TunOptions:      &inbound.tunOptions,
+			Context:         ctx,
+			Handler:         (*autoRedirectHandler)(inbound),
+			Logger:          logger,
+			NetworkMonitor:  networkManager.NetworkMonitor(),
+			InterfaceFinder: networkManager.InterfaceFinder(),
+			TableName:       "sing-box",
+			DisableNFTables: dErr == nil && disableNFTables,
+			RouteAddressSet: inbound.routeAddressSetPrefixes,
 		})
 		if err != nil {
 			return nil, E.Cause(err, "initialize auto-redirect")
