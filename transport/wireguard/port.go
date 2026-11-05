@@ -1,10 +1,10 @@
 package wireguard
 
 import (
-	"github.com/Miku0139oao/sidera-core/common"
 	"net/netip"
 	"sync/atomic"
 
+	"github.com/Miku0139oao/sidera-core/common"
 	"github.com/sagernet/sing-tun"
 	"github.com/sagernet/sing-tun/gtcpip/header"
 	E "github.com/sagernet/sing/common/exceptions"

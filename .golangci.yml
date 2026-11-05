@@ -53,6 +53,21 @@ linters:
         linters:
           - staticcheck
         text: SA1019
+      # x/net deprecated http2/h2c in favour of the Protocols field, but the
+      # replacement is Go 1.24+ only and this tree still builds h2c handlers on
+      # paths that do not go through http.Server.
+      - path: protocol/hysteria2/realm.go
+        linters:
+          - staticcheck
+        text: SA1019
+      - path: protocol/naive/inbound.go
+        linters:
+          - staticcheck
+        text: SA1019
+      - path: service/api/server.go
+        linters:
+          - staticcheck
+        text: SA1019
       # copyPacketExact records a non-nil error before returning, so these
       # nil comparisons are unreachable by construction, not by accident.
       - path: route/conn.go

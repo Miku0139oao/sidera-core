@@ -3,10 +3,10 @@
 package tailscale
 
 import (
-	"github.com/Miku0139oao/sidera-core/common"
 	"net/netip"
 
 	"github.com/Miku0139oao/sidera-core/adapter"
+	"github.com/Miku0139oao/sidera-core/common"
 	C "github.com/Miku0139oao/sidera-core/constant"
 	"github.com/Miku0139oao/sidera-core/log"
 	"github.com/sagernet/sing-tun"
