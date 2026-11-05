@@ -35,8 +35,8 @@ The supported release toolchain is Go 1.27.3. The repository includes a
 `.go-version` file, and Make targets set `GOTOOLCHAIN=go1.27.3` so local,
 container, and release builds use the same tested patch release. Compatibility
 with the private runtime symbols enabled by the `badlinkname` build tag is
-covered by the Go 1.27 CI build and race-test jobs. Go 1.25.0 is the module
-compatibility floor, with Go 1.25, 1.26 and 1.27 retained in the test matrix.
+covered by the Go 1.27 CI build and race-test jobs. The module compatibility floor is
+Go 1.27.3; the test matrix no longer carries older toolchains.
 
 ```sh
 go build ./cmd/sidera

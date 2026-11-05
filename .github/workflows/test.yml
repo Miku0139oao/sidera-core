@@ -33,8 +33,6 @@ jobs:
           - windows-latest
           - macos-latest
         go:
-          - 1.25.7
-          - 1.27.3
           - 1.27.3
     runs-on: ${{ matrix.os }}
     env:
