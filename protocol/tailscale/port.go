@@ -3,6 +3,7 @@
 package tailscale
 
 import (
+	"github.com/Miku0139oao/sidera-core/common"
 	"net/netip"
 
 	"github.com/Miku0139oao/sidera-core/adapter"
@@ -132,7 +133,7 @@ func (t *Endpoint) WritePackets(packets [][]byte) error {
 		if header.IPVersion(packet) == header.IPv6Version {
 			source = inet6Address
 		}
-		reply, replyOk := tun.BuildUnreachable(packet, source, headroom)
+		reply, replyOk := common.BuildICMPUnreachable(packet, source, headroom)
 		if replyOk {
 			replies = append(replies, reply)
 		}

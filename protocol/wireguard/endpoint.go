@@ -9,6 +9,7 @@ import (
 
 	"github.com/Miku0139oao/sidera-core/adapter"
 	"github.com/Miku0139oao/sidera-core/adapter/endpoint"
+	S "github.com/Miku0139oao/sidera-core/common"
 	"github.com/Miku0139oao/sidera-core/common/dialer"
 	C "github.com/Miku0139oao/sidera-core/constant"
 	"github.com/Miku0139oao/sidera-core/log"
@@ -88,9 +89,8 @@ func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 		InterfaceFinder: networkManager.InterfaceFinder(),
 		EgressPoolOptions: tun.UDPEgressPoolOptions{
 			Logger:           logger,
-			InterfaceFinder:  networkManager.InterfaceFinder(),
+			InterfaceFinder:  S.NewExcludingInterfaceFinder(networkManager.InterfaceFinder(), []string{options.Name}),
 			InterfaceMonitor: networkManager.InterfaceMonitor(),
-			ExcludeInterface: options.Name,
 			IsExempt: func() bool {
 				return networkManager.AutoRedirectOutputMark() != 0
 			},

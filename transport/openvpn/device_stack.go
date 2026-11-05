@@ -10,6 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/Miku0139oao/sidera-core/common"
 	"github.com/sagernet/gvisor/pkg/buffer"
 	"github.com/sagernet/gvisor/pkg/tcpip"
 	"github.com/sagernet/gvisor/pkg/tcpip/adapters/gonet"
@@ -69,18 +70,17 @@ func newStackDevice(options DeviceOptions) (*stackDevice, error) {
 	}
 	if options.Handler != nil {
 		ipStack.SetTransportProtocolHandler(tcp.ProtocolNumber, tun.NewTCPForwarder(options.Context, ipStack, options.Handler).HandlePacket)
-		udpForwarder := tun.NewUDPForwarder(options.Context, ipStack, options.Handler, tun.UDPNatOptions{
-			Timeout:          options.UDPTimeout,
-			Shared:           true,
-			Mapping:          options.UDPMapping,
-			Filtering:        options.UDPFiltering,
-			MaxSize:          options.UDPNATMax,
-			InterfaceFinder:  options.InterfaceFinder,
-			ExcludeInterface: options.ExcludeInterface,
+		udpForwarder := tun.NewUDPForwarder(options.Context, ipStack, options.Handler, nil, tun.UDPNatOptions{
+			Timeout:         options.UDPTimeout,
+			Shared:          true,
+			Mapping:         options.UDPMapping,
+			Filtering:       options.UDPFiltering,
+			MaxSize:         options.UDPNATMax,
+			InterfaceFinder: common.NewExcludingInterfaceFinder(options.InterfaceFinder, options.ExcludeInterface),
 		})
 		ipStack.SetTransportProtocolHandler(udp.ProtocolNumber, udpForwarder.HandlePacket)
 		device.udpForwarder = udpForwarder
-		icmpForwarder := tun.NewICMPForwarder(ipStack, options.Handler, options.Logger)
+		icmpForwarder := tun.NewICMPForwarder(ipStack, options.Handler, nil, options.Logger)
 		ipStack.SetTransportProtocolHandler(icmp.ProtocolNumber4, icmpForwarder.HandlePacket)
 		ipStack.SetTransportProtocolHandler(icmp.ProtocolNumber6, icmpForwarder.HandlePacket)
 		device.icmpForwarder = icmpForwarder

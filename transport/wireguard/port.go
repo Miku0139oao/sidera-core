@@ -1,6 +1,7 @@
 package wireguard
 
 import (
+	"github.com/Miku0139oao/sidera-core/common"
 	"net/netip"
 	"sync/atomic"
 
@@ -72,7 +73,7 @@ func (e *Endpoint) WritePackets(packets [][]byte) error {
 		} else {
 			source = e.tunDevice.Inet6Address()
 		}
-		reply, replyOk := tun.BuildUnreachable(packet, source, state.headroom)
+		reply, replyOk := common.BuildICMPUnreachable(packet, source, state.headroom)
 		if replyOk {
 			replies = append(replies, reply)
 		}

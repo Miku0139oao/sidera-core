@@ -13,6 +13,7 @@ import (
 
 	"github.com/Miku0139oao/sidera-core/adapter"
 	"github.com/Miku0139oao/sidera-core/adapter/endpoint"
+	"github.com/Miku0139oao/sidera-core/common"
 	"github.com/Miku0139oao/sidera-core/common/dialer"
 	"github.com/Miku0139oao/sidera-core/common/listener"
 	C "github.com/Miku0139oao/sidera-core/constant"
@@ -280,9 +281,8 @@ func (s *ServerEndpoint) startRuntimeLocked(startDevice bool) error {
 					Logger:           s.logger,
 					Network:          M.NetworkFromNetAddr(N.NetworkUDP, listenAddress),
 					Control:          listenConfig.Control,
-					InterfaceFinder:  networkManager.InterfaceFinder(),
+					InterfaceFinder:  common.NewExcludingInterfaceFinder(networkManager.InterfaceFinder(), []string{s.options.Name}),
 					InterfaceMonitor: networkManager.InterfaceMonitor(),
-					ExcludeInterface: s.options.Name,
 					IsExempt: func() bool {
 						return networkManager.AutoRedirectOutputMark() != 0
 					},
@@ -809,7 +809,7 @@ func (s *ServerEndpoint) writeRouteMisses(routeMisses []*ovpn.RouteMissError) {
 	replies := make([][]byte, 0, len(routeMisses))
 	for _, routeMiss := range routeMisses {
 		sourceAddress := packetSourceAddress(routeMiss.Packet, inet4Address, inet6Address)
-		reply, built := tun.BuildUnreachable(routeMiss.Packet, sourceAddress, headroom)
+		reply, built := common.BuildICMPUnreachable(routeMiss.Packet, sourceAddress, headroom)
 		if built {
 			replies = append(replies, reply)
 		}

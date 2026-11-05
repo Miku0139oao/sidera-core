@@ -286,8 +286,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 			InterfaceFinder:        networkManager.InterfaceFinder(),
 			TableName:              "sing-box",
 			DisableNFTables:        dErr == nil && disableNFTables,
-			RouteAddressSet:        &inbound.routeAddressSet,
-			RouteExcludeAddressSet: &inbound.routeExcludeAddressSet,
+			RouteAddressSet:        inbound.routeAddressSetPrefixes,
 		})
 		if err != nil {
 			return nil, E.Cause(err, "initialize auto-redirect")
@@ -586,6 +585,23 @@ func (t *Inbound) releaseRouteRuleSets() {
 	for _, ruleSet := range t.routeExcludeRuleSet {
 		ruleSet.DecRef()
 	}
+}
+
+// routeAddressSetPrefixes returns the current route address sets in the form
+// auto-redirect expects: it resolves them on demand instead of holding a
+// pointer to the slices, so a rule-set update is picked up by the next call.
+func (t *Inbound) routeAddressSetPrefixes() (include []netip.Prefix, exclude []netip.Prefix, err error) {
+	t.routeSetAccess.Lock()
+	defer t.routeSetAccess.Unlock()
+	if !t.routeSetsActive {
+		return nil, nil, nil
+	}
+	include = common.FlatMap(t.routeAddressSet, (*netipx.IPSet).Prefixes)
+	if len(t.routeAddressSet) > 0 && len(include) == 0 {
+		include = []netip.Prefix{netip.PrefixFrom(netip.IPv4Unspecified(), 32), netip.PrefixFrom(netip.IPv6Unspecified(), 128)}
+	}
+	exclude = common.FlatMap(t.routeExcludeAddressSet, (*netipx.IPSet).Prefixes)
+	return include, exclude, nil
 }
 
 func (t *Inbound) updateRouteAddressSet(it adapter.RuleSet) {

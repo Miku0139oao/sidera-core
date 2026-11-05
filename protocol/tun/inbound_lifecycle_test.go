@@ -85,8 +85,9 @@ type tunLifecycleAutoRedirect struct {
 
 func (r *tunLifecycleAutoRedirect) Start() error { r.started.Add(1); return nil }
 func (r *tunLifecycleAutoRedirect) Close() error { r.closed.Add(1); return nil }
-func (r *tunLifecycleAutoRedirect) UpdateRouteAddressSet() {
+func (r *tunLifecycleAutoRedirect) UpdateRouteAddressSet() error {
 	r.updates.Add(1)
+	return nil
 }
 
 type tunLifecycleInterface struct {
