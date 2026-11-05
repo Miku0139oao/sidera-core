@@ -49,6 +49,10 @@ linters:
         linters:
           - staticcheck
         text: SA1019
+      - path: experimental/boxdd/peer_windows.go
+        linters:
+          - staticcheck
+        text: SA1019
       # copyPacketExact records a non-nil error before returning, so these
       # nil comparisons are unreachable by construction, not by accident.
       - path: route/conn.go
