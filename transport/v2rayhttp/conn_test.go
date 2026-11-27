@@ -95,6 +95,14 @@ func TestLateHTTPConnCloseBeforeSetup(t *testing.T) {
 	}
 }
 
+func TestLateHTTPConnReadWrapsSetupError(t *testing.T) {
+	conn := NewLateHTTPConn(&httpRecordingConn{})
+	conn.Setup(nil, io.ErrUnexpectedEOF)
+	if _, err := conn.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+		t.Fatalf("Read error = %v, want io.EOF", err)
+	}
+}
+
 func TestHTTP2WrapperClosedWriteBufferReleasesOwnership(t *testing.T) {
 	wrapper := NewHTTP2Wrapper(NewHTTPConn(bytes.NewReader(nil), io.Discard))
 	wrapper.CloseWrapper()
@@ -105,6 +113,118 @@ func TestHTTP2WrapperClosedWriteBufferReleasesOwnership(t *testing.T) {
 	}
 	if buffer.Cap() != 0 {
 		t.Fatal("closed wrapper did not release owned buffer")
+	}
+}
+
+type httpBlockingWriteConn struct {
+	entered     chan struct{}
+	release     chan struct{}
+	closedCh    chan struct{}
+	enteredOnce sync.Once
+	closeOnce   sync.Once
+	closed      atomic.Bool
+}
+
+func (c *httpBlockingWriteConn) Read([]byte) (int, error) { return 0, io.EOF }
+func (c *httpBlockingWriteConn) Write(p []byte) (int, error) {
+	c.enteredOnce.Do(func() { close(c.entered) })
+	select {
+	case <-c.release:
+		return len(p), nil
+	case <-c.closedCh:
+		return 0, net.ErrClosed
+	}
+}
+func (c *httpBlockingWriteConn) Close() error {
+	c.closeOnce.Do(func() {
+		c.closed.Store(true)
+		close(c.closedCh)
+	})
+	return nil
+}
+func (c *httpBlockingWriteConn) LocalAddr() net.Addr              { return httpTestAddr("local") }
+func (c *httpBlockingWriteConn) RemoteAddr() net.Addr             { return httpTestAddr("remote") }
+func (c *httpBlockingWriteConn) SetDeadline(time.Time) error      { return nil }
+func (c *httpBlockingWriteConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *httpBlockingWriteConn) SetWriteDeadline(time.Time) error { return nil }
+
+func newHTTPBlockingWriteConn() *httpBlockingWriteConn {
+	return &httpBlockingWriteConn{
+		entered:  make(chan struct{}),
+		release:  make(chan struct{}),
+		closedCh: make(chan struct{}),
+	}
+}
+
+func TestHTTP2WrapperCloseWaitsForInflightWrite(t *testing.T) {
+	rawConn := newHTTPBlockingWriteConn()
+	wrapper := NewHTTP2Wrapper(rawConn)
+	writeDone := make(chan error, 1)
+	go func() {
+		_, err := wrapper.Write([]byte("payload"))
+		writeDone <- err
+	}()
+	<-rawConn.entered
+
+	closeDone := make(chan struct{})
+	go func() {
+		wrapper.CloseWrapper()
+		close(closeDone)
+	}()
+	select {
+	case <-closeDone:
+		t.Fatal("CloseWrapper returned while Write was still using the connection")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(rawConn.release)
+	select {
+	case err := <-writeDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Write did not finish")
+	}
+	select {
+	case <-closeDone:
+	case <-time.After(time.Second):
+		t.Fatal("CloseWrapper did not return after Write finished")
+	}
+	if _, err := wrapper.Write([]byte("late")); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("Write after CloseWrapper error = %v, want net.ErrClosed", err)
+	}
+}
+
+func TestHTTP2WrapperCloseReleasesBlockedWrite(t *testing.T) {
+	rawConn := newHTTPBlockingWriteConn()
+	wrapper := NewHTTP2Wrapper(rawConn)
+	writeDone := make(chan error, 1)
+	go func() {
+		_, err := wrapper.Write([]byte("payload"))
+		writeDone <- err
+	}()
+	<-rawConn.entered
+
+	// Close must first tear down the underlying connection so the blocked Write
+	// is released; acquiring the write lock first would deadlock.
+	closeResult := make(chan error, 1)
+	go func() { closeResult <- wrapper.Close() }()
+	select {
+	case err := <-closeResult:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close deadlocked behind a blocked Write")
+	}
+	select {
+	case err := <-writeDone:
+		if !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("Write error = %v, want net.ErrClosed", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("blocked Write was not released by Close")
 	}
 }
 

@@ -71,10 +71,17 @@ func (c *GRPCConn) Read(b []byte) (n int, err error) {
 	select {
 	case <-c.done:
 		return 0, net.ErrClosed
+	case <-c.Context().Done():
+		// On the server side Close only cancels routing, not the gRPC stream, so
+		// watch the stream context as well instead of relying on Recv to notice.
+		// Recv itself is released once the stream ends.
+		return 0, net.ErrClosed
 	case result = <-recvResult:
 	}
 	select {
 	case <-c.done:
+		return 0, net.ErrClosed
+	case <-c.Context().Done():
 		return 0, net.ErrClosed
 	default:
 	}

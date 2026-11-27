@@ -64,11 +64,17 @@ func (s *Server) Tun(server GunService_TunServer) error {
 	}))
 	select {
 	case <-done:
-		routeCancel(nil)
+		routeCancel(net.ErrClosed)
 		conn.Close()
 		return nil
 	case <-conn.Done():
+		// The transport conn was closed by the handler (or a peer teardown).
+		// Cancel routing and wait for the handler goroutine to finish before
+		// returning, otherwise the gRPC stream is torn down mid-cleanup. Closing
+		// the conn already cancels routeContext, so a handler honoring it exits
+		// and reports onClose, which closes done.
 		routeCancel(net.ErrClosed)
+		<-done
 		return nil
 	case <-streamContext.Done():
 		cause := context.Cause(streamContext)

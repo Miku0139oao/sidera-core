@@ -167,11 +167,21 @@ func (c *Client) DialContext(ctx context.Context) (net.Conn, error) {
 		return nil, err
 	}
 	client := NewGunServiceClient(clientConn).(GunServiceCustomNameClient)
-	streamContext, cancel := context.WithCancelCause(ctx)
+	// The stream must outlive the dial context: callers such as parallel dialing
+	// cancel it once a winner is chosen. Only propagate cancellation until the
+	// stream has been created.
+	streamContext, cancel := context.WithCancelCause(context.WithoutCancel(ctx))
+	stopPropagation := context.AfterFunc(ctx, func() {
+		cancel(context.Cause(ctx))
+	})
 	stream, err := client.TunCustomName(streamContext, c.serviceName)
 	if err != nil {
+		stopPropagation()
 		cancel(err)
 		return nil, err
+	}
+	if !stopPropagation() {
+		return nil, context.Cause(ctx)
 	}
 	return NewGRPCConn(stream, cancel), nil
 }

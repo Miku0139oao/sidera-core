@@ -275,7 +275,7 @@ func (c *HTTP2Conn) Read(b []byte) (n int, err error) {
 	defer c.readAccess.Unlock()
 	reader, err := c.awaitReader()
 	if err != nil {
-		return 0, err
+		return 0, baderror.WrapH2(err)
 	}
 	n, err = reader.Read(b)
 	return n, baderror.WrapH2(err)
@@ -413,12 +413,21 @@ func (w *HTTP2ConnWrapper) WriteBuffer(buffer *buf.Buffer) error {
 }
 
 func (w *HTTP2ConnWrapper) CloseWrapper() {
+	// Serialize with Write/WriteBuffer: the h2 ResponseWriter is only valid while
+	// ServeHTTP is running, so once this returns no write may still be in flight.
+	w.access.Lock()
+	defer w.access.Unlock()
 	w.closed.Store(true)
 }
 
 func (w *HTTP2ConnWrapper) Close() error {
+	// Close the underlying connection before waiting on the write lock: an
+	// in-flight Write may be blocked on HTTP/2 flow control and only releases
+	// once the stream is torn down. Server.ServeHTTP calls CloseWrapper directly
+	// after the handler finished, where no write can still be pending.
+	closeErr := w.ExtendedConn.Close()
 	w.CloseWrapper()
-	return w.ExtendedConn.Close()
+	return closeErr
 }
 
 func (w *HTTP2ConnWrapper) Upstream() any {
