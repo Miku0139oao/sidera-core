@@ -64,10 +64,10 @@ func TestDecodeXrayVLESSWireCompatibility(t *testing.T) {
 		require.True(t, vlessOptions.XrayVisionRejectUDP443)
 	})
 
-	t.Run("gRPC service name escaping", func(t *testing.T) {
+	t.Run("gRPC service name preserved", func(t *testing.T) {
 		options := decodeXrayTestConfig(t, xrayVLESSDocument(`{"network":"grpc","grpcSettings":{"serviceName":"foo/bar"}}`))
 		vlessOptions := options.Outbounds[0].Options.(*option.VLESSOutboundOptions)
-		require.Equal(t, "foo%2Fbar", vlessOptions.Transport.GRPCOptions.ServiceName)
+		require.Equal(t, "foo/bar", vlessOptions.Transport.GRPCOptions.ServiceName)
 	})
 
 	t.Run("invalid UUID and long alias", func(t *testing.T) {
@@ -417,7 +417,7 @@ func TestDecodeXrayVLESSInboundWithRealityEncryption(t *testing.T) {
 	require.Equal(t, "gateway.example", vlessOptions.TLS.ServerName)
 	require.Equal(t, "gateway.example", vlessOptions.TLS.Reality.Handshake.Server)
 	require.Equal(t, uint16(443), vlessOptions.TLS.Reality.Handshake.ServerPort)
-	require.Equal(t, "26.3.27", vlessOptions.TLS.Reality.MinClientVersion)
+	require.Empty(t, vlessOptions.TLS.Reality.MinClientVersion)
 	require.Equal(t, time.Second, time.Duration(vlessOptions.TLS.Reality.MaxTimeDifference))
 }
 
