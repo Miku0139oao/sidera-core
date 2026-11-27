@@ -102,6 +102,30 @@ func TestTLSClientHelloSNI(t *testing.T) {
 	require.Equal(t, "www.example.com", metadata.Domain)
 }
 
+func TestTLSClientHelloSNIKeepsDomainAndDropsIPLiteral(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name   string
+		server string
+		domain string
+	}{
+		{name: "dns-name", server: "sniff.example.com", domain: "sniff.example.com"},
+		{name: "ipv4-literal", server: "192.0.2.10", domain: ""},
+		{name: "ipv6-literal", server: "2001:db8::10", domain: ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			hello := tlsClientHelloRecord(tc.server, []uint16{tls.VersionTLS13})
+			var metadata adapter.InboundContext
+			err := sniff.TLSClientHello(context.Background(), &metadata, bytes.NewReader(hello))
+			require.NoError(t, err)
+			require.Equal(t, C.ProtocolTLS, metadata.Protocol)
+			require.Equal(t, tc.domain, metadata.Domain)
+		})
+	}
+}
+
 func TestTLSClientHelloNoSNI(t *testing.T) {
 	t.Parallel()
 	hello := tlsClientHelloRecord("", []uint16{tls.VersionTLS13})
