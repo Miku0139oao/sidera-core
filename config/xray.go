@@ -726,6 +726,9 @@ func normalizeXrayUUIDOrAlias(value string) (string, error) {
 		byteOffset += groupBytes
 		text = text[groupLength:]
 	}
+	if len(text) > 0 {
+		return "", E.New("invalid Xray UUID: ", value)
+	}
 	return hex.EncodeToString(decoded[0:4]) + "-" +
 		hex.EncodeToString(decoded[4:6]) + "-" +
 		hex.EncodeToString(decoded[6:8]) + "-" +
@@ -1090,9 +1093,6 @@ func translateXrayInboundReality(source *xrayReality) (map[string]any, error) {
 	}
 	if source.MinClientVer != "" {
 		reality["min_client_version"] = source.MinClientVer
-	} else {
-		// Match Xray's default capability gate for omitted minClientVer.
-		reality["min_client_version"] = "26.3.27"
 	}
 	if source.MaxClientVer != "" {
 		reality["max_client_version"] = source.MaxClientVer
@@ -1329,7 +1329,7 @@ func translateXrayGRPC(source *xrayGRPC) (map[string]any, error) {
 	}
 	result := map[string]any{"type": "grpc"}
 	if source.ServiceName != "" {
-		result["service_name"] = url.PathEscape(source.ServiceName)
+		result["service_name"] = source.ServiceName
 	}
 	if source.IdleTimeout > 0 {
 		result["idle_timeout"] = strconv.FormatInt(int64(source.IdleTimeout), 10) + "s"
