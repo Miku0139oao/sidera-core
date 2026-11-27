@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -11,6 +12,7 @@ import (
 	box "github.com/Miku0139oao/sidera-core"
 	"github.com/Miku0139oao/sidera-core/adapter"
 	boxInbound "github.com/Miku0139oao/sidera-core/adapter/inbound"
+	boxOutbound "github.com/Miku0139oao/sidera-core/adapter/outbound"
 	boxService "github.com/Miku0139oao/sidera-core/adapter/service"
 	"github.com/Miku0139oao/sidera-core/include"
 	"github.com/Miku0139oao/sidera-core/log"
@@ -186,6 +188,56 @@ func TestBoxCloseDefersBusyManagerWithoutDeadlock(t *testing.T) {
 	}, time.Second, 10*time.Millisecond)
 }
 
+func TestBusyRetrySkipsAlreadyClosedServiceAdmission(t *testing.T) {
+	serviceRegistry := boxService.NewRegistry()
+	boxService.Register[option.StubOptions](serviceRegistry, "retry-quiescence-test", func(context.Context, log.ContextLogger, string, option.StubOptions) (adapter.Service, error) {
+		return &producerQuiescenceTestService{
+			Adapter: boxService.NewAdapter("retry-quiescence-test", "service"),
+			events:  new([]string),
+		}, nil
+	})
+	outboundRegistry := boxOutbound.NewRegistry()
+	var instance *box.Box
+	boxOutbound.Register[option.StubOptions](outboundRegistry, "retry-close-test", func(_ context.Context, _ adapter.Router, _ log.ContextLogger, tag string, _ option.StubOptions) (adapter.Outbound, error) {
+		return &reentrantCloseTestOutbound{tag: tag, instance: instance}, nil
+	})
+	ctx := include.Context(t.Context())
+	ctx = service.ContextWith[adapter.ServiceRegistry](ctx, serviceRegistry)
+	ctx = service.ContextWith[option.ServiceOptionsRegistry](ctx, serviceRegistry)
+	ctx = service.ContextWith[adapter.OutboundRegistry](ctx, outboundRegistry)
+	ctx = service.ContextWith[option.OutboundOptionsRegistry](ctx, outboundRegistry)
+	var err error
+	instance, err = box.New(box.Options{
+		Context: ctx,
+		Options: option.Options{
+			Services:  []option.Service{{Type: "retry-quiescence-test", Tag: "service", Options: &option.StubOptions{}}},
+			Outbounds: []option.Outbound{{Type: "retry-close-test", Tag: "retry", Options: &option.StubOptions{}}},
+		},
+	})
+	require.NoError(t, err)
+	retryOutbound, loaded := instance.Outbound().Outbound("retry")
+	require.True(t, loaded)
+	retryOutbound.(*reentrantCloseTestOutbound).instance = instance
+
+	// Removing the outbound closes it while its Close callback re-enters
+	// Box.Close. The service manager is finalized before the outbound manager,
+	// so the deferred retry must not replay admission against the closed
+	// service manager and record a spurious failure.
+	removeDone := make(chan error, 1)
+	go func() { removeDone <- instance.Outbound().Remove("retry") }()
+	select {
+	case <-removeDone:
+	case <-time.After(time.Second):
+		t.Fatal("outbound removal deadlocked with Box.Close reentry")
+	}
+	var closeErr error
+	require.Eventually(t, func() bool {
+		closeErr = instance.Close()
+		return closeErr != nil && strings.Contains(closeErr.Error(), "outbound")
+	}, time.Second, 10*time.Millisecond)
+	require.NotContains(t, closeErr.Error(), "service admission")
+}
+
 func TestCloseQuiescesTrafficProducersBeforeServiceFinalization(t *testing.T) {
 	var events []string
 	serviceRegistry := boxService.NewRegistry()
@@ -327,6 +379,30 @@ type boxReentryTestInbound struct {
 
 func (i *boxReentryTestInbound) Start(adapter.StartStage) error { return nil }
 func (i *boxReentryTestInbound) Close() error                   { return i.closeFunc() }
+
+type reentrantCloseTestOutbound struct {
+	adapter.Outbound
+	tag      string
+	instance *box.Box
+}
+
+func (o *reentrantCloseTestOutbound) Type() string           { return "retry-close-test" }
+func (o *reentrantCloseTestOutbound) Tag() string            { return o.tag }
+func (o *reentrantCloseTestOutbound) Network() []string      { return nil }
+func (o *reentrantCloseTestOutbound) Dependencies() []string { return nil }
+func (o *reentrantCloseTestOutbound) Start(adapter.StartStage) error {
+	return nil
+}
+func (o *reentrantCloseTestOutbound) Close() error {
+	result := make(chan error, 1)
+	go func() { result <- o.instance.Close() }()
+	select {
+	case err := <-result:
+		return err
+	case <-time.After(time.Second):
+		return errors.New("Box.Close deadlocked during outbound close")
+	}
+}
 
 type producerQuiescenceTestService struct {
 	boxService.Adapter
