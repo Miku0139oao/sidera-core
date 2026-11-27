@@ -245,6 +245,18 @@ func (s *Service) handleWebSocket(w http.ResponseWriter, r *http.Request, proxyP
 	waitGroup.Wait()
 }
 
+// extendWebSocketIdleDeadlines refreshes the idle read deadline in both
+// directions. Traffic in either direction proves the session is alive: an
+// upstream response stream is long and one-directional, so arming a deadline
+// only on the direction that last produced a frame would tear down healthy
+// sessions mid-response. Extending the opposite direction also lets a slow
+// first upstream frame be covered by the client's request activity.
+func extendWebSocketIdleDeadlines(clientConn net.Conn, upstreamConn net.Conn) {
+	deadline := time.Now().Add(webSocketIdleTimeout)
+	_ = clientConn.SetReadDeadline(deadline)
+	_ = upstreamConn.SetReadDeadline(deadline)
+}
+
 func (s *Service) proxyWebSocketClientToUpstream(clientConn net.Conn, upstreamConn net.Conn, modelChannel chan<- string) {
 	for {
 		data, opCode, err := readBoundedWebSocketData(clientConn, ws.StateServerSide)
@@ -254,7 +266,7 @@ func (s *Service) proxyWebSocketClientToUpstream(clientConn net.Conn, upstreamCo
 			}
 			return
 		}
-		_ = clientConn.SetReadDeadline(time.Now().Add(webSocketIdleTimeout))
+		extendWebSocketIdleDeadlines(clientConn, upstreamConn)
 
 		if opCode == ws.OpText && s.usageTracker != nil {
 			var request struct {
@@ -289,7 +301,7 @@ func (s *Service) proxyWebSocketUpstreamToClient(upstreamReadWriter io.ReadWrite
 			}
 			return
 		}
-		_ = upstreamConn.SetReadDeadline(time.Now().Add(webSocketIdleTimeout))
+		extendWebSocketIdleDeadlines(clientConn, upstreamConn)
 
 		if opCode == ws.OpText && s.usageTracker != nil {
 			select {

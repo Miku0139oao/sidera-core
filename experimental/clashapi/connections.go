@@ -21,6 +21,11 @@ import (
 	"github.com/gofrs/uuid/v5"
 )
 
+// maxConnectionsIntervalMilliseconds bounds the websocket snapshot interval.
+// Beyond this the time.Millisecond conversion at the ticker would either
+// overflow int64 or create an impractically slow stream.
+const maxConnectionsIntervalMilliseconds = int64(24 * time.Hour / time.Millisecond)
+
 func connectionRouter(ctx context.Context, network adapter.NetworkManager, trafficManager *trafficcontrol.Manager) http.Handler {
 	r := chi.NewRouter()
 	r.Get("/", getConnections(ctx, trafficManager))
@@ -115,7 +120,7 @@ func getConnections(ctx context.Context, trafficManager *trafficcontrol.Manager)
 		interval := 1000
 		if intervalStr != "" {
 			parsedInterval, parseErr := strconv.Atoi(intervalStr)
-			if parseErr != nil || parsedInterval <= 0 {
+			if parseErr != nil || parsedInterval <= 0 || int64(parsedInterval) > maxConnectionsIntervalMilliseconds {
 				render.Status(r, http.StatusBadRequest)
 				render.JSON(w, r, ErrBadRequest)
 				return

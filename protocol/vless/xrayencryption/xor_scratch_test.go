@@ -167,15 +167,15 @@ func TestXorConnWriteShortWrites(t *testing.T) {
 	}
 }
 
-func TestXorConnWriteFailureCount(t *testing.T) {
+func TestXorConnWriteFailureIsFailClosed(t *testing.T) {
 	sentinel := errors.New("write failed")
 	input := xorTestRecord(t, 17)
 	original := append([]byte(nil), input...)
 	sink := &shortWriteConn{maxWrite: 4, firstError: sentinel}
 	conn := NewXorConn(sink, NewCTR(xorTestKeyIV()), nil, 0, 0)
 	n, err := conn.Write(input)
-	if n != 4 || !errors.Is(err, sentinel) {
-		t.Fatalf("partial Write = %d, %v, want 4, sentinel", n, err)
+	if n != 0 || !errors.Is(err, sentinel) {
+		t.Fatalf("failed Write = %d, %v, want 0, sentinel (keystream cannot be rewound)", n, err)
 	}
 	if !bytes.Equal(input, original) {
 		t.Fatal("failed write mutated caller input")

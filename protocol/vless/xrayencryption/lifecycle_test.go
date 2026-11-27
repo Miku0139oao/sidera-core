@@ -363,7 +363,7 @@ func TestWritesAreImmutableAndHandleShortWrites(t *testing.T) {
 		}
 	})
 
-	t.Run("partial error count", func(t *testing.T) {
+	t.Run("partial error is fail-closed", func(t *testing.T) {
 		sentinel := errors.New("write failed")
 		sink := &shortWriteConn{maxWrite: 4, firstError: sentinel}
 		input := make([]byte, 5+17)
@@ -371,8 +371,8 @@ func TestWritesAreImmutableAndHandleShortWrites(t *testing.T) {
 		original := append([]byte(nil), input...)
 		conn := NewXorConn(sink, NewCTR(bytes.Repeat([]byte{1}, 32), bytes.Repeat([]byte{2}, 16)), nil, 0, 0)
 		n, err := conn.Write(input)
-		if n != 4 || !errors.Is(err, sentinel) {
-			t.Fatalf("partial Write = %d, %v, want 4, sentinel", n, err)
+		if n != 0 || !errors.Is(err, sentinel) {
+			t.Fatalf("partial Write = %d, %v, want 0, sentinel (keystream cannot be rewound)", n, err)
 		}
 		if !bytes.Equal(input, original) {
 			t.Fatal("failed random-mode write mutated caller input")

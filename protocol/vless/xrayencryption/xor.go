@@ -104,7 +104,14 @@ func (c *XorConn) Write(b []byte) (int, error) {
 		c.CTR.XORKeyStream(remaining[:need], remaining[:need])
 		remaining = remaining[need:]
 	}
-	return writeFullCount(c.Conn, encoded)
+	// The CTR keystream and OutSkip/OutHeader state have already been advanced
+	// over the whole buffer, so a partial write cannot be resumed without
+	// desynchronizing the stream. Report a fail-closed error with no progress
+	// instead of a partial count that invites a retry.
+	if err := writeFull(c.Conn, encoded); err != nil {
+		return 0, err
+	}
+	return len(b), nil
 }
 
 func (c *XorConn) Read(b []byte) (int, error) {
