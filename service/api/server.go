@@ -168,14 +168,22 @@ func (s *Service) Start(stage adapter.StartStage) error {
 }
 
 // CommitRuntime persists state that is valid only after the complete Box has
-// started successfully.
+// started successfully and starts dashboard management workers. ActivateRuntime
+// cannot report errors, so admin startup must happen here: a failure fails the
+// runtime commit (and Box start) instead of being logged while the API later
+// reports success with dead dashboard management.
 func (s *Service) CommitRuntime() error {
-	if s.admin != nil {
-		rollback, err := s.admin.markServerProfilesApplied()
-		if err != nil {
-			return err
-		}
-		s.runtimeRollback = rollback
+	if s.admin == nil {
+		return nil
+	}
+	rollback, err := s.admin.markServerProfilesApplied()
+	if err != nil {
+		return err
+	}
+	s.runtimeRollback = rollback
+	if err = s.admin.start(); err != nil {
+		rollbackErr := s.RollbackRuntime()
+		return errors.Join(E.Cause(err, "start dashboard management"), rollbackErr)
 	}
 	return nil
 }
@@ -198,11 +206,6 @@ func (s *Service) ValidateRuntimeActivation() error {
 
 func (s *Service) ActivateRuntime() {
 	s.runtimeRollback = nil
-	if s.admin != nil {
-		if err := s.admin.start(); err != nil {
-			s.logger.Error("start dashboard management: ", err)
-		}
-	}
 	tcpListener := s.tcpListener
 	s.tcpListener = nil
 	s.serveWorkers.Add(1)
