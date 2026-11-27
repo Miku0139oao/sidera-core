@@ -8,7 +8,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -87,15 +86,14 @@ func NewHTTPS(ctx context.Context, logger log.ContextLogger, tag string, options
 			host = options.Server
 		}
 	}
-	destinationURL := url.URL{
-		Scheme: "https",
-		Host:   host,
-	}
-	if destinationURL.Host == "" {
-		destinationURL.Host = options.Server
-	}
+	destinationAddress := M.ParseSocksaddrHostPort(host, options.ServerPort)
+	destinationURL := url.URL{Scheme: "https"}
 	if options.ServerPort != 0 && options.ServerPort != 443 {
-		destinationURL.Host = net.JoinHostPort(destinationURL.Host, strconv.Itoa(int(options.ServerPort)))
+		destinationURL.Host = destinationAddress.String()
+	} else if destinationAddress.IsIPv6() {
+		destinationURL.Host = "[" + destinationAddress.AddrString() + "]"
+	} else {
+		destinationURL.Host = destinationAddress.AddrString()
 	}
 	path := options.Path
 	if path == "" {

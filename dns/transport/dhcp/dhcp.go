@@ -101,7 +101,11 @@ func (t *Transport) Start(stage adapter.StartStage) error {
 		return nil
 	}
 	if t.interfaceName == "" {
-		t.interfaceCallback = t.networkManager.InterfaceMonitor().RegisterCallback(t.interfaceUpdated)
+		interfaceMonitor := t.networkManager.InterfaceMonitor()
+		if interfaceMonitor == nil {
+			return E.New("missing monitor for auto DHCP, set route.auto_detect_interface")
+		}
+		t.interfaceCallback = interfaceMonitor.RegisterCallback(t.interfaceUpdated)
 	}
 	go func() {
 		err := t.fetch()
@@ -118,7 +122,9 @@ func (t *Transport) Start(stage adapter.StartStage) error {
 
 func (t *Transport) Close() error {
 	if t.interfaceCallback != nil {
-		t.networkManager.InterfaceMonitor().UnregisterCallback(t.interfaceCallback)
+		if interfaceMonitor := t.networkManager.InterfaceMonitor(); interfaceMonitor != nil {
+			interfaceMonitor.UnregisterCallback(t.interfaceCallback)
+		}
 	}
 	t.transportLock.Lock()
 	defer t.transportLock.Unlock()
