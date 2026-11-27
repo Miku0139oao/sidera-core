@@ -22,6 +22,7 @@ import (
 
 	mDNS "github.com/miekg/dns"
 	"golang.org/x/crypto/cryptobyte"
+	"golang.org/x/sync/singleflight"
 )
 
 func parseECHClientConfig(ctx context.Context, clientConfig ECHCapableConfig, options option.OutboundTLSOptions) (Config, error) {
@@ -50,12 +51,12 @@ func parseECHClientConfig(ctx context.Context, clientConfig ECHCapableConfig, op
 			return nil, E.New("invalid ECH configs pem")
 		}
 		config.updateECHConfigLocked(block.Bytes)
-		return config, nil
+		return wrapECHClientConfig(config), nil
 	}
 
 	config.dynamic = true
 	config.dnsRouter = service.FromContext[adapter.DNSRouter](ctx)
-	return config, nil
+	return wrapECHClientConfig(config), nil
 }
 
 func parseECHServerConfig(ctx context.Context, options option.InboundTLSOptions, tlsConfig *tls.Config, echKeyPath *string) error {
@@ -121,6 +122,38 @@ type ECHClientConfig struct {
 	retryPending    bool
 	lastTTL         time.Duration
 	lastUpdate      time.Time
+	fetchGroup      singleflight.Group
+}
+
+// echClientConfigWithSessionIDGenerator preserves the WithSessionIDGenerator
+// capability of the wrapped config, required by the ShadowTLS v3 outbound,
+// while keeping the ECH config generations managed by ECHClientConfig.
+type echClientConfigWithSessionIDGenerator struct {
+	*ECHClientConfig
+}
+
+func (s *echClientConfigWithSessionIDGenerator) SetSessionIDGenerator(generator func(clientHello []byte, sessionID []byte) error) {
+	// This only assigns a field, so holding the config lock across it cannot
+	// block on I/O; it keeps the write ordered with generation cloning.
+	s.access.Lock()
+	defer s.access.Unlock()
+	if idConfig, loaded := s.config.(WithSessionIDGenerator); loaded {
+		idConfig.SetSessionIDGenerator(generator)
+	}
+}
+
+func (s *echClientConfigWithSessionIDGenerator) Clone() Config {
+	return &echClientConfigWithSessionIDGenerator{s.ECHClientConfig.Clone().(*ECHClientConfig)}
+}
+
+// wrapECHClientConfig exposes the optional capabilities of the wrapped config.
+// Session ID generation is only advertised when the underlying config supports
+// it, so the STDConfig fallback in ShadowTLS keeps working for std configs.
+func wrapECHClientConfig(config *ECHClientConfig) Config {
+	if _, loaded := config.config.(WithSessionIDGenerator); loaded {
+		return &echClientConfigWithSessionIDGenerator{ECHClientConfig: config}
+	}
+	return config
 }
 
 func (s *ECHClientConfig) ServerName() string {
@@ -236,25 +269,72 @@ func (s *ECHClientConfig) updateECHConfigLocked(configList []byte) {
 	s.config = config
 }
 
+type echFetchContextKey struct{}
+
 func (s *ECHClientConfig) configForHandshake(ctx context.Context) (ECHCapableConfig, error) {
 	s.access.Lock()
-	defer s.access.Unlock()
-
 	if s.retryPending {
 		s.retryPending = false
-		return s.config, nil
+		config := s.config
+		s.access.Unlock()
+		return config, nil
 	}
 	if !s.dynamic {
-		return s.config, nil
+		config := s.config
+		s.access.Unlock()
+		return config, nil
 	}
 	if len(s.config.ECHConfigList()) != 0 && s.lastTTL != 0 && time.Since(s.lastUpdate) <= s.lastTTL {
-		return s.config, nil
+		config := s.config
+		s.access.Unlock()
+		return config, nil
 	}
-
 	queryServerName := s.queryServerName
 	if queryServerName == "" {
 		queryServerName = s.config.ServerName()
 	}
+	s.access.Unlock()
+
+	// A DNS query made by this config may dial through this same TLS config
+	// (for example a DoH transport). Reentering singleflight.Do for the same
+	// group would wait on itself, so fetch directly in that case.
+	if ctx.Value(echFetchContextKey{}) == s {
+		return s.fetchECHConfigList(ctx, queryServerName)
+	}
+	// The shared fetch must not inherit any single caller's cancellation: a
+	// leader whose handshake is torn down would otherwise fail every waiter
+	// even though their own contexts are alive. Keep the context values (the
+	// reentrancy marker) and let the DNS client's own timeout bound the query.
+	fetchCtx := context.WithValue(context.WithoutCancel(ctx), echFetchContextKey{}, s)
+	fetchResult := s.fetchGroup.DoChan("config", func() (any, error) {
+		return s.fetchECHConfigList(fetchCtx, queryServerName)
+	})
+	select {
+	case result := <-fetchResult:
+		if result.Err != nil {
+			// A transient refresh failure must not invalidate a usable cached
+			// list; only fail when no list is available at all.
+			if cached, loaded := s.cachedECHConfig(); loaded {
+				return cached, nil
+			}
+			return nil, result.Err
+		}
+		return result.Val.(ECHCapableConfig), nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (s *ECHClientConfig) cachedECHConfig() (ECHCapableConfig, bool) {
+	s.access.Lock()
+	defer s.access.Unlock()
+	if len(s.config.ECHConfigList()) == 0 {
+		return nil, false
+	}
+	return s.config, true
+}
+
+func (s *ECHClientConfig) fetchECHConfigList(ctx context.Context, queryServerName string) (ECHCapableConfig, error) {
 	message := &mDNS.Msg{
 		MsgHdr: mDNS.MsgHdr{
 			RecursionDesired: true,
@@ -267,6 +347,8 @@ func (s *ECHClientConfig) configForHandshake(ctx context.Context) (ECHCapableCon
 			},
 		},
 	}
+	// Never hold s.access across this call: it may block for the DNS round
+	// trip and may even dial back through this same TLS config.
 	response, err := s.dnsRouter.Exchange(ctx, message, adapter.DNSQueryOptions{})
 	if err != nil {
 		return nil, E.Cause(err, "fetch ECH config list")
@@ -275,27 +357,42 @@ func (s *ECHClientConfig) configForHandshake(ctx context.Context) (ECHCapableCon
 		return nil, E.Cause(dns.RcodeError(response.Rcode), "fetch ECH config list")
 	}
 
-	var found bool
+	var (
+		echConfigList []byte
+		ttl           time.Duration
+		found         bool
+	)
 match:
 	for _, rr := range response.Answer {
 		switch resource := rr.(type) {
 		case *mDNS.HTTPS:
 			for _, value := range resource.Value {
 				if value.Key().String() == "ech" {
-					echConfigList, err := base64.StdEncoding.DecodeString(value.String())
+					decoded, err := base64.StdEncoding.DecodeString(value.String())
 					if err != nil {
 						return nil, E.Cause(err, "decode ECH config")
 					}
-					s.lastTTL = time.Duration(rr.Header().Ttl) * time.Second
-					s.lastUpdate = time.Now()
-					s.updateECHConfigLocked(echConfigList)
+					echConfigList = decoded
+					ttl = time.Duration(rr.Header().Ttl) * time.Second
 					found = true
 					break match
 				}
 			}
 		}
 	}
-	if !found || len(s.config.ECHConfigList()) == 0 {
+
+	s.access.Lock()
+	defer s.access.Unlock()
+	// A server-provided retry list is newer than this DNS response; do not
+	// overwrite it.
+	if found && !s.retryPending {
+		s.lastTTL = ttl
+		s.lastUpdate = time.Now()
+		s.updateECHConfigLocked(echConfigList)
+	}
+	// A refresh that returned no ECH record keeps the previously fetched list;
+	// only fail when no list is available at all.
+	if len(s.config.ECHConfigList()) == 0 {
 		return nil, E.New("no ECH config found in DNS records")
 	}
 	return s.config, nil

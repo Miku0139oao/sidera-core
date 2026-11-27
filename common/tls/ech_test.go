@@ -5,6 +5,7 @@ package tls
 import (
 	"context"
 	stdTLS "crypto/tls"
+	"encoding/pem"
 	"net"
 	"net/netip"
 	"runtime"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Miku0139oao/sidera-core/adapter"
+	"github.com/Miku0139oao/sidera-core/option"
 
 	mDNS "github.com/miekg/dns"
 )
@@ -171,6 +173,7 @@ func (c *echTestConn) ConnectionState() ConnectionState { return ConnectionState
 
 type echTestDNSRouter struct {
 	config  []byte
+	empty   bool
 	queries atomic.Int32
 }
 
@@ -180,6 +183,9 @@ func (r *echTestDNSRouter) Exchange(_ context.Context, message *mDNS.Msg, _ adap
 	r.queries.Add(1)
 	response := new(mDNS.Msg)
 	response.SetReply(message)
+	if r.empty {
+		return response, nil
+	}
 	response.Answer = []mDNS.RR{
 		&mDNS.HTTPS{SVCB: mDNS.SVCB{
 			Hdr:      mDNS.RR_Header{Name: message.Question[0].Name, Rrtype: mDNS.TypeHTTPS, Class: mDNS.ClassINET, Ttl: 60},
@@ -202,3 +208,156 @@ func (r *echTestDNSRouter) Lookup(context.Context, string, adapter.DNSQueryOptio
 func (r *echTestDNSRouter) ClearCache()                                    {}
 func (r *echTestDNSRouter) LookupReverseMapping(netip.Addr) (string, bool) { return "", false }
 func (r *echTestDNSRouter) ResetNetwork()                                  {}
+
+func TestECHClientConfigPreservesSessionIDGenerator(t *testing.T) {
+	echConfigPEM := pem.EncodeToMemory(&pem.Block{Type: "ECH CONFIGS", Bytes: []byte{1, 2, 3, 4}})
+	options := option.OutboundTLSOptions{
+		ECH: &option.OutboundECHOptions{
+			Enabled: true,
+			Config:  []string{string(echConfigPEM)},
+		},
+	}
+
+	// Mirror protocol/shadowtls/outbound.go: a config that supports
+	// SetSessionIDGenerator must keep being discoverable through the wrapper.
+	t.Run("generator capability is forwarded", func(t *testing.T) {
+		config, err := parseECHClientConfig(context.Background(), &echSessionIDTestConfig{serverName: "public.example"}, options)
+		if err != nil {
+			t.Fatalf("parse ECH client config: %v", err)
+		}
+		idConfig, loaded := config.(WithSessionIDGenerator)
+		if !loaded {
+			t.Fatalf("%T does not implement WithSessionIDGenerator", config)
+		}
+		generator := func([]byte, []byte) error { return nil }
+		idConfig.SetSessionIDGenerator(generator)
+
+		wrapper, loaded := config.(*echClientConfigWithSessionIDGenerator)
+		if !loaded {
+			t.Fatalf("%T is not the capability-preserving wrapper", config)
+		}
+		wrapper.access.Lock()
+		inner := wrapper.config
+		wrapper.access.Unlock()
+		innerConfig, loaded := inner.(*echSessionIDTestConfig)
+		if !loaded {
+			t.Fatalf("wrapped config = %T", inner)
+		}
+		if innerConfig.generator == nil {
+			t.Fatal("SetSessionIDGenerator was not forwarded to the wrapped config")
+		}
+		if _, loaded = config.Clone().(WithSessionIDGenerator); !loaded {
+			t.Fatalf("clone of %T lost WithSessionIDGenerator", config)
+		}
+	})
+
+	// A std-backed config must not advertise the uTLS-only capability, or the
+	// ShadowTLS outbound would skip its STDConfig fallback.
+	t.Run("std config keeps fallback", func(t *testing.T) {
+		config, err := parseECHClientConfig(context.Background(), &echTestConfig{serverName: "public.example"}, options)
+		if err != nil {
+			t.Fatalf("parse ECH client config: %v", err)
+		}
+		if _, loaded := config.(WithSessionIDGenerator); loaded {
+			t.Fatalf("%T advertises WithSessionIDGenerator for a std config", config)
+		}
+		if _, err = config.STDConfig(); err != nil {
+			t.Fatalf("STDConfig fallback failed: %v", err)
+		}
+	})
+}
+
+func TestECHRefreshFallsBackToCachedConfig(t *testing.T) {
+	cached := []byte("cached ECH config")
+	config := &ECHClientConfig{
+		config:     &echTestConfig{serverName: "public.example", echConfig: append([]byte(nil), cached...)},
+		dnsRouter:  &echTestDNSRouter{empty: true},
+		dynamic:    true,
+		lastTTL:    time.Hour,
+		lastUpdate: time.Time{},
+	}
+
+	generation, err := config.configForHandshake(context.Background())
+	if err != nil {
+		t.Fatalf("refresh without an ECH record failed despite a cached config: %v", err)
+	}
+	if got := string(generation.ECHConfigList()); got != string(cached) {
+		t.Fatalf("returned config = %q, want cached %q", got, cached)
+	}
+}
+
+func TestECHRefreshWithoutAnyConfigFails(t *testing.T) {
+	config := &ECHClientConfig{
+		config:    &echTestConfig{serverName: "public.example"},
+		dnsRouter: &echTestDNSRouter{empty: true},
+		dynamic:   true,
+	}
+
+	if _, err := config.configForHandshake(context.Background()); err == nil {
+		t.Fatal("refresh without any ECH config unexpectedly succeeded")
+	}
+}
+
+func TestECHRefreshDoesNotHoldAccessLock(t *testing.T) {
+	cached := []byte("cached ECH config")
+	config := &ECHClientConfig{
+		config:     &echTestConfig{serverName: "public.example", echConfig: append([]byte(nil), cached...)},
+		dynamic:    true,
+		lastTTL:    time.Hour,
+		lastUpdate: time.Time{},
+	}
+	router := &echLockProbeDNSRouter{
+		echTestDNSRouter: echTestDNSRouter{config: []byte("fresh ECH config")},
+		owner:            config,
+	}
+	config.dnsRouter = router
+
+	if _, err := config.configForHandshake(context.Background()); err != nil {
+		t.Fatalf("refresh failed: %v", err)
+	}
+	if router.lockHeld.Load() {
+		t.Fatal("dnsRouter.Exchange was called while the access mutex was held")
+	}
+}
+
+type echSessionIDTestConfig struct {
+	serverName string
+	echConfig  []byte
+	generator  func([]byte, []byte) error
+}
+
+func (c *echSessionIDTestConfig) ServerName() string                { return c.serverName }
+func (c *echSessionIDTestConfig) SetServerName(serverName string)   { c.serverName = serverName }
+func (c *echSessionIDTestConfig) NextProtos() []string              { return nil }
+func (c *echSessionIDTestConfig) SetNextProtos([]string)            {}
+func (c *echSessionIDTestConfig) HandshakeTimeout() time.Duration   { return 0 }
+func (c *echSessionIDTestConfig) SetHandshakeTimeout(time.Duration) {}
+func (c *echSessionIDTestConfig) STDConfig() (*STDConfig, error)    { return &stdTLS.Config{}, nil }
+func (c *echSessionIDTestConfig) ECHConfigList() []byte             { return c.echConfig }
+func (c *echSessionIDTestConfig) SetECHConfigList(config []byte) {
+	c.echConfig = append(c.echConfig[:0], config...)
+}
+func (c *echSessionIDTestConfig) Clone() Config {
+	cloned := *c
+	cloned.echConfig = append([]byte(nil), c.echConfig...)
+	return &cloned
+}
+func (c *echSessionIDTestConfig) Client(net.Conn) (Conn, error) { return nil, nil }
+func (c *echSessionIDTestConfig) SetSessionIDGenerator(generator func([]byte, []byte) error) {
+	c.generator = generator
+}
+
+type echLockProbeDNSRouter struct {
+	echTestDNSRouter
+	owner    *ECHClientConfig
+	lockHeld atomic.Bool
+}
+
+func (r *echLockProbeDNSRouter) Exchange(ctx context.Context, message *mDNS.Msg, options adapter.DNSQueryOptions) (*mDNS.Msg, error) {
+	if r.owner.access.TryLock() {
+		r.owner.access.Unlock()
+	} else {
+		r.lockHeld.Store(true)
+	}
+	return r.echTestDNSRouter.Exchange(ctx, message, options)
+}

@@ -34,6 +34,7 @@ import (
 	"github.com/sagernet/sing/common/debug"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
+	M "github.com/sagernet/sing/common/metadata"
 	"github.com/sagernet/sing/common/ntp"
 	aTLS "github.com/sagernet/sing/common/tls"
 
@@ -233,7 +234,11 @@ func populateRealitySessionID(sessionID []byte, now time.Time, shortID [8]byte) 
 	if len(sessionID) < 16 {
 		return
 	}
-	// Keep the capability version aligned with the pinned Xray baseline.
+	// REALITY capability version. 26.7.11 matches core.Version_x/y/z of the
+	// Xray development snapshot pinned in UPSTREAM.md
+	// (6e3322d219140a025285ded1114fe17a5edb74d8). The v26.3.27 stable baseline
+	// sends 26.3.27, so servers gating max_client_ver below this value reject
+	// this client; bump only together with the pinned snapshot.
 	sessionID[0] = 26
 	sessionID[1] = 7
 	sessionID[2] = 11
@@ -280,7 +285,12 @@ func realityClientFallback(ctx context.Context, configContext context.Context, u
 	}
 	defer transport.CloseIdleConnections()
 	client := &http.Client{Transport: transport}
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://"+serverName+"/", nil)
+	serverAddress := M.ParseSocksaddrHostPort(serverName, 0)
+	host := serverAddress.AddrString()
+	if serverAddress.IsIPv6() {
+		host = "[" + host + "]"
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://"+host+"/", nil)
 	if err != nil {
 		return err
 	}
@@ -391,5 +401,5 @@ func (c *realityClientConnWrapper) ReaderReplaceable() bool {
 }
 
 func (c *realityClientConnWrapper) WriterReplaceable() bool {
-	return true
+	return false
 }
