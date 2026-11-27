@@ -68,6 +68,9 @@ type Box struct {
 	closeErr            error
 	closing             bool
 	closed              bool
+	closeStep           int
+	closeAccum          error
+	closeRetries        int
 	beforeRuntimeCommit func() (func() error, error)
 }
 
@@ -666,7 +669,19 @@ func (s *Box) start() error {
 }
 
 func (s *Box) Close() (err error) {
-	var retryClose bool
+	// An explicit Close starts a fresh fast-retry budget; the background retry
+	// chain calls closeInternal directly so it cannot reset the budget itself.
+	s.closeAccess.Lock()
+	s.closeRetries = 0
+	s.closeAccess.Unlock()
+	return s.closeInternal()
+}
+
+func (s *Box) closeInternal() (err error) {
+	var (
+		retryClose bool
+		retryDelay time.Duration
+	)
 	s.closeAccess.Lock()
 	if s.closed {
 		closeErr := s.closeErr
@@ -687,15 +702,32 @@ func (s *Box) Close() (err error) {
 		s.closeAccess.Lock()
 		s.closing = false
 		if retryClose {
+			// Teardown is still running in the background: do not finalize the
+			// Box as closed with a failure result. The accumulated errors from
+			// resources already released are kept for the final Close result.
 			s.closeErr = nil
 			s.closed = false
+			s.closeRetries++
+			// Keep rescheduling so a busy manager that clears later still
+			// completes teardown, but back off after the fast-retry budget so a
+			// stuck manager is not polled every 10ms. A later explicit Close
+			// resets the budget.
+			retryDelay = closeRetryDelay
+			if s.closeRetries > maxCloseRetries {
+				retryDelay = closeRetrySlowDelay
+				if s.closeRetries == maxCloseRetries+1 {
+					s.logger.Warn("close deferred: manager still busy, retrying with backoff")
+				}
+			}
 		} else {
-			s.closeErr = err
+			s.closeErr = s.closeAccum
+			s.closeAccum = nil
 			s.closed = true
+			s.closeRetries = 0
 		}
 		s.closeAccess.Unlock()
 		if retryClose {
-			time.AfterFunc(10*time.Millisecond, func() { _ = s.Close() })
+			time.AfterFunc(retryDelay, func() { _ = s.closeInternal() })
 		}
 		if panicValue != nil {
 			panic(panicValue)
@@ -709,7 +741,66 @@ func (s *Box) Close() (err error) {
 	if closePanic != nil {
 		panic(closePanic)
 	}
+	if retryClose {
+		return err
+	}
+	// Report every error observed across this teardown, including resources
+	// closed by an earlier attempt that deferred a busy manager.
+	err = s.accumulatedCloseError()
 	return err
+}
+
+const (
+	closeRetryDelay     = 10 * time.Millisecond
+	closeRetrySlowDelay = time.Second
+	maxCloseRetries     = 100
+)
+
+// close step indexes let a deferred Close resume after a busy manager instead
+// of replaying children that were already released. The order must match the
+// calls in closeResources.
+const (
+	closeStepDebugServer = iota
+	closeStepServiceAdmission
+	closeStepInbound
+	closeStepConnection
+	closeStepServiceFinalize
+	closeStepCertificateProvider
+	closeStepEndpoint
+	closeStepOutbound
+	closeStepRouter
+	closeStepDNSRouter
+	closeStepDNSTransport
+	closeStepNetwork
+	closeStepHTTPClient
+	closeStepInternalServices
+	closeStepLogger
+)
+
+func (s *Box) closeStepValue() int {
+	s.closeAccess.Lock()
+	defer s.closeAccess.Unlock()
+	return s.closeStep
+}
+
+func (s *Box) advanceCloseStep(step int) {
+	s.closeAccess.Lock()
+	if step > s.closeStep {
+		s.closeStep = step
+	}
+	s.closeAccess.Unlock()
+}
+
+func (s *Box) accumulatedCloseError() error {
+	s.closeAccess.Lock()
+	defer s.closeAccess.Unlock()
+	return s.closeAccum
+}
+
+func (s *Box) recordCloseAccumulated(err error) {
+	s.closeAccess.Lock()
+	s.closeAccum = errors.Join(s.closeAccum, err)
+	s.closeAccess.Unlock()
 }
 
 func (s *Box) closeResources() (firstPanic any, err error) {
@@ -717,25 +808,41 @@ func (s *Box) closeResources() (firstPanic any, err error) {
 		close(s.done)
 		s.done = nil
 	}
+	step := s.closeStepValue()
 	recordCloseResult := func(name string, panicValue any, childErr error) {
 		if childErr != nil {
-			err = errors.Join(err, E.Cause(childErr, "close ", name))
+			childErr = E.Cause(childErr, "close ", name)
+			err = errors.Join(err, childErr)
+			s.recordCloseAccumulated(childErr)
 		}
 		if panicValue != nil {
 			if firstPanic == nil {
 				firstPanic = panicValue
 			} else {
-				err = errors.Join(err, E.New("additional panic while closing ", name, ": ", panicValue))
+				additional := E.New("additional panic while closing ", name, ": ", panicValue)
+				err = errors.Join(err, additional)
+				s.recordCloseAccumulated(additional)
 			}
 		}
 	}
-	closeResource := func(name string, closeFunc func() error) {
+	runClose := func(name string, closeFunc func() error) {
 		done := adapter.LogElapsed(s.logger, "close ", name)
 		panicValue, childErr := closeBoxResource(closeFunc)
 		done()
 		recordCloseResult(name, panicValue, childErr)
 	}
-	closeManagerResource := func(name string, closeFunc func() error) bool {
+	closeResource := func(stepIndex int, name string, closeFunc func() error) {
+		if stepIndex < step {
+			return
+		}
+		runClose(name, closeFunc)
+		step = stepIndex + 1
+		s.advanceCloseStep(step)
+	}
+	closeManagerResource := func(stepIndex int, name string, closeFunc func() error) bool {
+		if stepIndex < step {
+			return true
+		}
 		done := adapter.LogElapsed(s.logger, "close ", name)
 		panicValue, childErr := closeBoxResource(closeFunc)
 		done()
@@ -743,56 +850,62 @@ func (s *Box) closeResources() (firstPanic any, err error) {
 			return false
 		}
 		recordCloseResult(name, panicValue, childErr)
+		step = stepIndex + 1
+		s.advanceCloseStep(step)
 		return true
 	}
 	if s.debugHTTPServer != nil {
-		closeResource("debug HTTP server", s.debugHTTPServer.Close)
+		closeResource(closeStepDebugServer, "debug HTTP server", s.debugHTTPServer.Close)
 		s.debugHTTPServer = nil
 	}
-	if s.service != nil && !closeManagerResource("service admission", s.service.StopAdmission) {
-		return firstPanic, adapter.ErrLifecycleBusy
+	if s.service != nil && !closeManagerResource(closeStepServiceAdmission, "service admission", s.service.StopAdmission) {
+		return firstPanic, errors.Join(s.accumulatedCloseError(), adapter.ErrLifecycleBusy)
 	}
-	if s.inbound != nil && !closeManagerResource("inbound", s.inbound.Close) {
-		return firstPanic, adapter.ErrLifecycleBusy
+	if s.inbound != nil && !closeManagerResource(closeStepInbound, "inbound", s.inbound.Close) {
+		return firstPanic, errors.Join(s.accumulatedCloseError(), adapter.ErrLifecycleBusy)
 	}
 	if s.connection != nil {
-		closeResource("connection", s.connection.Close)
+		closeResource(closeStepConnection, "connection", s.connection.Close)
 		s.connection = nil
 	}
-	if s.service != nil && !closeManagerResource("service", s.service.CloseAfterProducerQuiescence) {
-		return firstPanic, adapter.ErrLifecycleBusy
+	if s.service != nil && !closeManagerResource(closeStepServiceFinalize, "service", s.service.CloseAfterProducerQuiescence) {
+		return firstPanic, errors.Join(s.accumulatedCloseError(), adapter.ErrLifecycleBusy)
 	}
-	if s.certificateProvider != nil && !closeManagerResource("certificate-provider", s.certificateProvider.Close) {
-		return firstPanic, adapter.ErrLifecycleBusy
+	if s.certificateProvider != nil && !closeManagerResource(closeStepCertificateProvider, "certificate-provider", s.certificateProvider.Close) {
+		return firstPanic, errors.Join(s.accumulatedCloseError(), adapter.ErrLifecycleBusy)
 	}
-	if s.endpoint != nil && !closeManagerResource("endpoint", s.endpoint.Close) {
-		return firstPanic, adapter.ErrLifecycleBusy
+	if s.endpoint != nil && !closeManagerResource(closeStepEndpoint, "endpoint", s.endpoint.Close) {
+		return firstPanic, errors.Join(s.accumulatedCloseError(), adapter.ErrLifecycleBusy)
 	}
-	if s.outbound != nil && !closeManagerResource("outbound", s.outbound.Close) {
-		return firstPanic, adapter.ErrLifecycleBusy
+	if s.outbound != nil && !closeManagerResource(closeStepOutbound, "outbound", s.outbound.Close) {
+		return firstPanic, errors.Join(s.accumulatedCloseError(), adapter.ErrLifecycleBusy)
 	}
 	if s.router != nil {
-		closeResource("router", s.router.Close)
+		closeResource(closeStepRouter, "router", s.router.Close)
 	}
 	if s.dnsRouter != nil {
-		closeResource("dns-router", s.dnsRouter.Close)
+		closeResource(closeStepDNSRouter, "dns-router", s.dnsRouter.Close)
 	}
-	if s.dnsTransport != nil && !closeManagerResource("dns-transport", s.dnsTransport.Close) {
-		return firstPanic, adapter.ErrLifecycleBusy
+	if s.dnsTransport != nil && !closeManagerResource(closeStepDNSTransport, "dns-transport", s.dnsTransport.Close) {
+		return firstPanic, errors.Join(s.accumulatedCloseError(), adapter.ErrLifecycleBusy)
 	}
 	if s.network != nil {
-		closeResource("network", s.network.Close)
+		closeResource(closeStepNetwork, "network", s.network.Close)
 	}
 	if s.httpClientService != nil {
-		closeResource("http-client", s.httpClientService.Close)
+		closeResource(closeStepHTTPClient, "http-client", s.httpClientService.Close)
 	}
-	for index, lifecycleService := range s.internalService {
-		if lifecycleService != nil {
-			closeResource(F.ToString("internal service[", index, "]"), lifecycleService.Close)
+	if step <= closeStepInternalServices {
+		for index, lifecycleService := range s.internalService {
+			if lifecycleService != nil {
+				runClose(F.ToString("internal service[", index, "]"), lifecycleService.Close)
+			}
 		}
+		step = closeStepInternalServices + 1
+		s.advanceCloseStep(step)
 	}
 	if s.logFactory != nil {
-		closeResource("logger", s.logFactory.Close)
+		closeResource(closeStepLogger, "logger", s.logFactory.Close)
 	}
 	return firstPanic, err
 }
