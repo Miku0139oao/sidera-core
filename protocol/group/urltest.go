@@ -466,6 +466,9 @@ func (g *URLTestGroup) runURLTest(ctx context.Context, force bool) (map[string]u
 			defer cancel()
 			t, err := urltest.URLTest(testCtx, g.link, p)
 			if err != nil {
+				if ctx.Err() != nil {
+					return nil, nil
+				}
 				g.logger.Debug("outbound ", tag, " unavailable: ", err)
 				g.history.DeleteURLTestHistory(realTag)
 			} else {
