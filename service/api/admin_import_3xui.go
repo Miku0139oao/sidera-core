@@ -196,9 +196,11 @@ func (a *adminAPI) apply3XUIImport(writer http.ResponseWriter, request *http.Req
 	ctx, cancel := context.WithTimeout(request.Context(), 30*time.Second)
 	defer cancel()
 
-	a.mutation.Lock()
-	defer a.mutation.Unlock()
-	a.flushPendingTrafficLocked()
+	// Inspect the uploaded database before taking the process-wide mutation
+	// lock. These steps only read the temp file; scanning whole tables while
+	// holding the lock stalls traffic accounting and connection teardown for the
+	// whole import. Store-dependent blockers are re-validated by
+	// commit3XUIImport against a fresh store snapshot under the lock.
 	report, err := a.inspect3XUIDatabase(ctx, databasePath, fingerprint, mapping)
 	if err != nil {
 		writeAdminError(writer, http.StatusBadRequest, "無法驗證 3x-ui 資料庫")
@@ -213,6 +215,10 @@ func (a *adminAPI) apply3XUIImport(writer http.ResponseWriter, request *http.Req
 		writeAdminError(writer, http.StatusBadRequest, "無法讀取 3x-ui client 資料")
 		return
 	}
+
+	a.mutation.Lock()
+	defer a.mutation.Unlock()
+	a.flushPendingTrafficLocked()
 	if err = a.commit3XUIImport(report, sources); err != nil {
 		writeAdminError(writer, http.StatusInternalServerError, E.Cause(err, "3x-ui 匯入失敗").Error())
 		return
@@ -247,6 +253,15 @@ type admin3XUIPreparedAccount struct {
 	account     *adminAccount
 	subID       string
 	memberships map[string]*adminUser
+}
+
+// admin3XUIImportTargetEligible reports whether a mapped tag may receive
+// imported users. Only dashboard-created inbound profiles carry the advertise
+// metadata and config that subscription link generation reads; config-file
+// inbounds and endpoint profiles would accept the users but never yield a
+// subscription link, silently stranding the retained 3x-ui subscription ID.
+func admin3XUIImportTargetEligible(profile *adminServerStore) bool {
+	return profile != nil && !profile.Deleted && profile.Kind == adminServerKindInbound
 }
 
 func (a *adminAPI) commit3XUIImport(report admin3XUIImportReport, sources map[int64]*admin3XUISourceClient) error {
@@ -334,6 +349,9 @@ func (a *adminAPI) commit3XUIImport(report admin3XUIImportReport, sources map[in
 			}
 		}
 		for tag, candidate := range value.memberships {
+			if !admin3XUIImportTargetEligible(a.store.Servers[tag]) {
+				return E.New("target inbound is not a dashboard-created inbound: ", tag)
+			}
 			updated := updatedInbounds[tag]
 			if updated == nil {
 				updated = cloneInboundStore(a.store.Inbounds[tag])
@@ -557,6 +575,7 @@ func (a *adminAPI) inspect3XUIDatabase(ctx context.Context, databasePath string,
 
 	targetTypes := make(map[string]string, len(a.runtimes))
 	targetSchemas := make(map[string]adapter.ManagedUserSchema, len(a.runtimes))
+	managedTargets := make(map[string]string, len(a.runtimes))
 	existingNames := make(map[string]map[string]bool)
 	existingUUIDs := make(map[string]map[string]bool)
 	existingPasswords := make(map[string]map[string]bool)
@@ -565,8 +584,11 @@ func (a *adminAPI) inspect3XUIDatabase(ctx context.Context, databasePath string,
 	a.storeAccess.RLock()
 	for tag, runtimeInbound := range a.runtimes {
 		if runtimeInbound != nil && runtimeInbound.Manager != nil {
-			targetTypes[tag] = runtimeInbound.Type
-			targetSchemas[tag] = runtimeInbound.Manager.service.ManagedUserSchema()
+			managedTargets[tag] = runtimeInbound.Type
+			if admin3XUIImportTargetEligible(a.store.Servers[tag]) {
+				targetTypes[tag] = runtimeInbound.Type
+				targetSchemas[tag] = runtimeInbound.Manager.service.ManagedUserSchema()
+			}
 		}
 	}
 	for tag, inbound := range a.store.Inbounds {
@@ -604,7 +626,7 @@ func (a *adminAPI) inspect3XUIDatabase(ctx context.Context, databasePath string,
 	}
 	a.storeAccess.RUnlock()
 
-	inbounds, inboundByID, invalidInbounds, err := inspect3XUIInbounds(ctx, database, mapping, targetTypes, &report)
+	inbounds, inboundByID, invalidInbounds, err := inspect3XUIInbounds(ctx, database, mapping, targetTypes, managedTargets, &report)
 	if err != nil {
 		return report, err
 	}
@@ -728,7 +750,7 @@ func inspect3XUITableColumns(ctx context.Context, database *sql.DB, table string
 	return columns, rows.Err()
 }
 
-func inspect3XUIInbounds(ctx context.Context, database *sql.DB, mapping map[int64]string, targetTypes map[string]string, report *admin3XUIImportReport) ([]admin3XUIImportInbound, map[int64]admin3XUIImportInbound, map[int64]bool, error) {
+func inspect3XUIInbounds(ctx context.Context, database *sql.DB, mapping map[int64]string, targetTypes map[string]string, managedTargets map[string]string, report *admin3XUIImportReport) ([]admin3XUIImportInbound, map[int64]admin3XUIImportInbound, map[int64]bool, error) {
 	rows, err := database.QueryContext(ctx, "SELECT id, COALESCE(tag, ''), COALESCE(remark, ''), lower(COALESCE(protocol, '')), COALESCE(settings, ''), COALESCE(stream_settings, ''), COALESCE(enable, 0), COALESCE(port, 0) FROM inbounds ORDER BY id")
 	if err != nil {
 		return nil, nil, nil, err
@@ -759,7 +781,11 @@ func inspect3XUIInbounds(ctx context.Context, database *sql.DB, mapping map[int6
 			report.addIssue("error", "unmapped_inbound", path, "3x-ui inbound 尚未映射到 Sidera server tag")
 			invalid[inbound.SourceID] = true
 		case !targetFound:
-			report.addIssue("error", "missing_target_inbound", path, "映射的 Sidera inbound 不存在或不支援動態用戶")
+			if _, managed := managedTargets[inbound.TargetTag]; managed {
+				report.addIssue("error", "unsupported_target_inbound", path, "映射的 Sidera inbound 不是由面板建立的訂閱節點，無法產生訂閱連結")
+			} else {
+				report.addIssue("error", "missing_target_inbound", path, "映射的 Sidera inbound 不存在或不支援動態用戶")
+			}
 			invalid[inbound.SourceID] = true
 		case !inbound.Supported:
 			report.addIssue("error", "unsupported_protocol_mapping", path, "來源與目標 inbound 協定不相容")
