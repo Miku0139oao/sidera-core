@@ -358,7 +358,7 @@ func TestUpdateUserPreservesOmittedIPLimit(t *testing.T) {
 	require.Equal(t, 2, a.store.Inbounds[managed.tag].Users[0].MaxIPs)
 }
 
-func TestLegacyUserRenameReappliesRuntimeAfterAccountSplit(t *testing.T) {
+func TestLegacyUserRenameRejectsBreakingGroupedAccount(t *testing.T) {
 	first := &adminTestManagedService{tag: "first", type_: C.TypeSOCKS}
 	second := &adminTestManagedService{tag: "second", type_: C.TypeSOCKS}
 	a := newAdminTestAPI(t, first, false)
@@ -370,7 +370,7 @@ func TestLegacyUserRenameReappliesRuntimeAfterAccountSplit(t *testing.T) {
 		a.runtimes[a.inbounds[index].Tag] = &a.inbounds[index]
 	}
 	a.store.Accounts = map[string]*adminAccount{
-		"global": {ID: "global", Name: "alice", PolicyScope: adminAccountPolicyGlobal, Enabled: false, Revision: 1, CreatedAt: 1, UpdatedAt: 1},
+		"global": {ID: "global", Name: "alice", PolicyScope: adminAccountPolicyGlobal, Enabled: true, QuotaBytes: 4096, ExpiresAt: 4102444800000, Revision: 1, CreatedAt: 1, UpdatedAt: 1},
 	}
 	a.store.Inbounds[first.Tag()] = &adminInboundStore{
 		Type: first.Type(), Authoritative: true, Revision: 1, AppliedRevision: 1,
@@ -387,12 +387,45 @@ func TestLegacyUserRenameReappliesRuntimeAfterAccountSplit(t *testing.T) {
 	require.NoError(t, err)
 
 	response := adminRequest(a, "PUT", adminRoutePrefix+"/users/first-id", body)
+	require.Equal(t, http.StatusConflict, response.Code, response.Body.String())
+	require.Contains(t, response.Body.String(), "用戶群組")
+	require.Len(t, a.store.Accounts, 1)
+	require.Equal(t, "alice", a.store.Accounts["global"].Name)
+	require.EqualValues(t, 4096, a.store.Accounts["global"].QuotaBytes)
+	for _, tag := range []string{first.Tag(), second.Tag()} {
+		user := a.store.Inbounds[tag].Users[0]
+		require.Equal(t, "alice", user.Name)
+		require.Equal(t, "global", user.AccountID)
+	}
+	require.Empty(t, first.users, "rejected rename must not touch the runtime")
+}
+
+func TestLegacyUserRenameSingleMembershipPreservesAccountLimits(t *testing.T) {
+	managed := &adminTestManagedService{tag: "owned", type_: C.TypeSOCKS}
+	a := newAdminTestAPI(t, managed, false)
+	a.store.Accounts = map[string]*adminAccount{
+		"global": {ID: "global", Name: "alice", PolicyScope: adminAccountPolicyGlobal, Enabled: true, QuotaBytes: 4096, ExpiresAt: 4102444800000, Revision: 1, CreatedAt: 1, UpdatedAt: 1},
+	}
+	a.store.Inbounds[managed.tag] = &adminInboundStore{
+		Type: managed.Type(), Authoritative: true, Revision: 1, AppliedRevision: 1,
+		Users: []*adminUser{{ID: "alice-id", AccountID: "global", Inbound: managed.Tag(), Type: managed.Type(), Name: "alice", Password: "password", Enabled: true}},
+	}
+	a.router = a.buildRouter()
+	body, err := stdjson.Marshal(map[string]any{
+		"inbound": managed.tag, "name": "renamed", "password": "password", "enabled": true, "revision": 1,
+	})
+	require.NoError(t, err)
+
+	response := adminRequest(a, "PUT", adminRoutePrefix+"/users/alice-id", body)
 	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
-	require.Len(t, first.users, 1)
-	require.Equal(t, "renamed", first.users[0].Name)
-	renamed := a.store.Inbounds[first.Tag()].Users[0]
-	require.NotEqual(t, "global", renamed.AccountID)
-	require.Equal(t, adminAccountPolicyMembership, a.store.Accounts[renamed.AccountID].PolicyScope)
+	require.Equal(t, "renamed", a.store.Inbounds[managed.tag].Users[0].Name)
+	require.Equal(t, "global", a.store.Inbounds[managed.tag].Users[0].AccountID)
+	require.Len(t, a.store.Accounts, 1)
+	require.Equal(t, "renamed", a.store.Accounts["global"].Name)
+	require.EqualValues(t, 4096, a.store.Accounts["global"].QuotaBytes)
+	require.EqualValues(t, 4102444800000, a.store.Accounts["global"].ExpiresAt)
+	require.Len(t, managed.users, 1)
+	require.Equal(t, "renamed", managed.users[0].Name)
 }
 
 func TestUserGroupMutationsAreRevisionSafeAcrossInbounds(t *testing.T) {
@@ -617,7 +650,7 @@ func TestExpiredGlobalAccountRenewsAcrossMemberships(t *testing.T) {
 		a.runtimes[a.inbounds[index].Tag] = &a.inbounds[index]
 	}
 	a.store.Accounts = map[string]*adminAccount{
-		"account": {ID: "account", Name: "Alice", PolicyScope: adminAccountPolicyGlobal, Enabled: false, QuotaBytes: 1000, ExpiresAt: now - 31*adminDayMilliseconds, ResetDays: 30, BaseUploadBytes: 100, BaseDownloadBytes: 200, Revision: 1, CreatedAt: 1, UpdatedAt: 1},
+		"account": {ID: "account", Name: "Alice", PolicyScope: adminAccountPolicyGlobal, Enabled: true, QuotaBytes: 1000, ExpiresAt: now - 31*adminDayMilliseconds, ResetDays: 30, BaseUploadBytes: 100, BaseDownloadBytes: 200, Revision: 1, CreatedAt: 1, UpdatedAt: 1},
 	}
 	a.store.Inbounds[first.Tag()] = &adminInboundStore{Type: first.Type(), Authoritative: true, Revision: 1, Users: []*adminUser{{ID: "one", AccountID: "account", Inbound: first.Tag(), Type: first.Type(), Name: "Alice", Password: "first", Enabled: true, UploadBytes: 10, DownloadBytes: 20}}}
 	a.store.Inbounds[second.Tag()] = &adminInboundStore{Type: second.Type(), Authoritative: true, Revision: 1, Users: []*adminUser{{ID: "two", AccountID: "account", Inbound: second.Tag(), Type: second.Type(), Name: "Alice", Password: "second", Enabled: true, UploadBytes: 30, DownloadBytes: 40}}}
@@ -641,6 +674,27 @@ func TestExpiredGlobalAccountRenewsAcrossMemberships(t *testing.T) {
 	require.Len(t, second.users, 1)
 	require.Equal(t, 1, first.updateCalls)
 	require.Equal(t, 1, second.updateCalls)
+}
+
+func TestExpiredDisabledAccountRenewalPreservesDisabledState(t *testing.T) {
+	now := time.Now().UnixMilli()
+	managed := &adminTestManagedService{tag: "owned", type_: C.TypeSOCKS}
+	a := newAdminTestAPI(t, managed, false)
+	a.store.Accounts = map[string]*adminAccount{
+		"account": {ID: "account", Name: "Alice", PolicyScope: adminAccountPolicyGlobal, Enabled: false, QuotaBytes: 1000, ExpiresAt: now - 31*adminDayMilliseconds, ResetDays: 30, Revision: 1, CreatedAt: 1, UpdatedAt: 1},
+	}
+	a.store.Inbounds[managed.tag] = &adminInboundStore{
+		Type: managed.Type(), Authoritative: true, Revision: 1,
+		Users: []*adminUser{{ID: "one", AccountID: "account", Inbound: managed.Tag(), Type: managed.Type(), Name: "Alice", Password: "password", Enabled: true}},
+	}
+
+	require.NoError(t, a.renewExpiredAccounts(now))
+	account := a.store.Accounts["account"]
+	require.False(t, account.Enabled, "renewal must not undo an admin disabling the account")
+	require.Greater(t, account.ExpiresAt, now)
+	require.Greater(t, account.Revision, int64(1))
+	require.Zero(t, a.store.Inbounds[managed.tag].Users[0].UploadBytes)
+	require.Zero(t, a.store.Inbounds[managed.tag].Users[0].DownloadBytes)
 }
 
 func TestAdminCollectionResponsesRedactCredentials(t *testing.T) {

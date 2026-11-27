@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -502,6 +503,57 @@ func TestDisconnectedWebSocketCancelsRequestStream(t *testing.T) {
 	case <-done:
 	case <-ctx.Done():
 		t.Fatal("disconnected websocket did not cancel request context")
+	}
+}
+
+func TestWebSocketKeepAliveRefreshesIdleDeadline(t *testing.T) {
+	serverConn := make(chan *websocket.Conn, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		conn, err := websocket.Accept(writer, request, &websocket.AcceptOptions{InsecureSkipVerify: true})
+		if err != nil {
+			return
+		}
+		serverConn <- conn
+		<-request.Context().Done()
+	}))
+	defer server.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	client, _, err := websocket.Dial(ctx, websocketURL(server.URL, "/"), &websocket.DialOptions{})
+	require.NoError(t, err)
+	defer client.CloseNow()
+	// Keep reading so the client answers the server's keepalive pings.
+	go func() {
+		for {
+			if _, _, readErr := client.Read(ctx); readErr != nil {
+				return
+			}
+		}
+	}()
+	var conn *websocket.Conn
+	select {
+	case conn = <-serverConn:
+	case <-ctx.Done():
+		t.Fatal("websocket server did not accept the connection")
+	}
+	connectionCtx, cancelConnection := context.WithCancel(ctx)
+	defer cancelConnection()
+	// Ping only observes the pong through a concurrent Reader on the same
+	// connection, mirroring the gRPC transport's request body reader.
+	go func() {
+		for {
+			if _, _, readErr := conn.Read(connectionCtx); readErr != nil {
+				return
+			}
+		}
+	}()
+	activity := newWebSocketActivity(connectionCtx, cancelConnection, conn, 250*time.Millisecond)
+	defer activity.stop()
+	go keepWebSocketAlive(connectionCtx, cancelConnection, conn, activity, 25*time.Millisecond)
+	select {
+	case <-activity.done:
+		t.Fatal("keepalive pings did not refresh the idle deadline")
+	case <-time.After(800 * time.Millisecond):
 	}
 }
 

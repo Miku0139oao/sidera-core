@@ -135,7 +135,7 @@ func (b *webBridge) serveWebSocket(writer http.ResponseWriter, request *http.Req
 	sessionWorkers.Add(1)
 	go func() {
 		defer sessionWorkers.Done()
-		keepWebSocketAlive(ctx, cancel, conn)
+		keepWebSocketAlive(ctx, cancel, conn, activity, webSocketPingInterval)
 	}()
 	b.grpcServer.ServeHTTP(response, grpcRequest)
 	response.writeTrailerFrame()
@@ -154,8 +154,11 @@ func parseWebSocketHeader(content []byte) (http.Header, error) {
 	return http.Header(mimeHeader), nil
 }
 
-func keepWebSocketAlive(ctx context.Context, cancel context.CancelFunc, conn *websocket.Conn) {
-	ticker := time.NewTicker(webSocketPingInterval)
+func keepWebSocketAlive(ctx context.Context, cancel context.CancelFunc, conn *websocket.Conn, activity *webSocketActivity, interval time.Duration) {
+	if interval <= 0 {
+		interval = webSocketPingInterval
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -167,6 +170,11 @@ func keepWebSocketAlive(ctx context.Context, cancel context.CancelFunc, conn *we
 				conn.CloseNow()
 				return
 			}
+			// A successful ping means the peer answered with a pong, so the
+			// connection is healthy even when the gRPC stream has no
+			// application data to read or write. Refresh the idle deadline so
+			// quiet subscription streams are not cancelled.
+			activity.touch()
 		}
 	}
 }

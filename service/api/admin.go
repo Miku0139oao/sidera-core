@@ -1215,7 +1215,8 @@ func (a *adminAPI) renewExpiredAccounts(now int64) error {
 			return E.New("account renewal expiry overflow: ", identifier)
 		}
 		account.ExpiresAt += steps * period
-		account.Enabled = true
+		// Renewal only extends the expiry window; it must not undo an admin
+		// disabling the account. Enabled stays untouched.
 		account.BaseUploadBytes = 0
 		account.BaseDownloadBytes = 0
 		account.Revision = nextAdminRevision(account.Revision, now)
@@ -2229,6 +2230,15 @@ func (a *adminAPI) updateUser(writer http.ResponseWriter, request *http.Request)
 		writeAdminError(writer, http.StatusConflict, err.Error())
 		return
 	}
+	if normalized.Name != current.Name && current.AccountID != "" {
+		a.storeAccess.RLock()
+		shared := a.accountHasMultipleMembersLocked(current.AccountID)
+		a.storeAccess.RUnlock()
+		if shared {
+			writeAdminError(writer, http.StatusConflict, "此用戶與其他節點共用帳戶，請透過用戶群組修改名稱")
+			return
+		}
+	}
 	candidate := *current
 	candidate.Name = normalized.Name
 	candidate.UUID = normalized.UUID
@@ -2547,6 +2557,34 @@ func (a *adminAPI) findUser(id string) (string, *adminUser) {
 		}
 	}
 	return "", nil
+}
+
+// accountHasMultipleMembersLocked reports whether the account is shared by
+// more than one membership. Renaming a single membership of a shared account
+// would make the membership names diverge from the account name, so the next
+// store normalization would split the account and create an unlimited
+// membership account for the renamed node. Such renames must go through the
+// user-group endpoint, which renames every membership atomically.
+func (a *adminAPI) accountHasMultipleMembersLocked(accountID string) bool {
+	if accountID == "" {
+		return false
+	}
+	count := 0
+	for _, record := range a.store.Inbounds {
+		if record == nil {
+			continue
+		}
+		for _, user := range record.Users {
+			if user == nil || user.AccountID != accountID {
+				continue
+			}
+			count++
+			if count > 1 {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func normalizeAdminInput(input adminUserInput, schema adapter.ManagedUserSchema) (adminUserInput, error) {
