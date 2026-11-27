@@ -123,6 +123,42 @@ func TestTransportImplicitDefaultReplacementAndReentrantDefault(t *testing.T) {
 	}
 }
 
+func TestTransportManagerRemoveUnregistersBeforeCloseError(t *testing.T) {
+	closeErr := errors.New("close failed")
+	removed := &managerTestTransport{
+		tag:          "removed",
+		dependencies: []string{"dependency"},
+		closeFunc:    func() error { return closeErr },
+	}
+	replacement := &managerTestTransport{tag: "replacement"}
+	manager := NewTransportManager(log.NewNOPFactory().Logger(), nil, nil, "")
+	manager.transports = []adapter.DNSTransport{removed, replacement}
+	manager.transportByTag["removed"] = removed
+	manager.transportByTag["replacement"] = replacement
+	manager.dependByTag["dependency"] = []string{"removed"}
+	manager.defaultTransport = removed
+
+	err := manager.Remove("removed")
+	if !errors.Is(err, closeErr) {
+		t.Fatalf("Remove error = %v, want %v", err, closeErr)
+	}
+	if _, loaded := manager.Transport("removed"); loaded {
+		t.Fatal("close failure left the removed transport registered")
+	}
+	if manager.Default() != replacement {
+		t.Fatal("close failure left the removed transport as the default")
+	}
+	if transports := manager.Transports(); len(transports) != 1 || transports[0] != replacement {
+		t.Fatalf("unexpected transports after removal: %v", transports)
+	}
+	if dependBy, loaded := manager.dependByTag["dependency"]; loaded {
+		t.Fatalf("dependency index still contains removed transport: %v", dependBy)
+	}
+	if removed.closed != 1 {
+		t.Fatalf("removed transport close count = %d, want 1", removed.closed)
+	}
+}
+
 func TestTransportReplacementCloseFailureRetainsOwnership(t *testing.T) {
 	expected := errors.New("old close failed")
 	registry := NewTransportRegistry()

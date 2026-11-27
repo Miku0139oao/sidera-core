@@ -341,28 +341,16 @@ func (m *TransportManager) Remove(tag string) error {
 	}
 	wasDefault := m.defaultTransport == transport
 	wasFakeIP := m.fakeIPTransport == transport
-	remaining := append([]adapter.DNSTransport(nil), m.transports...)
-	m.access.Unlock()
-
-	dependencies := append([]string(nil), transport.Dependencies()...)
 	var replacementDefault adapter.DNSTransport
 	if wasDefault {
-		for _, candidate := range remaining {
+		for _, candidate := range m.transports {
 			if candidate != transport && candidate.Type() != C.DNSTypeFakeIP {
 				replacementDefault = candidate
 				break
 			}
 		}
 	}
-	if err := m.closeTransport(transport); err != nil {
-		return err
-	}
-
-	m.access.Lock()
-	if current, loaded := m.transportByTag[tag]; !loaded || current != transport {
-		m.access.Unlock()
-		return E.New("DNS transport manager changed during removal: ", tag)
-	}
+	dependencies := append([]string(nil), transport.Dependencies()...)
 	delete(m.transportByTag, tag)
 	m.transports = append(m.transports[:index], m.transports[index+1:]...)
 	if wasDefault {
@@ -380,10 +368,14 @@ func (m *TransportManager) Remove(tag string) error {
 		}
 	}
 	m.access.Unlock()
+
+	// The transport is unregistered before it is closed: a close failure must
+	// not leave a closed transport registered (or selected as the default).
+	closeErr := m.closeTransport(transport)
 	if replacementDefault != nil {
 		m.logger.Info("updated default server to ", replacementDefault.Tag())
 	}
-	return nil
+	return closeErr
 }
 
 func (m *TransportManager) Create(ctx context.Context, logger log.ContextLogger, tag string, transportType string, options any) error {

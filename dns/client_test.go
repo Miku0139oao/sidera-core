@@ -6,6 +6,7 @@ import (
 	"net/netip"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/Miku0139oao/sidera-core/adapter"
 	C "github.com/Miku0139oao/sidera-core/constant"
@@ -54,7 +55,7 @@ func testAQuery() *mDNS.Msg {
 	return message
 }
 
-func TestComputeTimeToLivePreservesZero(t *testing.T) {
+func TestComputeTimeToLiveIgnoresZeroWithPositiveTTL(t *testing.T) {
 	response := testAResponse(testAQuery(), 0)
 	response.Answer = append(response.Answer, &mDNS.A{
 		Hdr: mDNS.RR_Header{
@@ -67,21 +68,54 @@ func TestComputeTimeToLivePreservesZero(t *testing.T) {
 	})
 
 	ttl, initialized := computeTimeToLive(response)
-	if !initialized || ttl != 0 {
-		t.Fatalf("computed TTL = %d, initialized = %v; want a true zero TTL", ttl, initialized)
+	if !initialized || ttl != 300 {
+		t.Fatalf("computed TTL = %d, initialized = %v; want 300 from the positive record", ttl, initialized)
 	}
-	if applied := applyResponseOptions(response.Question[0], response, adapter.DNSQueryOptions{}); applied != 0 {
-		t.Fatalf("applied TTL = %d, want 0", applied)
+	if applied := applyResponseOptions(response.Question[0], response, adapter.DNSQueryOptions{}); applied != 300 {
+		t.Fatalf("applied TTL = %d, want 300", applied)
 	}
-	for index, record := range response.Answer {
-		if record.Header().Ttl != 0 {
-			t.Fatalf("answer %d TTL = %d, want 0", index, record.Header().Ttl)
-		}
+
+	zeroOnly := testAResponse(testAQuery(), 0)
+	if ttl, initialized = computeTimeToLive(zeroOnly); !initialized || ttl != 0 {
+		t.Fatalf("zero-only response TTL = %d, initialized = %v; want a true zero TTL", ttl, initialized)
+	}
+	if applied := applyResponseOptions(zeroOnly.Question[0], zeroOnly, adapter.DNSQueryOptions{}); applied != 0 {
+		t.Fatalf("zero-only applied TTL = %d, want 0", applied)
 	}
 
 	empty := new(mDNS.Msg)
 	if ttl, initialized = computeTimeToLive(empty); initialized || ttl != 0 {
 		t.Fatalf("empty response TTL = %d, initialized = %v; want uninitialized", ttl, initialized)
+	}
+}
+
+func TestZeroTTLAdditionalRecordDoesNotDisableCaching(t *testing.T) {
+	transport := &clientTestTransport{response: func(message *mDNS.Msg) *mDNS.Msg {
+		response := testAResponse(message, 300)
+		response.Extra = append(response.Extra, &mDNS.A{
+			Hdr: mDNS.RR_Header{
+				Name:   "additional.example.",
+				Rrtype: mDNS.TypeA,
+				Class:  mDNS.ClassINET,
+				Ttl:    0,
+			},
+			A: netip.MustParseAddr("192.0.2.53").AsSlice(),
+		})
+		return response
+	}}
+	client := NewClient(ClientOptions{Context: context.Background(), DisableExpire: true})
+
+	for range 2 {
+		response, err := client.Exchange(context.Background(), transport, testAQuery(), adapter.DNSQueryOptions{}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ttl := response.Answer[0].Header().Ttl; ttl != 300 {
+			t.Fatalf("response TTL = %d, want 300", ttl)
+		}
+	}
+	if calls := transport.calls.Load(); calls != 1 {
+		t.Fatalf("upstream calls = %d, want 1 with a zero-TTL additional record", calls)
 	}
 }
 
@@ -139,6 +173,57 @@ func TestDNSCacheRewriteTTLIsolation(t *testing.T) {
 	if calls := transport.calls.Load(); calls != 3 {
 		t.Fatalf("isolated rewrite policies used %d upstream calls, want 3", calls)
 	}
+}
+
+func TestStaleRejectedCachedResponseTriggersRefresh(t *testing.T) {
+	reject := func(*mDNS.Msg) bool { return false }
+	newStaleClient := func() (*Client, *clientTestTransport, chan struct{}) {
+		t.Helper()
+		refreshed := make(chan struct{}, 1)
+		transport := &clientTestTransport{response: func(message *mDNS.Msg) *mDNS.Msg {
+			select {
+			case refreshed <- struct{}{}:
+			default:
+			}
+			return testAResponse(message, 300)
+		}}
+		client := NewClient(ClientOptions{Context: context.Background(), OptimisticTimeout: time.Hour})
+		return client, transport, refreshed
+	}
+	primeStale := func(client *Client, transport *clientTestTransport, options adapter.DNSQueryOptions) {
+		t.Helper()
+		message := testAQuery()
+		key := client.cacheKey(transport, message, message.Question[0], options)
+		client.cache.AddWithLifetime(key, testAResponse(message, 300), -time.Minute)
+	}
+	waitRefresh := func(refreshed chan struct{}, path string) {
+		t.Helper()
+		select {
+		case <-refreshed:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s: a stale rejected cache entry was not refreshed from upstream", path)
+		}
+	}
+
+	t.Run("Exchange", func(t *testing.T) {
+		client, transport, refreshed := newStaleClient()
+		options := adapter.DNSQueryOptions{}
+		primeStale(client, transport, options)
+		if _, err := client.Exchange(context.Background(), transport, testAQuery(), options, reject); !errors.Is(err, ErrResponseRejectedCached) {
+			t.Fatalf("cached exchange error = %v, want %v", err, ErrResponseRejectedCached)
+		}
+		waitRefresh(refreshed, "Exchange")
+	})
+
+	t.Run("Lookup", func(t *testing.T) {
+		client, transport, refreshed := newStaleClient()
+		options := adapter.DNSQueryOptions{Strategy: C.DomainStrategyIPv4Only}
+		primeStale(client, transport, options)
+		if _, err := client.Lookup(context.Background(), transport, "cache.example", options, reject); !errors.Is(err, ErrResponseRejectedCached) {
+			t.Fatalf("cached lookup error = %v, want %v", err, ErrResponseRejectedCached)
+		}
+		waitRefresh(refreshed, "Lookup")
+	})
 }
 
 func TestCachedResponseCheckerIsolation(t *testing.T) {
