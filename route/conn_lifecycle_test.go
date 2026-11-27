@@ -13,6 +13,7 @@ import (
 	"github.com/Miku0139oao/sidera-core/adapter"
 	"github.com/Miku0139oao/sidera-core/log"
 	"github.com/sagernet/sing/common/buf"
+	"github.com/sagernet/sing/common/bufio"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 
@@ -290,6 +291,55 @@ func TestRelayPreservesWrappedCloseWriteResponseAfterEOF(t *testing.T) {
 	}
 }
 
+// TestRelayPreservesHalfCloseThroughCounterDestination covers the traffic
+// counter wrapper that route destinations carry (bufio.CounterConn). CounterConn
+// exposes UnwrapWriter but not WriterReplaceable, so a plain N.UnwrapWriter stops
+// at the counter and misses the underlying TCPConn's CloseWrite. connectionCopy
+// must strip counters first; otherwise it falls back to a full Close and kills
+// the download direction before the backend response can be relayed.
+func TestRelayPreservesHalfCloseThroughCounterDestination(t *testing.T) {
+	client, relayInbound := tcpConnPair(t)
+	relayOutbound, backend := tcpConnPair(t)
+	defer client.Close()
+	defer relayInbound.Close()
+	defer relayOutbound.Close()
+	defer backend.Close()
+
+	backendResult := make(chan error, 1)
+	go func() {
+		request, err := io.ReadAll(backend)
+		if err == nil && string(request) != "request" {
+			err = errors.New("unexpected request")
+		}
+		if err == nil {
+			_, err = backend.Write([]byte("response"))
+		}
+		_ = backend.CloseWrite()
+		backendResult <- err
+	}()
+
+	callback := make(chan error, 1)
+	state := &connectionRelayState{onClose: func(err error) { callback <- err }}
+	manager := NewConnectionManager(log.NewNOPFactory().NewLogger("relay-test"))
+	countedOutbound := bufio.NewCounterConn(&replaceableTestConn{Conn: relayOutbound}, nil, nil)
+	go manager.connectionCopy(context.Background(), relayInbound, countedOutbound, false, state)
+	go manager.connectionCopy(context.Background(), countedOutbound, relayInbound, true, state)
+
+	_, err := client.Write([]byte("request"))
+	require.NoError(t, err)
+	require.NoError(t, client.CloseWrite())
+	response, err := io.ReadAll(client)
+	require.NoError(t, err)
+	require.Equal(t, "response", string(response))
+	require.NoError(t, <-backendResult)
+	select {
+	case err = <-callback:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("relay completion timed out")
+	}
+}
+
 type relayErrorConn struct {
 	readErr   error
 	closed    chan struct{}
@@ -350,4 +400,151 @@ func TestRelayReportsOriginatingError(t *testing.T) {
 		t.Fatal("relay callback was invoked more than once")
 	case <-time.After(20 * time.Millisecond):
 	}
+}
+
+type exactMultiPacketReader struct {
+	packets [][]byte
+	index   int
+}
+
+func (r *exactMultiPacketReader) ReadPacket(buffer *buf.Buffer) (M.Socksaddr, error) {
+	if r.index >= len(r.packets) {
+		return M.Socksaddr{}, io.EOF
+	}
+	packet := r.packets[r.index]
+	r.index++
+	if _, err := buffer.Write(packet); err != nil {
+		return M.Socksaddr{}, err
+	}
+	return M.Socksaddr{Port: 53}, nil
+}
+
+type collectingPacketWriter struct {
+	packets [][]byte
+}
+
+func (w *collectingPacketWriter) WritePacket(buffer *buf.Buffer, _ M.Socksaddr) error {
+	w.packets = append(w.packets, append([]byte(nil), buffer.Bytes()...))
+	buffer.Release()
+	return nil
+}
+
+type countedPacketReader struct {
+	reader N.PacketReader
+	total  int64
+}
+
+func (r *countedPacketReader) ReadPacket(buffer *buf.Buffer) (M.Socksaddr, error) {
+	return r.reader.ReadPacket(buffer)
+}
+
+func (r *countedPacketReader) UnwrapPacketReader() (N.PacketReader, []N.CountFunc) {
+	return r.reader, []N.CountFunc{func(n int64) { r.total += n }}
+}
+
+type countedPacketWriter struct {
+	writer N.PacketWriter
+	total  int64
+}
+
+func (w *countedPacketWriter) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
+	return w.writer.WritePacket(buffer, destination)
+}
+
+func (w *countedPacketWriter) UnwrapPacketWriter() (N.PacketWriter, []N.CountFunc) {
+	return w.writer, []N.CountFunc{func(n int64) { w.total += n }}
+}
+
+func TestCopyPacketExactPreservesCountersAndDatagramSize(t *testing.T) {
+	large := make([]byte, 65535)
+	for index := range large {
+		large[index] = byte(index)
+	}
+	small := []byte("hello")
+	reader := &countedPacketReader{reader: &exactMultiPacketReader{packets: [][]byte{small, large}}}
+	writer := &collectingPacketWriter{}
+	countedWriter := &countedPacketWriter{writer: writer}
+
+	n, err := copyPacketExact(countedWriter, reader)
+	require.ErrorIs(t, err, io.EOF)
+	expected := int64(len(small) + len(large))
+	require.Equal(t, expected, n)
+	require.Equal(t, expected, reader.total, "read traffic counters were not reported")
+	require.Equal(t, expected, countedWriter.total, "write traffic counters were not reported")
+	require.Len(t, writer.packets, 2)
+	require.Equal(t, small, writer.packets[0])
+	require.Len(t, writer.packets[1], 65535, "maximum-size datagram was truncated")
+	require.Equal(t, large, writer.packets[1])
+}
+
+type handshakePacketWriter struct {
+	collectingPacketWriter
+	needHandshake bool
+}
+
+func (w *handshakePacketWriter) NeedHandshakeForWrite() bool { return w.needHandshake }
+
+func (w *handshakePacketWriter) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
+	err := w.collectingPacketWriter.WritePacket(buffer, destination)
+	w.needHandshake = false
+	return err
+}
+
+func TestCopyPacketExactRefreshesHandshakeState(t *testing.T) {
+	reader := &exactMultiPacketReader{packets: [][]byte{[]byte("one"), []byte("two")}}
+	writer := &handshakePacketWriter{needHandshake: true}
+
+	n, err := copyPacketExact(writer, reader)
+	require.ErrorIs(t, err, io.EOF, "handshake completion must not terminate the copy")
+	require.EqualValues(t, 6, n)
+	require.Len(t, writer.packets, 2)
+	require.Equal(t, []byte("one"), writer.packets[0])
+	require.Equal(t, []byte("two"), writer.packets[1])
+}
+
+type handshakeFailureRecorder struct {
+	exactMultiPacketReader
+	failures int
+}
+
+func (r *handshakeFailureRecorder) HandshakeFailure(err error) error {
+	r.failures++
+	return nil
+}
+
+type failingPacketWriter struct {
+	err       error
+	succeeded int
+	failAfter int
+}
+
+func (w *failingPacketWriter) WritePacket(buffer *buf.Buffer, _ M.Socksaddr) error {
+	if w.succeeded >= w.failAfter {
+		return w.err
+	}
+	w.succeeded++
+	buffer.Release()
+	return nil
+}
+
+func TestCopyPacketExactReportsFirstHandshakeFailure(t *testing.T) {
+	writeErr := errors.New("write packet")
+
+	t.Run("first_datagram", func(t *testing.T) {
+		reader := &handshakeFailureRecorder{exactMultiPacketReader: exactMultiPacketReader{packets: [][]byte{[]byte("one")}}}
+		writer := &failingPacketWriter{err: writeErr}
+		n, err := copyPacketExact(writer, reader)
+		require.ErrorIs(t, err, writeErr)
+		require.Zero(t, n)
+		require.Equal(t, 1, reader.failures)
+	})
+
+	t.Run("later_datagram", func(t *testing.T) {
+		reader := &handshakeFailureRecorder{exactMultiPacketReader: exactMultiPacketReader{packets: [][]byte{[]byte("one"), []byte("two")}}}
+		writer := &failingPacketWriter{err: writeErr, failAfter: 1}
+		n, err := copyPacketExact(writer, reader)
+		require.ErrorIs(t, err, writeErr)
+		require.EqualValues(t, 3, n)
+		require.Zero(t, reader.failures, "handshake failure must only be reported for the first datagram")
+	})
 }

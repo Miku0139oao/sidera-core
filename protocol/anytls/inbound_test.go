@@ -43,6 +43,57 @@ func (r *blockingStreamRouter) RoutePacketConnectionEx(context.Context, N.Packet
 	panic("unexpected packet route")
 }
 
+type capturingStreamRouter struct {
+	ctx context.Context
+}
+
+func (r *capturingStreamRouter) RouteConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext) error {
+	r.RouteConnectionEx(ctx, conn, metadata, nil)
+	return nil
+}
+
+func (r *capturingStreamRouter) RoutePacketConnection(context.Context, N.PacketConn, adapter.InboundContext) error {
+	return errors.New("unexpected packet route")
+}
+
+func (r *capturingStreamRouter) RouteConnectionEx(ctx context.Context, _ net.Conn, _ adapter.InboundContext, _ N.CloseHandlerFunc) {
+	r.ctx = ctx
+}
+
+func (r *capturingStreamRouter) RoutePacketConnectionEx(context.Context, N.PacketConn, adapter.InboundContext, N.CloseHandlerFunc) {
+	panic("unexpected packet route")
+}
+
+func TestRoutedConnectionKeepsSessionContext(t *testing.T) {
+	router := &capturingStreamRouter{}
+	inbound := &Inbound{
+		router:   router,
+		logger:   logger.NOP(),
+		listener: listener.New(listener.Options{}),
+	}
+	serverConn, clientConn := net.Pipe()
+	defer clientConn.Close()
+	sessionCtx, sessionCancel := context.WithCancel(context.Background())
+	defer sessionCancel()
+
+	(*inboundHandler)(inbound).NewConnectionEx(sessionCtx, serverConn, adapter.InboundContext{}.Source, adapter.InboundContext{}.Destination, nil)
+	if router.ctx == nil {
+		t.Fatal("stream handler did not route the connection")
+	}
+	// Route setup only starts the relay and returns; the routed connection keeps
+	// using this context. It must survive the handler returning and only end when
+	// the owning session ends.
+	if err := router.ctx.Err(); err != nil {
+		t.Fatalf("routed connection context was cancelled by handler return: %v", err)
+	}
+	sessionCancel()
+	select {
+	case <-router.ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("routed connection context did not observe session cancellation")
+	}
+}
+
 func TestManagedUserUpdateDoesNotWaitForActiveSession(t *testing.T) {
 	inbound := &Inbound{
 		logger:        logger.NOP(),
@@ -187,11 +238,18 @@ func TestCloseCancelsAndJoinsStreamHandlers(t *testing.T) {
 	}
 	serverConn, clientConn := net.Pipe()
 	defer clientConn.Close()
+	sessionCtx, sessionCancel := context.WithCancel(context.Background())
+	tracked := make(chan bool, 1)
 	handlerDone := make(chan struct{})
 	go func() {
-		(*inboundHandler)(inbound).NewConnectionEx(context.Background(), serverConn, adapter.InboundContext{}.Source, adapter.InboundContext{}.Destination, nil)
+		tracked <- inbound.trackConnection(serverConn, sessionCancel)
+		defer inbound.untrackConnection(serverConn)
+		(*inboundHandler)(inbound).NewConnectionEx(sessionCtx, serverConn, adapter.InboundContext{}.Source, adapter.InboundContext{}.Destination, nil)
 		close(handlerDone)
 	}()
+	if !<-tracked {
+		t.Fatal("failed to track session connection")
+	}
 	select {
 	case <-router.entered:
 	case <-time.After(time.Second):
