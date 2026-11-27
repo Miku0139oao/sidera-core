@@ -43,10 +43,9 @@ type trackedConnection struct {
 }
 
 type trackedStreamHandler struct {
-	owner  uint64
-	conn   net.Conn
-	cancel context.CancelFunc
-	done   chan struct{}
+	owner uint64
+	conn  net.Conn
+	done  chan struct{}
 }
 
 type Inbound struct {
@@ -191,9 +190,6 @@ func (h *Inbound) closeTracked(connections []net.Conn, connectionStates []*track
 	err = common.Close(h.listener)
 	for _, connectionState := range connectionStates {
 		connectionState.cancel()
-	}
-	for _, streamHandler := range streamHandlers {
-		streamHandler.cancel()
 	}
 	for _, conn := range connections {
 		err = E.Errors(err, conn.Close())
@@ -357,7 +353,7 @@ func (h *Inbound) untrackConnection(conn net.Conn) {
 	}
 }
 
-func (h *Inbound) trackStreamHandler(conn net.Conn, cancel context.CancelFunc) (*trackedStreamHandler, bool) {
+func (h *Inbound) trackStreamHandler(conn net.Conn) (*trackedStreamHandler, bool) {
 	h.connectionAccess.Lock()
 	defer h.connectionAccess.Unlock()
 	if h.closing || h.closed {
@@ -367,10 +363,9 @@ func (h *Inbound) trackStreamHandler(conn net.Conn, cancel context.CancelFunc) (
 		h.streamHandlers = make(map[*trackedStreamHandler]struct{})
 	}
 	streamHandler := &trackedStreamHandler{
-		owner:  anyTLSGoroutineID(),
-		conn:   conn,
-		cancel: cancel,
-		done:   make(chan struct{}),
+		owner: anyTLSGoroutineID(),
+		conn:  conn,
+		done:  make(chan struct{}),
 	}
 	h.streamHandlers[streamHandler] = struct{}{}
 	return streamHandler, true
@@ -408,16 +403,18 @@ type inboundHandler Inbound
 
 func (h *inboundHandler) NewConnectionEx(ctx context.Context, conn net.Conn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
 	inbound := (*Inbound)(h)
-	handlerCtx, handlerCancel := context.WithCancel(ctx)
-	streamHandler, tracked := inbound.trackStreamHandler(conn, handlerCancel)
+	streamHandler, tracked := inbound.trackStreamHandler(conn)
 	if !tracked {
-		handlerCancel()
 		N.CloseOnHandshakeFailure(conn, onClose, os.ErrClosed)
 		return
 	}
 	defer inbound.untrackStreamHandler(streamHandler)
-	defer handlerCancel()
-	ctx = handlerCtx
+	// RouteConnectionEx only starts the relay and returns; the routed connection
+	// keeps this context for its whole lifetime. Handing it a handler-scoped
+	// context and cancelling on return would tear down live connections, so use
+	// the session context instead. It is owned by Inbound.NewConnection and
+	// cancelled from Inbound.Close (through the tracked session), matching
+	// protocol/vless and protocol/hysteria.
 	var metadata adapter.InboundContext
 	metadata.Inbound = h.Tag()
 	metadata.InboundType = h.Type()

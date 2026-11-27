@@ -29,6 +29,50 @@ func (h *udpIntegrityPacketHandler) NewPacket(buffer *buf.Buffer, source M.Socks
 	h.packets <- packet
 }
 
+type closeFromPacketHandler struct {
+	listener *Listener
+	closeErr chan error
+}
+
+func (h *closeFromPacketHandler) NewPacket(buffer *buf.Buffer, source M.Socksaddr) {
+	select {
+	case h.closeErr <- h.listener.Close():
+	default:
+	}
+}
+
+func TestListenerCloseFromPacketHandlerDoesNotDeadlock(t *testing.T) {
+	handler := &closeFromPacketHandler{closeErr: make(chan error, 1)}
+	listener := New(Options{
+		Context: context.Background(),
+		Logger:  logger.NOP(),
+		Network: []string{N.NetworkUDP},
+		Listen: option.ListenOptions{
+			Listen: common.Ptr(badoption.Addr(netip.MustParseAddr("127.0.0.1"))),
+		},
+		PacketHandler: handler,
+	})
+	handler.listener = listener
+	require.NoError(t, listener.Start())
+	t.Cleanup(func() { _ = listener.Close() })
+
+	client, err := net.DialUDP("udp", nil, listener.UDPConn().LocalAddr().(*net.UDPAddr))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, client.Close()) })
+
+	_, err = client.Write([]byte("close"))
+	require.NoError(t, err)
+
+	select {
+	case err := <-handler.closeErr:
+		require.NoError(t, err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close called from the packet handler deadlocked")
+	}
+	// External callers still observe completed teardown on later Close calls.
+	require.NoError(t, listener.Close())
+}
+
 func TestUDPListenerDeliversExactDatagramOrCountsTruncatedDrop(t *testing.T) {
 	handler := &udpIntegrityPacketHandler{packets: make(chan []byte, 8)}
 	listener := New(Options{

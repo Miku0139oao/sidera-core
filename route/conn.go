@@ -2,6 +2,7 @@ package route
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	"net/netip"
@@ -292,9 +293,10 @@ func (m *ConnectionManager) NewPacketConnection(ctx context.Context, this N.Dial
 	}
 	err = N.ReportPacketConnHandshakeSuccess(conn, remotePacketConn)
 	if err != nil {
-		conn.Close()
+		err = E.Cause(err, "report handshake success")
 		remotePacketConn.Close()
-		m.logger.ErrorContext(ctx, "report handshake success: ", err)
+		N.CloseOnHandshakeFailure(conn, onClose, err)
+		m.logger.ErrorContext(ctx, err)
 		return
 	}
 	if destinationAddress.IsValid() {
@@ -482,15 +484,19 @@ func (m *ConnectionManager) connectionCopy(ctx context.Context, source net.Conn,
 	if err != nil {
 		state.record(err)
 		common.Close(source, destination)
-	} else if duplexDst, isDuplex := N.UnwrapWriter(destination).(N.WriteCloser); isDuplex {
-		err = duplexDst.CloseWrite()
-		state.record(err)
-		if err != nil {
-			common.Close(source, destination)
-		}
 	} else {
-		err = destination.Close()
-		state.record(err)
+		destinationWriter, _ := N.UnwrapCountWriter(destination, nil)
+		duplexDst, isDuplex := N.UnwrapWriter(destinationWriter).(N.WriteCloser)
+		if isDuplex {
+			err = duplexDst.CloseWrite()
+			state.record(err)
+			if err != nil {
+				common.Close(source, destination)
+			}
+		} else {
+			err = destination.Close()
+			state.record(err)
+		}
 	}
 	state.finish(source, destination)
 	if !direction {
@@ -512,12 +518,79 @@ func (m *ConnectionManager) connectionCopy(ctx context.Context, source net.Conn,
 	}
 }
 
+// copyPacketExact forwards datagrams with exact 65535-byte boundaries. A UDP
+// datagram must be forwarded in full or not at all; the upstream copy fast path
+// uses 8/16 KiB pooled buffers and some recvmmsg implementations ignore
+// MSG_TRUNC, which can turn a valid large datagram into a corrupt prefix. A
+// maximum-size managed buffer keeps packet boundaries exact.
+//
+// Everything else mirrors bufio.CopyPacket: traffic counters are unwrapped and
+// reported, cached packets take the passthrough fast path, early-connection
+// handshakes are transferred one datagram at a time, and a write failure on the
+// first datagram is reported back to the originating reader.
 func copyPacketExact(destination N.PacketWriter, source N.PacketReader) (n int64, err error) {
-	// A UDP datagram must be forwarded in full or not at all. The upstream copy
-	// fast path uses 8/16 KiB pooled buffers and some recvmmsg implementations
-	// ignore MSG_TRUNC, which can turn a valid large datagram into a corrupt
-	// prefix. A maximum-size managed buffer keeps packet boundaries exact.
 	const maxUDPPayloadSize = 65535
+	originSource := source
+	var readCounters, writeCounters []N.CountFunc
+	for {
+		source, readCounters = N.UnwrapCountPacketReader(source, readCounters)
+		destination, writeCounters = N.UnwrapCountPacketWriter(destination, writeCounters)
+		if cachedReader, isCached := source.(N.CachedPacketReader); isCached {
+			packet := cachedReader.ReadCachedPacket()
+			if packet != nil {
+				var cachedN int64
+				cachedN, err = writeCachedPacketExact(originSource, destination, packet, readCounters, writeCounters, n > 0)
+				n += cachedN
+				if err != nil {
+					return n, err
+				}
+				continue
+			}
+		}
+		break
+	}
+	for {
+		var copyN int64
+		copyN, err = copyPacketExactSession(destination, source, originSource, readCounters, writeCounters, n > 0, maxUDPPayloadSize)
+		n += copyN
+		if errors.Is(err, N.ErrHandshakeCompleted) {
+			source, readCounters = N.UnwrapCountPacketReader(source, readCounters)
+			destination, writeCounters = N.UnwrapCountPacketWriter(destination, writeCounters)
+			continue
+		}
+		return n, err
+	}
+}
+
+func writeCachedPacketExact(originSource N.PacketReader, destination N.PacketWriter, packet *N.PacketBuffer, readCounters []N.CountFunc, writeCounters []N.CountFunc, notFirstTime bool) (n int64, err error) {
+	options := N.NewReadWaitOptions(nil, destination)
+	buffer := options.Copy(packet.Buffer)
+	dataLen := buffer.Len()
+	destinationAddress := packet.Destination
+	N.PutPacketBuffer(packet)
+	err = destination.WritePacket(buffer, destinationAddress)
+	if err != nil {
+		buffer.Leak()
+		if !notFirstTime {
+			handshakeErr := N.ReportHandshakeFailure(originSource, err)
+			if handshakeErr != nil {
+				err = handshakeErr
+			}
+		}
+		return 0, err
+	}
+	for _, counter := range readCounters {
+		counter(int64(dataLen))
+	}
+	for _, counter := range writeCounters {
+		counter(int64(dataLen))
+	}
+	return int64(dataLen), nil
+}
+
+func copyPacketExactSession(destination N.PacketWriter, source N.PacketReader, originSource N.PacketReader, readCounters []N.CountFunc, writeCounters []N.CountFunc, notFirstTime bool, maxUDPPayloadSize int) (n int64, err error) {
+	handshake := N.NewPacketHandshakeState(source, destination)
+	upgradable := handshake.Upgradable()
 	options := N.NewReadWaitOptions(source, destination)
 	for {
 		buffer := options.NewBufferSize(maxUDPPayloadSize)
@@ -534,9 +607,27 @@ func copyPacketExact(destination N.PacketWriter, source N.PacketReader) (n int64
 		options.PostReturn(buffer)
 		if writeErr := destination.WritePacket(buffer, packetDestination); writeErr != nil {
 			buffer.Leak()
+			if !notFirstTime {
+				handshakeErr := N.ReportHandshakeFailure(originSource, writeErr)
+				if handshakeErr != nil {
+					writeErr = handshakeErr
+				}
+			}
 			return n, writeErr
 		}
 		n += int64(dataLen)
+		for _, counter := range readCounters {
+			counter(int64(dataLen))
+		}
+		for _, counter := range writeCounters {
+			counter(int64(dataLen))
+		}
+		if upgradable {
+			if err = handshake.Check(); err != nil {
+				return n, err
+			}
+		}
+		notFirstTime = true
 	}
 }
 

@@ -44,6 +44,7 @@ type Listener struct {
 	packetOutbound       chan *N.PacketBuffer
 	packetOutboundClosed chan struct{}
 	shutdown             atomic.Bool
+	udpInGoroutine       atomic.Uint64
 	udpTruncated         atomic.Uint64
 	closeOnce            sync.Once
 	closeErr             error
@@ -101,7 +102,10 @@ func (l *Listener) Start() error {
 		}
 		l.packetOutboundClosed = make(chan struct{})
 		l.packetOutbound = make(chan *N.PacketBuffer, 64)
-		go l.loopUDPIn()
+		go func() {
+			l.udpInGoroutine.Store(currentGoroutineID())
+			l.loopUDPIn()
+		}()
 		if !l.disablePacketOutput {
 			go l.loopUDPOut()
 		}
@@ -129,22 +133,48 @@ func (l *Listener) Start() error {
 }
 
 func (l *Listener) Close() error {
+	// loopUDPIn closes packetOutboundClosed when it returns, and Close joins it
+	// so callers observe that the UDP reader has fully stopped. Packet handlers
+	// run on that reader goroutine, so a handler that closes the listener would
+	// otherwise wait for its own loop forever. Such a caller only initiates
+	// teardown: the loop exits as soon as the handler returns. The join stays
+	// outside closeOnce so an in-handler Close also never blocks on an external
+	// Close that is joining the same loop.
+	loopID := l.udpInGoroutine.Load()
+	fromPacketHandler := l.packetOutboundClosed != nil && loopID != 0 && loopID == currentGoroutineID()
 	l.closeOnce.Do(func() {
 		l.shutdown.Store(true)
 		var err error
 		if l.systemProxy != nil && l.systemProxy.IsEnabled() {
 			err = l.systemProxy.Disable()
 		}
-		err = E.Errors(err, common.Close(
+		l.closeErr = E.Errors(err, common.Close(
 			l.tcpListener,
 			common.PtrOrNil(l.udpConn),
 		))
-		if l.packetOutboundClosed != nil {
-			<-l.packetOutboundClosed
-		}
-		l.closeErr = err
 	})
+	if l.packetOutboundClosed != nil && !fromPacketHandler {
+		<-l.packetOutboundClosed
+	}
 	return l.closeErr
+}
+
+func currentGoroutineID() uint64 {
+	var buffer [64]byte
+	length := runtime.Stack(buffer[:], false)
+	const prefix = "goroutine "
+	if length <= len(prefix) {
+		return 0
+	}
+	var id uint64
+	for index := len(prefix); index < length; index++ {
+		value := buffer[index]
+		if value < '0' || value > '9' {
+			break
+		}
+		id = id*10 + uint64(value-'0')
+	}
+	return id
 }
 
 func (l *Listener) TCPListener() net.Listener {
