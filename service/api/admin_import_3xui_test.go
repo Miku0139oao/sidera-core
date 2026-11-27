@@ -31,7 +31,7 @@ func Test3XUIImportRejectsConcurrentOperation(t *testing.T) {
 func Test3XUIImportDryRunIsDeterministicAndReadOnly(t *testing.T) {
 	databasePath := create3XUIImportTestDatabase(t)
 	managed := &adminTestManagedService{tag: "target", type_: C.TypeVLESS}
-	a := newAdminTestAPI(t, managed, false)
+	a := newAdminTestAPI(t, managed, true)
 	a.router = a.buildRouter()
 	_, err := a.inspect3XUIDatabase(context.Background(), databasePath, "fixture", map[int64]string{1: "target"})
 	require.NoError(t, err)
@@ -87,7 +87,7 @@ func Test3XUIImportNormalizes3XUIHysteriaVersion2(t *testing.T) {
 		`UPDATE inbounds SET protocol = 'hysteria', settings = '{"version":2,"obfsPassword":"secret"}', stream_settings = '{"network":"hysteria","hysteriaSettings":{"version":2}}' WHERE id = 1`,
 		`UPDATE client_inbounds SET flow_override = '' WHERE client_id = 1 AND inbound_id = 1`,
 	)
-	a := newAdminTestAPI(t, &adminTestManagedService{tag: "target", type_: C.TypeHysteria2}, false)
+	a := newAdminTestAPI(t, &adminTestManagedService{tag: "target", type_: C.TypeHysteria2}, true)
 	a.router = a.buildRouter()
 
 	response := request3XUIImportDryRun(t, a, databasePath, `{"1":"target"}`)
@@ -232,7 +232,7 @@ func Test3XUIImportDryRunRejectsDuplicateClientIDs(t *testing.T) {
 		`ALTER TABLE duplicate_clients RENAME TO clients`,
 		`INSERT INTO clients (id, email, sub_id, uuid, password, auth, flow, limit_ip, total_gb, expiry_time, enable, reset) VALUES (1, 'Bob', 'bob_Sub-ID', '22222222-2222-4222-8222-222222222222', 'password-2', 'auth-2', '', 0, 0, 0, 1, 0)`,
 	)
-	a := newAdminTestAPI(t, &adminTestManagedService{tag: "target", type_: C.TypeVLESS}, false)
+	a := newAdminTestAPI(t, &adminTestManagedService{tag: "target", type_: C.TypeVLESS}, true)
 	a.router = a.buildRouter()
 
 	response := request3XUIImportDryRun(t, a, databasePath, `{"1":"target"}`)
@@ -294,7 +294,8 @@ func Test3XUIImportDryRunRequiresAuthentication(t *testing.T) {
 func Test3XUIImportApplyCreatesGlobalAccountTransaction(t *testing.T) {
 	databasePath := create3XUIImportTestDatabase(t)
 	managed := &adminTestManagedService{tag: "target", type_: C.TypeVLESS}
-	a := newAdminTestAPI(t, managed, false)
+	a := newAdminTestAPI(t, managed, true)
+	a.store.Servers[managed.Tag()].Config = json.RawMessage(`{}`)
 	require.NoError(t, a.synchronizeStore())
 	a.router = a.buildRouter()
 
@@ -345,7 +346,8 @@ func Test3XUIImportApplyIgnoresClientFlowWhenOverrideEmpty(t *testing.T) {
 		`UPDATE client_inbounds SET flow_override = '' WHERE client_id = 1 AND inbound_id = 1`,
 	)
 	managed := &adminTestManagedService{tag: "target", type_: C.TypeVLESS}
-	a := newAdminTestAPI(t, managed, false)
+	a := newAdminTestAPI(t, managed, true)
+	a.store.Servers[managed.Tag()].Config = json.RawMessage(`{}`)
 	require.NoError(t, a.synchronizeStore())
 	a.router = a.buildRouter()
 
@@ -383,7 +385,7 @@ func Test3XUIImportApplyFingerprintBindsInboundMapping(t *testing.T) {
 	databasePath := create3XUIImportTestDatabase(t)
 	first := &adminTestManagedService{tag: "first", type_: C.TypeVLESS}
 	second := &adminTestManagedService{tag: "second", type_: C.TypeVLESS}
-	a := newAdminTestAPI(t, first, false)
+	a := newAdminTestAPI(t, first, true)
 	a.inbounds = append(a.inbounds, adminInboundRuntime{
 		Tag: second.Tag(), Type: second.Type(), Kind: adminServerKindInbound,
 		Manager: &adminManagedRuntime{service: second},
@@ -408,7 +410,7 @@ func Test3XUIImportApplyFingerprintBindsInboundMapping(t *testing.T) {
 func Test3XUIImportApplyRollsBackStoreAndRuntime(t *testing.T) {
 	databasePath := create3XUIImportTestDatabase(t)
 	managed := &adminTestManagedService{tag: "target", type_: C.TypeVLESS}
-	a := newAdminTestAPI(t, managed, false)
+	a := newAdminTestAPI(t, managed, true)
 	require.NoError(t, a.synchronizeStore())
 	a.router = a.buildRouter()
 	dryRun := request3XUIImportDryRun(t, a, databasePath, `{"1":"target"}`)
@@ -425,6 +427,60 @@ func Test3XUIImportApplyRollsBackStoreAndRuntime(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, before, after)
 	require.Empty(t, a.store.Inbounds["target"].Users)
+}
+
+func Test3XUIImportRejectsConfigFileTargetInbound(t *testing.T) {
+	databasePath := create3XUIImportTestDatabase(t)
+	managed := &adminTestManagedService{tag: "target", type_: C.TypeVLESS}
+	// A config-file inbound exposes a managed user service but has no dashboard
+	// server profile, so it can never produce a subscription link.
+	a := newAdminTestAPI(t, managed, false)
+	require.NoError(t, a.synchronizeStore())
+	a.router = a.buildRouter()
+
+	dryRun := request3XUIImportDryRun(t, a, databasePath, `{"1":"target"}`)
+	require.Equal(t, http.StatusOK, dryRun.Code, dryRun.Body.String())
+	var report admin3XUIImportReport
+	require.NoError(t, json.Unmarshal(dryRun.Body.Bytes(), &report))
+	require.False(t, report.Ready)
+	require.Equal(t, 1, report.Summary.BlockedAccounts)
+	require.Contains(t, dryRun.Body.String(), `"code":"unsupported_target_inbound"`)
+
+	before, err := json.Marshal(a.store)
+	require.NoError(t, err)
+	response := request3XUIImportApply(t, a, databasePath, `{"1":"target"}`, report.Fingerprint)
+	require.Equal(t, http.StatusConflict, response.Code, response.Body.String())
+	after, err := json.Marshal(a.store)
+	require.NoError(t, err)
+	require.Equal(t, before, after)
+}
+
+func Test3XUIImportCommitRevalidatesStoreSnapshot(t *testing.T) {
+	databasePath := create3XUIImportTestDatabase(t)
+	managed := &adminTestManagedService{tag: "target", type_: C.TypeVLESS}
+	a := newAdminTestAPI(t, managed, true)
+	require.NoError(t, a.synchronizeStore())
+
+	report, err := a.inspect3XUIDatabase(context.Background(), databasePath, "fixture", map[int64]string{1: "target"})
+	require.NoError(t, err)
+	require.True(t, report.Ready, report.Summary)
+	sources, err := read3XUIImportSources(context.Background(), databasePath)
+	require.NoError(t, err)
+
+	// A mutation that lands after preflight must still be rejected by the
+	// commit's validation of the fresh store snapshot, not overwrite or
+	// duplicate existing state.
+	a.storeAccess.Lock()
+	a.store.Accounts["late-account"] = &adminAccount{ID: "late-account", Name: "Alice", PolicyScope: adminAccountPolicyGlobal, Enabled: true}
+	a.storeAccess.Unlock()
+
+	require.Error(t, a.commit3XUIImport(report, sources))
+
+	a.storeAccess.RLock()
+	defer a.storeAccess.RUnlock()
+	require.Empty(t, a.store.Inbounds["target"].Users)
+	_, imported := a.store.ExternalSubscriptions["Alice"]
+	require.False(t, imported)
 }
 
 func create3XUIImportTestDatabase(t *testing.T) string {
