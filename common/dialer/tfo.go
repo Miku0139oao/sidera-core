@@ -20,6 +20,7 @@ import (
 type slowOpenConn struct {
 	dialer      *tfo.Dialer
 	ctx         context.Context
+	cancel      context.CancelFunc
 	network     string
 	destination M.Socksaddr
 	conn        atomic.Pointer[net.TCPConn]
@@ -39,9 +40,11 @@ func DialSlowContext(dialer *tfo.Dialer, ctx context.Context, network string, de
 			return dialer.Dialer.DialContext(ctx, network, destination.AddrString())
 		}
 	}
+	dialCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	return &slowOpenConn{
 		dialer:      dialer,
-		ctx:         ctx,
+		ctx:         dialCtx,
+		cancel:      cancel,
 		network:     network,
 		destination: destination,
 		create:      make(chan struct{}),
@@ -86,7 +89,18 @@ func (c *slowOpenConn) Write(b []byte) (n int, err error) {
 	if err != nil {
 		c.err = err
 	} else {
-		c.conn.Store(conn.(*net.TCPConn))
+		// Store first, then re-check: Close may run concurrently without c.access,
+		// so either Close's load observes this conn and closes it, or this
+		// post-store check observes the closed done channel and closes it.
+		tcpConn := conn.(*net.TCPConn)
+		c.conn.Store(tcpConn)
+		select {
+		case <-c.done:
+			tcpConn.Close()
+			err = os.ErrClosed
+			c.err = err
+		default:
+		}
 	}
 	n = len(b)
 	close(c.create)
@@ -96,6 +110,7 @@ func (c *slowOpenConn) Write(b []byte) (n int, err error) {
 func (c *slowOpenConn) Close() error {
 	c.closeOnce.Do(func() {
 		close(c.done)
+		c.cancel()
 		conn := c.conn.Load()
 		if conn != nil {
 			conn.Close()
