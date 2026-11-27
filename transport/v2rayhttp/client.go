@@ -7,12 +7,16 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/Miku0139oao/sidera-core/adapter"
 	"github.com/Miku0139oao/sidera-core/common/tls"
+	C "github.com/Miku0139oao/sidera-core/constant"
 	"github.com/Miku0139oao/sidera-core/option"
+	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
@@ -27,7 +31,7 @@ type Client struct {
 	ctx        context.Context
 	dialer     N.Dialer
 	serverAddr M.Socksaddr
-	transport  http.RoundTripper
+	transport  common.TypedValue[http.RoundTripper]
 	http2      bool
 	requestURL url.URL
 	host       []string
@@ -74,7 +78,7 @@ func NewClient(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opt
 	if !strings.HasPrefix(requestURL.Path, "/") {
 		requestURL.Path = "/" + requestURL.Path
 	}
-	return &Client{
+	client := &Client{
 		ctx:        ctx,
 		dialer:     dialer,
 		serverAddr: serverAddr,
@@ -82,9 +86,10 @@ func NewClient(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opt
 		host:       options.Host,
 		method:     options.Method,
 		headers:    options.Headers.Build(),
-		transport:  transport,
 		http2:      tlsConfig != nil,
-	}, nil
+	}
+	client.transport.Store(transport)
+	return client, nil
 }
 
 func (c *Client) DialContext(ctx context.Context) (net.Conn, error) {
@@ -108,7 +113,11 @@ func (c *Client) dialHTTP(ctx context.Context) (net.Conn, error) {
 	}
 	switch hostLen := len(c.host); hostLen {
 	case 0:
-		request.Host = c.serverAddr.AddrString()
+		if c.serverAddr.IsIPv6() {
+			request.Host = "[" + c.serverAddr.AddrString() + "]"
+		} else {
+			request.Host = c.serverAddr.AddrString()
+		}
 	case 1:
 		request.Host = c.host[0]
 	default:
@@ -119,7 +128,10 @@ func (c *Client) dialHTTP(ctx context.Context) (net.Conn, error) {
 }
 
 func (c *Client) dialHTTP2(ctx context.Context) (net.Conn, error) {
-	requestContext, cancel := context.WithCancelCause(ctx)
+	// The request context must outlive the dial context: callers such as parallel
+	// dialing cancel the dial context once a winner is chosen, which must not tear
+	// down an already established tunnel. Only the handshake phase is bounded.
+	requestContext, cancel := context.WithCancelCause(context.WithoutCancel(ctx))
 	pipeInReader, pipeInWriter := io.Pipe()
 	request := &http.Request{
 		Method: c.method,
@@ -137,10 +149,24 @@ func (c *Client) dialHTTP2(ctx context.Context) (net.Conn, error) {
 	default:
 		request.Host = c.host[rand.Intn(hostLen)]
 	}
+	transport := c.transport.Load()
 	conn := NewLateHTTPConn(pipeInWriter, cancel)
+	handshakeTimeout := C.TCPTimeout
+	if deadline, hasDeadline := ctx.Deadline(); hasDeadline {
+		handshakeTimeout = time.Until(deadline)
+	}
+	var handshakeTimedOut atomic.Bool
+	handshakeTimer := time.AfterFunc(handshakeTimeout, func() {
+		handshakeTimedOut.Store(true)
+		cancel(os.ErrDeadlineExceeded)
+	})
 	go func() {
-		response, err := c.transport.RoundTrip(request)
+		response, err := transport.RoundTrip(request)
+		handshakeTimer.Stop()
 		if err != nil {
+			if handshakeTimedOut.Load() {
+				err = os.ErrDeadlineExceeded
+			}
 			conn.Setup(nil, err)
 		} else if response.StatusCode != 200 {
 			response.Body.Close()
@@ -153,6 +179,6 @@ func (c *Client) dialHTTP2(ctx context.Context) (net.Conn, error) {
 }
 
 func (c *Client) Close() error {
-	c.transport = ResetTransport(c.transport)
+	c.transport.Store(ResetTransport(c.transport.Load()))
 	return nil
 }

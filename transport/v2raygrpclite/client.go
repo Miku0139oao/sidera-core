@@ -5,11 +5,15 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
+	"os"
+	"sync/atomic"
 	"time"
 
 	"github.com/Miku0139oao/sidera-core/adapter"
 	"github.com/Miku0139oao/sidera-core/common/tls"
+	C "github.com/Miku0139oao/sidera-core/constant"
 	"github.com/Miku0139oao/sidera-core/option"
 	"github.com/Miku0139oao/sidera-core/transport/v2rayhttp"
 	"github.com/sagernet/sing/common"
@@ -79,7 +83,10 @@ func NewClient(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opt
 }
 
 func (c *Client) DialContext(ctx context.Context) (net.Conn, error) {
-	requestContext, cancel := context.WithCancelCause(ctx)
+	// The request context must outlive the dial context: callers such as parallel
+	// dialing cancel the dial context once a winner is chosen, which must not tear
+	// down an already established stream. Only the handshake phase is bounded.
+	requestContext, cancel := context.WithCancelCause(context.WithoutCancel(ctx))
 	pipeInReader, pipeInWriter := io.Pipe()
 	request := &http.Request{
 		Method: http.MethodPost,
@@ -88,11 +95,31 @@ func (c *Client) DialContext(ctx context.Context) (net.Conn, error) {
 		Header: defaultClientHeader.Clone(),
 		Host:   c.host,
 	}
-	request = request.WithContext(requestContext)
 	conn := newLateGunConn(pipeInWriter, cancel)
+	handshakeTimeout := C.TCPTimeout
+	if deadline, hasDeadline := ctx.Deadline(); hasDeadline {
+		handshakeTimeout = time.Until(deadline)
+	}
+	var handshakeTimedOut atomic.Bool
+	handshakeTimer := time.AfterFunc(handshakeTimeout, func() {
+		handshakeTimedOut.Store(true)
+		cancel(os.ErrDeadlineExceeded)
+	})
+	// gRPC servers send the response headers together with the first message, so
+	// RoundTrip returning does not mark the stream as established; the request
+	// headers being written does.
+	request = request.WithContext(httptrace.WithClientTrace(requestContext, &httptrace.ClientTrace{
+		WroteHeaders: func() {
+			handshakeTimer.Stop()
+		},
+	}))
 	go func() {
 		response, err := c.transport.RoundTrip(request)
+		handshakeTimer.Stop()
 		if err != nil {
+			if handshakeTimedOut.Load() {
+				err = os.ErrDeadlineExceeded
+			}
 			conn.setup(nil, err)
 		} else if response.StatusCode != 200 {
 			response.Body.Close()

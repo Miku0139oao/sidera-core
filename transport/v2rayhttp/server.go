@@ -118,7 +118,11 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 			s.invalidRequest(writer, request, http.StatusRequestEntityTooLarge, E.New("request body is too large"))
 			return
 		}
-		if request.Body != nil && request.Body != http.NoBody {
+		// Only pre-read bodies whose length is known up front. A chunked request
+		// body (ContentLength -1) is a tunnel stream that never reaches EOF, so
+		// buffering it would block until http1EarlyBodyTimeout and drop the
+		// connection. Hijack immediately and forward the body bytes as they arrive.
+		if request.ContentLength > 0 && request.Body != nil && request.Body != http.NoBody {
 			responseController := http.NewResponseController(writer)
 			if err := responseController.SetReadDeadline(time.Now().Add(s.http1EarlyBodyTimeout)); err != nil {
 				s.invalidRequest(writer, request, http.StatusRequestTimeout, E.Cause(err, "set request body deadline"))
@@ -142,6 +146,15 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 				requestBody = buf.As(requestBodyBytes)
 			}
 		}
+		if request.ContentLength < 0 {
+			// net/http consumes the remaining request body before writing the
+			// response when full duplex is off. That body is the tunnel uplink and
+			// never ends, so opt into full duplex to hand it over unread.
+			if err := http.NewResponseController(writer).EnableFullDuplex(); err != nil {
+				s.invalidRequest(writer, request, 0, E.Cause(err, "enable full duplex"))
+				return
+			}
+		}
 		writer.WriteHeader(http.StatusOK)
 		writer.(http.Flusher).Flush()
 		conn, reader, err := h.Hijack()
@@ -149,7 +162,16 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 			s.invalidRequest(writer, request, 0, E.Cause(err, "hijack conn"))
 			return
 		}
-		if cacheLen := reader.Reader.Buffered(); cacheLen > 0 {
+		if request.ContentLength < 0 {
+			// A chunked tunnel body is de-chunked by net/http through
+			// request.Body, while the hijacked reader still contains the raw
+			// chunk framing. Hand the tunnel request.Body instead of forwarding
+			// those framing bytes as payload. Full duplex was enabled above so
+			// net/http has not consumed the body.
+			if request.Body != nil {
+				conn = &chunkedBodyConn{Conn: conn, reader: request.Body}
+			}
+		} else if cacheLen := reader.Reader.Buffered(); cacheLen > 0 {
 			cache := buf.NewSize(cacheLen)
 			_, err = cache.ReadFullFrom(reader.Reader, cacheLen)
 			if err != nil {
@@ -211,4 +233,16 @@ func (s *Server) ServePacket(listener net.PacketConn) error {
 
 func (s *Server) Close() error {
 	return common.Close(common.PtrOrNil(s.httpServer))
+}
+
+// chunkedBodyConn presents a hijacked HTTP/1.1 connection whose readable side is
+// the de-chunked request body, so the tunnel never sees Transfer-Encoding
+// framing bytes.
+type chunkedBodyConn struct {
+	net.Conn
+	reader io.Reader
+}
+
+func (c *chunkedBodyConn) Read(b []byte) (int, error) {
+	return c.reader.Read(b)
 }
