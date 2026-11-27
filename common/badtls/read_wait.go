@@ -87,3 +87,7 @@ func (c *ReadWaitConn) Upstream() any {
 func (c *ReadWaitConn) ReaderReplaceable() bool {
 	return true
 }
+
+func (c *ReadWaitConn) WriterReplaceable() bool {
+	return true
+}
